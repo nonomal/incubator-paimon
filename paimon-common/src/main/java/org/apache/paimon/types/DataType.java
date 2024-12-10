@@ -16,10 +16,6 @@
  * limitations under the License.
  */
 
-/* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
- * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
- * additional information regarding copyright ownership. */
-
 package org.apache.paimon.types;
 
 import org.apache.paimon.annotation.Public;
@@ -34,6 +30,10 @@ import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Set;
+
+/* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
+ * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
 
 /**
  * Describes the data type in the paimon ecosystem.
@@ -104,6 +104,9 @@ public abstract class DataType implements Serializable {
         return typeRoot.getFamilies().contains(family);
     }
 
+    /** The default size of a value of this data type, used internally for size estimation. */
+    public abstract int defaultSize();
+
     /**
      * Returns a deep copy of this type with possibly different nullability.
      *
@@ -140,6 +143,16 @@ public abstract class DataType implements Serializable {
         }
         DataType that = (DataType) o;
         return isNullable == that.isNullable && typeRoot == that.typeRoot;
+    }
+
+    /**
+     * Determine whether the current type is the result of the target type after pruning (e.g.
+     * select some fields from a nested type) or just the same.
+     *
+     * @param o the target data type
+     */
+    public boolean isPrunedFrom(Object o) {
+        return equals(o);
     }
 
     @Override

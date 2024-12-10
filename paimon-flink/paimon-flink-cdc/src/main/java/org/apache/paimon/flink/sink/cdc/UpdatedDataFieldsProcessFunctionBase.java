@@ -29,7 +29,9 @@ import org.apache.paimon.types.DataTypeChecks;
 import org.apache.paimon.types.DataTypeRoot;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Preconditions;
+import org.apache.paimon.utils.StringUtils;
 
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.slf4j.Logger;
@@ -40,15 +42,16 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 
 /** Base class for update data fields process function. */
 public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends ProcessFunction<I, O> {
     private static final Logger LOG =
             LoggerFactory.getLogger(UpdatedDataFieldsProcessFunctionBase.class);
 
-    protected Catalog catalog;
     protected final Catalog.Loader catalogLoader;
+    protected Catalog catalog;
+    private boolean allowUpperCase;
+
     private static final List<DataTypeRoot> STRING_TYPES =
             Arrays.asList(DataTypeRoot.CHAR, DataTypeRoot.VARCHAR);
     private static final List<DataTypeRoot> BINARY_TYPES =
@@ -62,13 +65,28 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
     private static final List<DataTypeRoot> FLOATING_POINT_TYPES =
             Arrays.asList(DataTypeRoot.FLOAT, DataTypeRoot.DOUBLE);
 
+    private static final List<DataTypeRoot> DECIMAL_TYPES = Arrays.asList(DataTypeRoot.DECIMAL);
+
+    private static final List<DataTypeRoot> TIMESTAMP_TYPES =
+            Arrays.asList(DataTypeRoot.TIMESTAMP_WITHOUT_TIME_ZONE);
+
     protected UpdatedDataFieldsProcessFunctionBase(Catalog.Loader catalogLoader) {
         this.catalogLoader = catalogLoader;
     }
 
-    @Override
+    /**
+     * Do not annotate with <code>@override</code> here to maintain compatibility with Flink 1.18-.
+     */
+    public void open(OpenContext openContext) throws Exception {
+        open(new Configuration());
+    }
+
+    /**
+     * Do not annotate with <code>@override</code> here to maintain compatibility with Flink 2.0+.
+     */
     public void open(Configuration parameters) {
         this.catalog = catalogLoader.load();
+        this.allowUpperCase = this.catalog.allowUpperCase();
     }
 
     protected void applySchemaChange(
@@ -92,6 +110,9 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
         } else if (schemaChange instanceof SchemaChange.UpdateColumnType) {
             SchemaChange.UpdateColumnType updateColumnType =
                     (SchemaChange.UpdateColumnType) schemaChange;
+            Preconditions.checkState(
+                    updateColumnType.fieldNames().length == 1,
+                    "Paimon CDC currently does not support nested type schema evolution.");
             TableSchema schema =
                     schemaManager
                             .latest()
@@ -99,11 +120,11 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
                                     () ->
                                             new RuntimeException(
                                                     "Table does not exist. This is unexpected."));
-            int idx = schema.fieldNames().indexOf(updateColumnType.fieldName());
+            int idx = schema.fieldNames().indexOf(updateColumnType.fieldNames()[0]);
             Preconditions.checkState(
                     idx >= 0,
                     "Field name "
-                            + updateColumnType.fieldName()
+                            + updateColumnType.fieldNames()[0]
                             + " does not exist in table. This is unexpected.");
             DataType oldType = schema.fields().get(idx).type();
             DataType newType = updateColumnType.newDataType();
@@ -114,8 +135,11 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
                 case EXCEPTION:
                     throw new UnsupportedOperationException(
                             String.format(
-                                    "Cannot convert field %s from type %s to %s",
-                                    updateColumnType.fieldName(), oldType, newType));
+                                    "Cannot convert field %s from type %s to %s of Paimon table %s.",
+                                    updateColumnType.fieldNames()[0],
+                                    oldType,
+                                    newType,
+                                    identifier.getFullName()));
             }
         } else if (schemaChange instanceof SchemaChange.UpdateColumnComment) {
             catalog.alterTable(identifier, schemaChange, false);
@@ -161,6 +185,23 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
             return oldIdx <= newIdx ? ConvertAction.CONVERT : ConvertAction.IGNORE;
         }
 
+        oldIdx = DECIMAL_TYPES.indexOf(oldType.getTypeRoot());
+        newIdx = DECIMAL_TYPES.indexOf(newType.getTypeRoot());
+        if (oldIdx >= 0 && newIdx >= 0) {
+            return DataTypeChecks.getPrecision(newType) <= DataTypeChecks.getPrecision(oldType)
+                            && DataTypeChecks.getScale(newType) <= DataTypeChecks.getScale(oldType)
+                    ? ConvertAction.IGNORE
+                    : ConvertAction.CONVERT;
+        }
+
+        oldIdx = TIMESTAMP_TYPES.indexOf(oldType.getTypeRoot());
+        newIdx = TIMESTAMP_TYPES.indexOf(newType.getTypeRoot());
+        if (oldIdx >= 0 && newIdx >= 0) {
+            return DataTypeChecks.getPrecision(oldType) <= DataTypeChecks.getPrecision(newType)
+                    ? ConvertAction.CONVERT
+                    : ConvertAction.IGNORE;
+        }
+
         return ConvertAction.EXCEPTION;
     }
 
@@ -174,28 +215,35 @@ public abstract class UpdatedDataFieldsProcessFunctionBase<I, O> extends Process
 
         List<SchemaChange> result = new ArrayList<>();
         for (DataField newField : updatedDataFields) {
-            if (oldFields.containsKey(newField.name())) {
-                DataField oldField = oldFields.get(newField.name());
+            String newFieldName =
+                    StringUtils.caseSensitiveConversion(newField.name(), allowUpperCase);
+            if (oldFields.containsKey(newFieldName)) {
+                DataField oldField = oldFields.get(newFieldName);
                 // we compare by ignoring nullable, because partition keys and primary keys might be
                 // nullable in source database, but they can't be null in Paimon
                 if (oldField.type().equalsIgnoreNullable(newField.type())) {
-                    if (!Objects.equals(oldField.description(), newField.description())) {
+                    // update column comment
+                    if (newField.description() != null
+                            && !newField.description().equals(oldField.description())) {
                         result.add(
                                 SchemaChange.updateColumnComment(
-                                        new String[] {newField.name()}, newField.description()));
+                                        new String[] {newFieldName}, newField.description()));
                     }
                 } else {
-                    result.add(SchemaChange.updateColumnType(newField.name(), newField.type()));
+                    // update column type
+                    result.add(SchemaChange.updateColumnType(newFieldName, newField.type()));
+                    // update column comment
                     if (newField.description() != null) {
                         result.add(
                                 SchemaChange.updateColumnComment(
-                                        new String[] {newField.name()}, newField.description()));
+                                        new String[] {newFieldName}, newField.description()));
                     }
                 }
             } else {
+                // add column
                 result.add(
                         SchemaChange.addColumn(
-                                newField.name(), newField.type(), newField.description(), null));
+                                newFieldName, newField.type(), newField.description(), null));
             }
         }
         return result;

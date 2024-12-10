@@ -18,16 +18,21 @@
 
 package org.apache.paimon.mergetree.compact;
 
+import org.apache.paimon.compact.CompactDeletionFile;
 import org.apache.paimon.compact.CompactResult;
 import org.apache.paimon.compact.CompactTask;
 import org.apache.paimon.compact.CompactUnit;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.mergetree.SortedRun;
+import org.apache.paimon.operation.metrics.CompactionMetrics;
+
+import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.Supplier;
 
 import static java.util.Collections.singletonList;
 
@@ -37,10 +42,12 @@ public class MergeTreeCompactTask extends CompactTask {
     private final long minFileSize;
     private final CompactRewriter rewriter;
     private final int outputLevel;
+    private final Supplier<CompactDeletionFile> compactDfSupplier;
 
     private final List<List<SortedRun>> partitioned;
 
     private final boolean dropDelete;
+    private final int maxLevel;
 
     // metric
     private int upgradeFilesNum;
@@ -50,12 +57,18 @@ public class MergeTreeCompactTask extends CompactTask {
             long minFileSize,
             CompactRewriter rewriter,
             CompactUnit unit,
-            boolean dropDelete) {
+            boolean dropDelete,
+            int maxLevel,
+            @Nullable CompactionMetrics.Reporter metricsReporter,
+            Supplier<CompactDeletionFile> compactDfSupplier) {
+        super(metricsReporter);
         this.minFileSize = minFileSize;
         this.rewriter = rewriter;
         this.outputLevel = unit.outputLevel();
+        this.compactDfSupplier = compactDfSupplier;
         this.partitioned = new IntervalPartition(unit.files(), keyComparator).partition();
         this.dropDelete = dropDelete;
+        this.maxLevel = maxLevel;
 
         this.upgradeFilesNum = 0;
     }
@@ -90,6 +103,7 @@ public class MergeTreeCompactTask extends CompactTask {
             }
         }
         rewrite(candidate, result);
+        result.setDeletionFile(compactDfSupplier.get());
         return result;
     }
 
@@ -102,10 +116,20 @@ public class MergeTreeCompactTask extends CompactTask {
     }
 
     private void upgrade(DataFileMeta file, CompactResult toUpdate) throws Exception {
-        if (file.level() != outputLevel) {
+        if (file.level() == outputLevel) {
+            return;
+        }
+
+        if (outputLevel != maxLevel || file.deleteRowCount().map(d -> d == 0).orElse(false)) {
             CompactResult upgradeResult = rewriter.upgrade(outputLevel, file);
             toUpdate.merge(upgradeResult);
             upgradeFilesNum++;
+        } else {
+            // files with delete records should not be upgraded directly to max level
+            List<List<SortedRun>> candidate = new ArrayList<>();
+            candidate.add(new ArrayList<>());
+            candidate.get(0).add(SortedRun.fromSingle(file));
+            rewriteImpl(candidate, toUpdate);
         }
     }
 
@@ -125,6 +149,11 @@ public class MergeTreeCompactTask extends CompactTask {
                 return;
             }
         }
+        rewriteImpl(candidate, toUpdate);
+    }
+
+    private void rewriteImpl(List<List<SortedRun>> candidate, CompactResult toUpdate)
+            throws Exception {
         CompactResult rewriteResult = rewriter.rewrite(outputLevel, dropDelete, candidate);
         toUpdate.merge(rewriteResult);
         candidate.clear();

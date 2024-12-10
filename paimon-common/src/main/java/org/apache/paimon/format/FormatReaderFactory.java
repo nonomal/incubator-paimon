@@ -19,18 +19,28 @@
 package org.apache.paimon.format;
 
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.fileindex.FileIndexResult;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.reader.FileRecordReader;
 import org.apache.paimon.reader.RecordReader;
 
 import java.io.IOException;
-import java.io.Serializable;
 
 /** A factory to create {@link RecordReader} for file. */
-public interface FormatReaderFactory extends Serializable {
+public interface FormatReaderFactory {
 
-    RecordReader<InternalRow> createReader(FileIO fileIO, Path file) throws IOException;
+    FileRecordReader<InternalRow> createReader(Context context) throws IOException;
 
-    RecordReader<InternalRow> createReader(FileIO fileIO, Path file, int poolSize)
-            throws IOException;
+    /** Context for creating reader. */
+    interface Context {
+
+        FileIO fileIO();
+
+        Path filePath();
+
+        long fileSize();
+
+        FileIndexResult fileIndex();
+    }
 }

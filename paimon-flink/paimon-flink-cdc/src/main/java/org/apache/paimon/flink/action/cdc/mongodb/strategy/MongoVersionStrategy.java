@@ -21,8 +21,8 @@ package org.apache.paimon.flink.action.cdc.mongodb.strategy;
 import org.apache.paimon.flink.action.cdc.ComputedColumn;
 import org.apache.paimon.flink.action.cdc.mongodb.SchemaAcquisitionMode;
 import org.apache.paimon.flink.sink.cdc.RichCdcMultiplexRecord;
-import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.JsonSerdeUtil;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
@@ -34,13 +34,10 @@ import org.apache.flink.configuration.Configuration;
 
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-import static org.apache.paimon.flink.action.cdc.CdcActionCommonUtils.mapKeyCaseConvert;
-import static org.apache.paimon.flink.action.cdc.CdcActionCommonUtils.recordKeyDuplicateErrMsg;
 import static org.apache.paimon.flink.action.cdc.mongodb.MongoDBActionUtils.DEFAULT_ID_GENERATION;
 import static org.apache.paimon.flink.action.cdc.mongodb.MongoDBActionUtils.FIELD_NAME;
 import static org.apache.paimon.flink.action.cdc.mongodb.MongoDBActionUtils.PARSER_PATH;
@@ -74,21 +71,19 @@ public interface MongoVersionStrategy {
      * Determines the extraction mode and retrieves the row accordingly.
      *
      * @param jsonNode The JsonNode representing the MongoDB document.
-     * @param paimonFieldTypes A map to store the field types.
-     * @param caseSensitive Flag indicating if the extraction should be case-sensitive.
+     * @param rowTypeBuilder row type builder.
      * @param mongodbConfig Configuration for the MongoDB connection.
      * @return A map representing the extracted row.
      * @throws JsonProcessingException If there's an error during JSON processing.
      */
     default Map<String, String> getExtractRow(
             JsonNode jsonNode,
-            LinkedHashMap<String, DataType> paimonFieldTypes,
-            boolean caseSensitive,
+            RowType.Builder rowTypeBuilder,
             List<ComputedColumn> computedColumns,
             Configuration mongodbConfig)
             throws JsonProcessingException {
         SchemaAcquisitionMode mode =
-                SchemaAcquisitionMode.valueOf(mongodbConfig.getString(START_MODE).toUpperCase());
+                SchemaAcquisitionMode.valueOf(mongodbConfig.get(START_MODE).toUpperCase());
         ObjectNode objectNode =
                 JsonSerdeUtil.asSpecificNodeType(jsonNode.asText(), ObjectNode.class);
         JsonNode idNode = objectNode.get(ID_FIELD);
@@ -97,42 +92,31 @@ public interface MongoVersionStrategy {
                     "The provided MongoDB JSON document does not contain an _id field.");
         }
         JsonNode document =
-                mongodbConfig.getBoolean(DEFAULT_ID_GENERATION)
-                        ? objectNode.set(ID_FIELD, idNode.get(OID_FIELD))
+                mongodbConfig.get(DEFAULT_ID_GENERATION)
+                        ? objectNode.set(
+                                ID_FIELD,
+                                idNode.get(OID_FIELD) == null ? idNode : idNode.get(OID_FIELD))
                         : objectNode;
-        Map<String, String> row;
         switch (mode) {
             case SPECIFIED:
-                row =
-                        parseFieldsFromJsonRecord(
-                                document.toString(),
-                                mongodbConfig.getString(PARSER_PATH),
-                                mongodbConfig.getString(FIELD_NAME),
-                                computedColumns,
-                                paimonFieldTypes);
-                break;
+                return parseFieldsFromJsonRecord(
+                        document.toString(),
+                        mongodbConfig.get(PARSER_PATH),
+                        mongodbConfig.get(FIELD_NAME),
+                        computedColumns,
+                        rowTypeBuilder);
             case DYNAMIC:
-                row =
-                        parseAndTypeJsonRow(
-                                document.toString(),
-                                paimonFieldTypes,
-                                computedColumns,
-                                caseSensitive);
-                break;
+                return parseAndTypeJsonRow(document.toString(), rowTypeBuilder, computedColumns);
             default:
                 throw new RuntimeException("Unsupported extraction mode: " + mode);
         }
-        return mapKeyCaseConvert(row, caseSensitive, recordKeyDuplicateErrMsg(row));
     }
 
     /** Parses and types a JSON row based on the given parameters. */
     default Map<String, String> parseAndTypeJsonRow(
-            String evaluate,
-            LinkedHashMap<String, DataType> paimonFieldTypes,
-            List<ComputedColumn> computedColumns,
-            boolean caseSensitive) {
+            String evaluate, RowType.Builder rowTypeBuilder, List<ComputedColumn> computedColumns) {
         Map<String, String> parsedRow = JsonSerdeUtil.parseJsonMap(evaluate, String.class);
-        return processParsedData(parsedRow, paimonFieldTypes, computedColumns, caseSensitive);
+        return processParsedData(parsedRow, rowTypeBuilder, computedColumns);
     }
 
     /** Parses fields from a JSON record based on the given parameters. */
@@ -141,7 +125,7 @@ public interface MongoVersionStrategy {
             String fieldPaths,
             String fieldNames,
             List<ComputedColumn> computedColumns,
-            LinkedHashMap<String, DataType> fieldTypes) {
+            RowType.Builder rowTypeBuilder) {
         String[] columnNames = fieldNames.split(",");
         String[] parseNames = fieldPaths.split(",");
         Map<String, String> parsedRow = new HashMap<>();
@@ -151,23 +135,21 @@ public interface MongoVersionStrategy {
             parsedRow.put(columnNames[i], Optional.ofNullable(evaluate).orElse("{}"));
         }
 
-        return processParsedData(parsedRow, fieldTypes, computedColumns, false);
+        return processParsedData(parsedRow, rowTypeBuilder, computedColumns);
     }
 
     /** Processes the parsed data to generate the result map and update field types. */
     static Map<String, String> processParsedData(
             Map<String, String> parsedRow,
-            LinkedHashMap<String, DataType> fieldTypes,
-            List<ComputedColumn> computedColumns,
-            boolean caseSensitive) {
+            RowType.Builder rowTypeBuilder,
+            List<ComputedColumn> computedColumns) {
         int initialCapacity = parsedRow.size() + computedColumns.size();
         Map<String, String> resultMap = new HashMap<>(initialCapacity);
 
         parsedRow.forEach(
                 (column, value) -> {
-                    String key = caseSensitive ? column : column.toLowerCase();
-                    fieldTypes.putIfAbsent(key, DataTypes.STRING());
-                    resultMap.put(key, value);
+                    rowTypeBuilder.field(column, DataTypes.STRING());
+                    resultMap.put(column, value);
                 });
         computedColumns.forEach(
                 computedColumn -> {
@@ -176,7 +158,7 @@ public interface MongoVersionStrategy {
                     String computedValue = computedColumn.eval(parsedRow.get(fieldReference));
 
                     resultMap.put(columnName, computedValue);
-                    fieldTypes.put(columnName, computedColumn.columnType());
+                    rowTypeBuilder.field(columnName, computedColumn.columnType());
                 });
         return resultMap;
     }

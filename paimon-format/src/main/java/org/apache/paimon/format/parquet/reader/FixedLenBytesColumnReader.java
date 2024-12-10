@@ -1,12 +1,13 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,7 +25,7 @@ import org.apache.paimon.data.columnar.writable.WritableLongVector;
 import org.apache.paimon.format.parquet.ParquetSchemaConverter;
 
 import org.apache.parquet.column.ColumnDescriptor;
-import org.apache.parquet.column.page.PageReader;
+import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.PrimitiveType;
 
@@ -38,8 +39,9 @@ public class FixedLenBytesColumnReader<VECTOR extends WritableColumnVector>
     private final int precision;
 
     public FixedLenBytesColumnReader(
-            ColumnDescriptor descriptor, PageReader pageReader, int precision) throws IOException {
-        super(descriptor, pageReader);
+            ColumnDescriptor descriptor, PageReadStore pageReadStore, int precision)
+            throws IOException {
+        super(descriptor, pageReadStore);
         checkTypeName(PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY);
         this.precision = precision;
     }
@@ -69,13 +71,42 @@ public class FixedLenBytesColumnReader<VECTOR extends WritableColumnVector>
             WritableBytesVector bytesVector = (WritableBytesVector) column;
             for (int i = 0; i < num; i++) {
                 if (runLenDecoder.readInteger() == maxDefLevel) {
-                    byte[] bytes = readDataBinary(bytesLen).getBytes();
+                    byte[] bytes = readDataBinary(bytesLen).getBytesUnsafe();
                     bytesVector.appendBytes(rowId + i, bytes, 0, bytes.length);
                 } else {
                     bytesVector.setNullAt(rowId + i);
                 }
             }
         }
+    }
+
+    @Override
+    protected void skipBatch(int num) {
+        int bytesLen = descriptor.getPrimitiveType().getTypeLength();
+        if (ParquetSchemaConverter.is32BitDecimal(precision)) {
+            for (int i = 0; i < num; i++) {
+                if (runLenDecoder.readInteger() == maxDefLevel) {
+                    skipDataBinary(bytesLen);
+                }
+            }
+        } else if (ParquetSchemaConverter.is64BitDecimal(precision)) {
+
+            for (int i = 0; i < num; i++) {
+                if (runLenDecoder.readInteger() == maxDefLevel) {
+                    skipDataBinary(bytesLen);
+                }
+            }
+        } else {
+            for (int i = 0; i < num; i++) {
+                if (runLenDecoder.readInteger() == maxDefLevel) {
+                    skipDataBinary(bytesLen);
+                }
+            }
+        }
+    }
+
+    private void skipDataBinary(int len) {
+        skipDataBuffer(len);
     }
 
     @Override
@@ -101,7 +132,7 @@ public class FixedLenBytesColumnReader<VECTOR extends WritableColumnVector>
             WritableBytesVector bytesVector = (WritableBytesVector) column;
             for (int i = rowId; i < rowId + num; ++i) {
                 if (!bytesVector.isNullAt(i)) {
-                    byte[] v = dictionary.decodeToBinary(dictionaryIds.getInt(i)).getBytes();
+                    byte[] v = dictionary.decodeToBinary(dictionaryIds.getInt(i)).getBytesUnsafe();
                     bytesVector.appendBytes(i, v, 0, v.length);
                 }
             }

@@ -20,6 +20,7 @@ package org.apache.paimon.flink.action.cdc.pulsar;
 
 import org.apache.paimon.flink.action.cdc.MessageQueueSchemaUtils;
 import org.apache.paimon.flink.action.cdc.TypeMapping;
+import org.apache.paimon.flink.action.cdc.serialization.CdcJsonDeserializationSchema;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
@@ -51,13 +52,12 @@ public class PulsarSchemaITCase extends PulsarActionITCaseBase {
         sendMessages(topic, messages);
 
         Configuration pulsarConfig = Configuration.fromMap(getBasicPulsarConfig());
-        pulsarConfig.set(TOPIC, topic);
+        pulsarConfig.setString(TOPIC.key(), topic);
         pulsarConfig.set(VALUE_FORMAT, "canal-json");
 
         Schema pulsarSchema =
                 MessageQueueSchemaUtils.getSchema(
-                        createPulsarConsumer(pulsarConfig, topic),
-                        topic,
+                        createPulsarConsumer(pulsarConfig, new CdcJsonDeserializationSchema()),
                         getDataFormat(pulsarConfig),
                         TypeMapping.defaultMapping());
         List<DataField> fields = new ArrayList<>();

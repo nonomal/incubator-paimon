@@ -18,7 +18,10 @@
 
 package org.apache.paimon.flink;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.utils.BlockingIterator;
 
 import org.apache.flink.table.planner.factories.TestValuesTableFactory;
 import org.apache.flink.types.Row;
@@ -33,22 +36,10 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** Test case for append-only managed table. */
 public class AppendOnlyTableITCase extends CatalogITCaseBase {
-
-    @Test
-    public void testCreateTableWithPrimaryKey() {
-        assertThatThrownBy(
-                        () ->
-                                batchSql(
-                                        "CREATE TABLE pk_table (id INT PRIMARY KEY NOT ENFORCED, data STRING) "
-                                                + "WITH ('write-mode'='append-only')"))
-                .hasRootCauseInstanceOf(RuntimeException.class)
-                .hasRootCauseMessage(
-                        "Cannot define any primary key in an append-only table. Set 'write-mode'='change-log' if still "
-                                + "want to keep the primary key definition.");
-    }
 
     @Test
     public void testCreateUnawareBucketTableWithBucketKey() {
@@ -59,7 +50,19 @@ public class AppendOnlyTableITCase extends CatalogITCaseBase {
                                                 + "WITH ('bucket' = '-1', 'bucket-key' = 'id')"))
                 .hasRootCauseInstanceOf(RuntimeException.class)
                 .hasRootCauseMessage(
-                        "Cannot define 'bucket-key' in unaware or dynamic bucket mode.");
+                        "Cannot define 'bucket-key' with bucket -1, please specify a bucket number.");
+    }
+
+    @Test
+    public void testCreateUnawareBucketTableWithFullCompaction() {
+        assertThatThrownBy(
+                        () ->
+                                batchSql(
+                                        "CREATE TABLE pk_table (id INT, data STRING) "
+                                                + "WITH ('bucket' = '-1','full-compaction.delta-commits'='10')"))
+                .hasRootCauseInstanceOf(RuntimeException.class)
+                .hasRootCauseMessage(
+                        "AppendOnlyTable of unware or dynamic bucket does not support 'full-compaction.delta-commits'");
     }
 
     @Test
@@ -82,6 +85,22 @@ public class AppendOnlyTableITCase extends CatalogITCaseBase {
         rows = batchSql("SELECT data from append_table");
         assertThat(rows.size()).isEqualTo(2);
         assertThat(rows).containsExactlyInAnyOrder(Row.of("AAA"), Row.of("BBB"));
+    }
+
+    @Test
+    public void testReadUnwareBucketTableWithRebalanceShuffle() throws Exception {
+        batchSql(
+                "CREATE TABLE append_scalable_table (id INT, data STRING) "
+                        + "WITH ('bucket' = '-1', 'consumer-id' = 'test', 'consumer.expiration-time' = '365 d', 'target-file-size' = '1 B', 'source.split.target-size' = '1 B', 'scan.parallelism' = '4')");
+        batchSql("INSERT INTO append_scalable_table VALUES (1, 'AAA'), (2, 'BBB')");
+        batchSql("INSERT INTO append_scalable_table VALUES (1, 'AAA'), (2, 'BBB')");
+        batchSql("INSERT INTO append_scalable_table VALUES (1, 'AAA'), (2, 'BBB')");
+        batchSql("INSERT INTO append_scalable_table VALUES (1, 'AAA'), (2, 'BBB')");
+
+        BlockingIterator<Row, Row> iterator =
+                BlockingIterator.of(streamSqlIter(("SELECT id FROM append_scalable_table")));
+        assertThat(iterator.collect(2)).containsExactlyInAnyOrder(Row.of(1), Row.of(2));
+        iterator.close();
     }
 
     @Test
@@ -230,9 +249,18 @@ public class AppendOnlyTableITCase extends CatalogITCaseBase {
     }
 
     @Test
+    public void testNestedTypeDDL() {
+        assertThrows(
+                RuntimeException.class,
+                () ->
+                        batchSql(
+                                "CREATE TABLE IF NOT EXISTS nested_table (id INT, data MAP<INT, INT>) WITH ('bucket' = '1', 'bucket-key'='id,data')"),
+                "nested type can not in bucket-key, in your table these key are [data]");
+    }
+
+    @Test
     public void testTimestampLzType() {
-        sql(
-                "CREATE TABLE t_table (id INT, data TIMESTAMP_LTZ(3)) WITH ('write-mode'='append-only')");
+        sql("CREATE TABLE t_table (id INT, data TIMESTAMP_LTZ(3))");
         batchSql("INSERT INTO t_table VALUES (1, TIMESTAMP '2023-02-03 20:20:20')");
         assertThat(batchSql("SELECT * FROM t_table"))
                 .containsExactly(
@@ -243,12 +271,63 @@ public class AppendOnlyTableITCase extends CatalogITCaseBase {
                                         .toInstant()));
     }
 
+    @Test
+    public void testDynamicOptions() throws Exception {
+        sql("CREATE TABLE T (id INT)");
+        batchSql("INSERT INTO T VALUES (1)");
+        sEnv.getConfig()
+                .getConfiguration()
+                .setString(
+                        "paimon.*.*.T." + CoreOptions.SCAN_MODE.key(),
+                        CoreOptions.StartupMode.LATEST.toString());
+        BlockingIterator<Row, Row> iterator = streamSqlBlockIter("SELECT * FROM T");
+
+        // wait streaming job start
+        Thread.sleep(2000);
+
+        sql("INSERT INTO T VALUES (2)");
+        // Only fetch latest snapshot is, dynamic option worked
+        assertThat(iterator.collect(1)).containsExactlyInAnyOrder(Row.of(2));
+    }
+
+    @Test
+    public void testReadWriteBranch() throws Exception {
+        // create table
+        sql("CREATE TABLE T (id INT)");
+        // insert data
+        batchSql("INSERT INTO T VALUES (1)");
+        // create tag
+        paimonTable("T").createTag("tag1", 1);
+        // create branch
+        paimonTable("T").createBranch("branch1", "tag1");
+        // insert data to branch
+        batchSql("INSERT INTO T/*+ OPTIONS('branch' = 'branch1') */ VALUES (2)");
+        List<Row> rows = batchSql("select * from T /*+ OPTIONS('branch' = 'branch1') */");
+        assertThat(rows).containsExactlyInAnyOrder(Row.of(2), Row.of(1));
+    }
+
+    @Test
+    public void testBranchNotExist() throws Exception {
+        // create table
+        sql("CREATE TABLE T (id INT)");
+        // insert data
+        batchSql("INSERT INTO T VALUES (1)");
+        // create tag
+        paimonTable("T").createTag("tag1", 1);
+        // create branch
+        paimonTable("T").createBranch("branch1", "tag1");
+        // call the FileSystemCatalog.getDataTableSchema() function
+        assertThatThrownBy(() -> paimonTable("T$branch_branch2"))
+                .isInstanceOf(Catalog.TableNotExistException.class)
+                .hasMessage("Table %s does not exist.", "default.T$branch_branch2");
+    }
+
     @Override
     protected List<String> ddl() {
         return Arrays.asList(
-                "CREATE TABLE IF NOT EXISTS append_table (id INT, data STRING) WITH ('write-mode'='append-only')",
-                "CREATE TABLE IF NOT EXISTS part_table (id INT, data STRING, dt STRING) PARTITIONED BY (dt) WITH ('write-mode'='append-only')",
-                "CREATE TABLE IF NOT EXISTS complex_table (id INT, data MAP<INT, INT>) WITH ('write-mode'='append-only')");
+                "CREATE TABLE IF NOT EXISTS append_table (id INT, data STRING) WITH ('bucket' = '1', 'bucket-key'='id')",
+                "CREATE TABLE IF NOT EXISTS part_table (id INT, data STRING, dt STRING) PARTITIONED BY (dt) WITH ('bucket' = '1', 'bucket-key'='id')",
+                "CREATE TABLE IF NOT EXISTS complex_table (id INT, data MAP<INT, INT>) WITH ('bucket' = '1', 'bucket-key'='id')");
     }
 
     private void testRejectChanges(RowKind kind) {

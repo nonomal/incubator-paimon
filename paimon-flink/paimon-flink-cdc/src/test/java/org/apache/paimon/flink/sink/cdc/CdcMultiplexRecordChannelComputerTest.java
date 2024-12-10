@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.sink.cdc;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
@@ -33,6 +34,7 @@ import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.TraceableFileIO;
 
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -68,13 +70,14 @@ public class CdcMultiplexRecordChannelComputerTest {
         tableWithoutPartition = Identifier.create(databaseName, "test_table2");
 
         Options catalogOptions = new Options();
-        catalogOptions.set(CatalogOptions.WAREHOUSE, warehouse.getPath());
+        catalogOptions.set(CatalogOptions.WAREHOUSE, warehouse.toString());
         catalogOptions.set(CatalogOptions.URI, "");
         catalogLoader = () -> CatalogFactory.createCatalog(CatalogContext.create(catalogOptions));
         catalog = catalogLoader.load();
         catalog.createDatabase(databaseName, true);
 
         Options conf = new Options();
+        conf.set(CoreOptions.BUCKET, ThreadLocalRandom.current().nextInt(1, 5));
         conf.set(CdcRecordStoreWriteOperator.RETRY_SLEEP_TIME, Duration.ofMillis(10));
 
         RowType rowTypeWithPartition =
@@ -112,6 +115,13 @@ public class CdcMultiplexRecordChannelComputerTest {
         }
     }
 
+    @AfterEach
+    public void after() throws Exception {
+        if (catalog != null) {
+            catalog.close();
+        }
+    }
+
     @Test
     public void testSchemaWithPartition() throws Exception {
         ThreadLocalRandom random = ThreadLocalRandom.current();
@@ -130,7 +140,6 @@ public class CdcMultiplexRecordChannelComputerTest {
 
     @Test
     public void testSchemaNoPartition() {
-
         ThreadLocalRandom random = ThreadLocalRandom.current();
         int numInputs = random.nextInt(1000) + 1;
         List<Map<String, String>> input = new ArrayList<>();
@@ -149,14 +158,14 @@ public class CdcMultiplexRecordChannelComputerTest {
 
         int numChannels = random.nextInt(10) + 1;
         CdcMultiplexRecordChannelComputer channelComputer =
-                new CdcMultiplexRecordChannelComputer(catalogLoader, new HashMap<>());
+                new CdcMultiplexRecordChannelComputer(catalogLoader);
         channelComputer.setup(numChannels);
 
         // assert that insert and delete records are routed into same channel
 
-        for (Map<String, String> fields : input) {
-            CdcRecord insertRecord = new CdcRecord(RowKind.INSERT, fields);
-            CdcRecord deleteRecord = new CdcRecord(RowKind.DELETE, fields);
+        for (Map<String, String> data : input) {
+            CdcRecord insertRecord = new CdcRecord(RowKind.INSERT, data);
+            CdcRecord deleteRecord = new CdcRecord(RowKind.DELETE, data);
 
             assertThat(
                             channelComputer.channel(
@@ -175,8 +184,8 @@ public class CdcMultiplexRecordChannelComputerTest {
         // assert that channel >= 0
         int numTests = random.nextInt(10) + 1;
         for (int test = 0; test < numTests; test++) {
-            Map<String, String> fields = input.get(random.nextInt(input.size()));
-            CdcRecord record = new CdcRecord(RowKind.INSERT, fields);
+            Map<String, String> data = input.get(random.nextInt(input.size()));
+            CdcRecord record = new CdcRecord(RowKind.INSERT, data);
 
             int numBuckets = random.nextInt(numChannels * 4) + 1;
             for (int i = 0; i < numBuckets; i++) {

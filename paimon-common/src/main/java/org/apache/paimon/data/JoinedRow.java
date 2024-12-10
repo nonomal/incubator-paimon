@@ -75,6 +75,10 @@ public class JoinedRow implements InternalRow {
         this.row2 = row2;
     }
 
+    public static JoinedRow join(InternalRow row1, InternalRow row2) {
+        return new JoinedRow(row1, row2);
+    }
+
     /**
      * Replaces the {@link InternalRow} backing this {@link JoinedRow}.
      *
@@ -85,6 +89,14 @@ public class JoinedRow implements InternalRow {
         this.row1 = row1;
         this.row2 = row2;
         return this;
+    }
+
+    public InternalRow row1() {
+        return row1;
+    }
+
+    public InternalRow row2() {
+        return row2;
     }
 
     // ---------------------------------------------------------------------------------------------

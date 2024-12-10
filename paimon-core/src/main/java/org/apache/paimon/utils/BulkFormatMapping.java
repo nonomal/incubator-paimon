@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,36 +18,52 @@
 
 package org.apache.paimon.utils;
 
-import org.apache.paimon.KeyValue;
 import org.apache.paimon.casting.CastFieldGetter;
 import org.apache.paimon.format.FileFormatDiscover;
 import org.apache.paimon.format.FormatReaderFactory;
+import org.apache.paimon.partition.PartitionUtils;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.schema.IndexCastMapping;
-import org.apache.paimon.schema.KeyValueFieldsExtractor;
 import org.apache.paimon.schema.SchemaEvolutionUtil;
 import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.function.Function;
+
+import static org.apache.paimon.predicate.PredicateBuilder.excludePredicateWithFields;
 
 /** Class with index mapping and bulk format. */
 public class BulkFormatMapping {
 
     @Nullable private final int[] indexMapping;
     @Nullable private final CastFieldGetter[] castMapping;
+    @Nullable private final Pair<int[], RowType> partitionPair;
     private final FormatReaderFactory bulkFormat;
+    private final TableSchema dataSchema;
+    private final List<Predicate> dataFilters;
 
     public BulkFormatMapping(
-            int[] indexMapping,
+            @Nullable int[] indexMapping,
             @Nullable CastFieldGetter[] castMapping,
-            FormatReaderFactory bulkFormat) {
+            @Nullable Pair<int[], RowType> partitionPair,
+            FormatReaderFactory bulkFormat,
+            TableSchema dataSchema,
+            List<Predicate> dataFilters) {
         this.indexMapping = indexMapping;
         this.castMapping = castMapping;
         this.bulkFormat = bulkFormat;
+        this.partitionPair = partitionPair;
+        this.dataSchema = dataSchema;
+        this.dataFilters = dataFilters;
     }
 
     @Nullable
@@ -60,107 +76,137 @@ public class BulkFormatMapping {
         return castMapping;
     }
 
+    @Nullable
+    public Pair<int[], RowType> getPartitionPair() {
+        return partitionPair;
+    }
+
     public FormatReaderFactory getReaderFactory() {
         return bulkFormat;
     }
 
-    public static BulkFormatMappingBuilder newBuilder(
-            FileFormatDiscover formatDiscover,
-            KeyValueFieldsExtractor extractor,
-            int[][] keyProjection,
-            int[][] valueProjection,
-            @Nullable List<Predicate> filters) {
-        return new BulkFormatMappingBuilder(
-                formatDiscover, extractor, keyProjection, valueProjection, filters);
+    public TableSchema getDataSchema() {
+        return dataSchema;
     }
 
-    /** Builder to build {@link BulkFormatMapping}. */
+    public List<Predicate> getDataFilters() {
+        return dataFilters;
+    }
+
+    /** Builder for {@link BulkFormatMapping}. */
     public static class BulkFormatMappingBuilder {
 
         private final FileFormatDiscover formatDiscover;
-        private final KeyValueFieldsExtractor extractor;
-        private final int[][] keyProjection;
-        private final int[][] valueProjection;
+        private final List<DataField> readTableFields;
+        private final Function<TableSchema, List<DataField>> fieldsExtractor;
         @Nullable private final List<Predicate> filters;
 
-        private BulkFormatMappingBuilder(
+        public BulkFormatMappingBuilder(
                 FileFormatDiscover formatDiscover,
-                KeyValueFieldsExtractor extractor,
-                int[][] keyProjection,
-                int[][] valueProjection,
+                List<DataField> readTableFields,
+                Function<TableSchema, List<DataField>> fieldsExtractor,
                 @Nullable List<Predicate> filters) {
             this.formatDiscover = formatDiscover;
-            this.extractor = extractor;
-            this.keyProjection = keyProjection;
-            this.valueProjection = valueProjection;
+            this.readTableFields = readTableFields;
+            this.fieldsExtractor = fieldsExtractor;
             this.filters = filters;
         }
 
         public BulkFormatMapping build(
                 String formatIdentifier, TableSchema tableSchema, TableSchema dataSchema) {
-            List<DataField> tableKeyFields = extractor.keyFields(tableSchema);
-            List<DataField> tableValueFields = extractor.valueFields(tableSchema);
-            int[][] tableProjection =
-                    KeyValue.project(keyProjection, valueProjection, tableKeyFields.size());
 
-            List<DataField> dataKeyFields = extractor.keyFields(dataSchema);
-            List<DataField> dataValueFields = extractor.valueFields(dataSchema);
+            List<DataField> readDataFields = readDataFields(dataSchema);
 
-            RowType keyType = new RowType(dataKeyFields);
-            RowType valueType = new RowType(dataValueFields);
-            RowType dataRecordType = KeyValue.schema(keyType, valueType);
-
-            int[][] dataKeyProjection =
-                    SchemaEvolutionUtil.createDataProjection(
-                            tableKeyFields, dataKeyFields, keyProjection);
-            int[][] dataValueProjection =
-                    SchemaEvolutionUtil.createDataProjection(
-                            tableValueFields, dataValueFields, valueProjection);
-            int[][] dataProjection =
-                    KeyValue.project(dataKeyProjection, dataValueProjection, dataKeyFields.size());
-
-            /*
-             * We need to create index mapping on projection instead of key and value separately
-             * here, for example
-             *
-             * <ul>
-             *   <li>the table key fields: 1->d, 3->a, 4->b, 5->c
-             *   <li>the data key fields: 1->a, 2->b, 3->c
-             * </ul>
-             *
-             * <p>The value fields of table and data are 0->value_count, the key and value
-             * projections are as follows
-             *
-             * <ul>
-             *   <li>table key projection: [0, 1, 2, 3], value projection: [0], data projection: [0,
-             *       1, 2, 3, 4, 5, 6] which 4/5 is seq/kind and 6 is value
-             *   <li>data key projection: [0, 1, 2], value projection: [0], data projection: [0, 1,
-             *       2, 3, 4, 5] where 3/4 is seq/kind and 5 is value
-             * </ul>
-             *
-             * <p>We will get value index mapping null from above and we can't create projection
-             * index mapping based on key and value index mapping any more.
-             */
+            // build index cast mapping
             IndexCastMapping indexCastMapping =
-                    SchemaEvolutionUtil.createIndexCastMapping(
-                            Projection.of(tableProjection).toTopLevelIndexes(),
-                            tableKeyFields,
-                            tableValueFields,
-                            Projection.of(dataProjection).toTopLevelIndexes(),
-                            dataKeyFields,
-                            dataValueFields);
+                    SchemaEvolutionUtil.createIndexCastMapping(readTableFields, readDataFields);
 
+            // build partition mapping and filter partition fields
+            Pair<Pair<int[], RowType>, List<DataField>>
+                    partitionMappingAndFieldsWithoutPartitionPair =
+                            PartitionUtils.constructPartitionMapping(dataSchema, readDataFields);
+            Pair<int[], RowType> partitionMapping =
+                    partitionMappingAndFieldsWithoutPartitionPair.getLeft();
+
+            // build read row type
+            RowType readDataRowType =
+                    new RowType(partitionMappingAndFieldsWithoutPartitionPair.getRight());
+
+            // build read filters
+            List<Predicate> readFilters = readFilters(filters, tableSchema, dataSchema);
+
+            return new BulkFormatMapping(
+                    indexCastMapping.getIndexMapping(),
+                    indexCastMapping.getCastMapping(),
+                    partitionMapping,
+                    formatDiscover
+                            .discover(formatIdentifier)
+                            .createReaderFactory(readDataRowType, readFilters),
+                    dataSchema,
+                    readFilters);
+        }
+
+        private List<DataField> readDataFields(TableSchema dataSchema) {
+            List<DataField> dataFields = fieldsExtractor.apply(dataSchema);
+            List<DataField> readDataFields = new ArrayList<>();
+            for (DataField dataField : dataFields) {
+                readTableFields.stream()
+                        .filter(f -> f.id() == dataField.id())
+                        .findFirst()
+                        .ifPresent(
+                                field ->
+                                        readDataFields.add(
+                                                dataField.newType(
+                                                        pruneDataType(
+                                                                field.type(), dataField.type()))));
+            }
+            return readDataFields;
+        }
+
+        private DataType pruneDataType(DataType readType, DataType dataType) {
+            switch (readType.getTypeRoot()) {
+                case ROW:
+                    RowType r = (RowType) readType;
+                    RowType d = (RowType) dataType;
+                    ArrayList<DataField> newFields = new ArrayList<>();
+                    for (DataField rf : r.getFields()) {
+                        if (d.containsField(rf.id())) {
+                            DataField df = d.getField(rf.id());
+                            newFields.add(df.newType(pruneDataType(rf.type(), df.type())));
+                        }
+                    }
+                    return d.copy(newFields);
+                case MAP:
+                    return ((MapType) dataType)
+                            .newKeyValueType(
+                                    pruneDataType(
+                                            ((MapType) readType).getKeyType(),
+                                            ((MapType) dataType).getKeyType()),
+                                    pruneDataType(
+                                            ((MapType) readType).getValueType(),
+                                            ((MapType) dataType).getValueType()));
+                case ARRAY:
+                    return ((ArrayType) dataType)
+                            .newElementType(
+                                    pruneDataType(
+                                            ((ArrayType) readType).getElementType(),
+                                            ((ArrayType) dataType).getElementType()));
+                default:
+                    return dataType;
+            }
+        }
+
+        private List<Predicate> readFilters(
+                List<Predicate> filters, TableSchema tableSchema, TableSchema dataSchema) {
             List<Predicate> dataFilters =
                     tableSchema.id() == dataSchema.id()
                             ? filters
                             : SchemaEvolutionUtil.createDataFilters(
                                     tableSchema.fields(), dataSchema.fields(), filters);
-            return new BulkFormatMapping(
-                    indexCastMapping.getIndexMapping(),
-                    indexCastMapping.getCastMapping(),
-                    formatDiscover
-                            .discover(formatIdentifier)
-                            .createReaderFactory(dataRecordType, dataProjection, dataFilters));
+
+            // Skip pushing down partition filters to reader.
+            return excludePredicateWithFields(
+                    dataFilters, new HashSet<>(dataSchema.partitionKeys()));
         }
     }
 }

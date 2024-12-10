@@ -99,6 +99,7 @@ public class CdcSinkBuilder<T> {
         SingleOutputStreamOperator<CdcRecord> parsed =
                 input.forward()
                         .process(new CdcParsingProcessFunction<>(parserFactory))
+                        .name("Side Output")
                         .setParallelism(input.getParallelism());
 
         DataStream<Void> schemaChangeProcessFunction =
@@ -108,17 +109,22 @@ public class CdcSinkBuilder<T> {
                                 new UpdatedDataFieldsProcessFunction(
                                         new SchemaManager(dataTable.fileIO(), dataTable.location()),
                                         identifier,
-                                        catalogLoader));
+                                        catalogLoader))
+                        .name("Schema Evolution");
         schemaChangeProcessFunction.getTransformation().setParallelism(1);
         schemaChangeProcessFunction.getTransformation().setMaxParallelism(1);
 
+        DataStream<CdcRecord> converted =
+                CaseSensitiveUtils.cdcRecordConvert(catalogLoader, parsed);
         BucketMode bucketMode = dataTable.bucketMode();
         switch (bucketMode) {
-            case FIXED:
-                return buildForFixedBucket(parsed);
-            case DYNAMIC:
-                return new CdcDynamicBucketSink((FileStoreTable) table).build(parsed, parallelism);
-            case UNAWARE:
+            case HASH_FIXED:
+                return buildForFixedBucket(converted);
+            case HASH_DYNAMIC:
+                return new CdcDynamicBucketSink((FileStoreTable) table)
+                        .build(converted, parallelism);
+            case BUCKET_UNAWARE:
+                return buildForUnawareBucket(converted);
             default:
                 throw new UnsupportedOperationException("Unsupported bucket mode: " + bucketMode);
         }
@@ -128,6 +134,12 @@ public class CdcSinkBuilder<T> {
         FileStoreTable dataTable = (FileStoreTable) table;
         DataStream<CdcRecord> partitioned =
                 partition(parsed, new CdcRecordChannelComputer(dataTable.schema()), parallelism);
-        return new FlinkCdcSink(dataTable).sinkFrom(partitioned);
+        return new CdcFixedBucketSink(dataTable).sinkFrom(partitioned);
+    }
+
+    private DataStreamSink<?> buildForUnawareBucket(DataStream<CdcRecord> parsed) {
+        FileStoreTable dataTable = (FileStoreTable) table;
+        // rebalance it to make sure schema change work to avoid infinite loop
+        return new CdcUnawareBucketSink(dataTable, parallelism).sinkFrom(parsed.rebalance());
     }
 }

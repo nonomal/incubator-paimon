@@ -19,6 +19,7 @@
 package org.apache.paimon.flink.source;
 
 import org.apache.paimon.flink.FlinkConnectorOptions;
+import org.apache.paimon.flink.PaimonDataStreamScanProvider;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.table.DataTable;
@@ -26,14 +27,14 @@ import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.ReadBuilder;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.Source;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.connector.ChangelogMode;
-import org.apache.flink.table.connector.source.LookupTableSource;
 import org.apache.flink.table.connector.source.ScanTableSource.ScanContext;
 import org.apache.flink.table.connector.source.ScanTableSource.ScanRuntimeProvider;
-import org.apache.flink.table.connector.source.SourceProvider;
 import org.apache.flink.table.data.RowData;
-import org.apache.flink.table.plan.stats.TableStats;
 
 import javax.annotation.Nullable;
 
@@ -43,13 +44,16 @@ public class SystemTableSource extends FlinkTableSource {
     private final boolean isStreamingMode;
     private final int splitBatchSize;
     private final FlinkConnectorOptions.SplitAssignMode splitAssignMode;
+    private final ObjectIdentifier tableIdentifier;
 
-    public SystemTableSource(Table table, boolean isStreamingMode) {
+    public SystemTableSource(
+            Table table, boolean isStreamingMode, ObjectIdentifier tableIdentifier) {
         super(table);
         this.isStreamingMode = isStreamingMode;
         Options options = Options.fromMap(table.options());
         this.splitBatchSize = options.get(FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_BATCH_SIZE);
         this.splitAssignMode = options.get(FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_ASSIGN_MODE);
+        this.tableIdentifier = tableIdentifier;
     }
 
     public SystemTableSource(
@@ -59,11 +63,13 @@ public class SystemTableSource extends FlinkTableSource {
             @Nullable int[][] projectFields,
             @Nullable Long limit,
             int splitBatchSize,
-            FlinkConnectorOptions.SplitAssignMode splitAssignMode) {
+            FlinkConnectorOptions.SplitAssignMode splitAssignMode,
+            ObjectIdentifier tableIdentifier) {
         super(table, predicate, projectFields, limit);
         this.isStreamingMode = isStreamingMode;
         this.splitBatchSize = splitBatchSize;
         this.splitAssignMode = splitAssignMode;
+        this.tableIdentifier = tableIdentifier;
     }
 
     @Override
@@ -82,7 +88,20 @@ public class SystemTableSource extends FlinkTableSource {
         } else {
             source = new StaticFileStoreSource(readBuilder, limit, splitBatchSize, splitAssignMode);
         }
-        return SourceProvider.of(source);
+        return new PaimonDataStreamScanProvider(
+                source.getBoundedness() == Boundedness.BOUNDED,
+                env -> {
+                    Integer parallelism = inferSourceParallelism(env);
+                    DataStreamSource<RowData> dataStreamSource =
+                            env.fromSource(
+                                    source,
+                                    WatermarkStrategy.noWatermarks(),
+                                    tableIdentifier.asSummaryString());
+                    if (parallelism != null) {
+                        dataStreamSource.setParallelism(parallelism);
+                    }
+                    return dataStreamSource;
+                });
     }
 
     @Override
@@ -94,7 +113,8 @@ public class SystemTableSource extends FlinkTableSource {
                 projectFields,
                 limit,
                 splitBatchSize,
-                splitAssignMode);
+                splitAssignMode,
+                tableIdentifier);
     }
 
     @Override
@@ -103,18 +123,7 @@ public class SystemTableSource extends FlinkTableSource {
     }
 
     @Override
-    public void pushWatermark(WatermarkStrategy<RowData> watermarkStrategy) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public LookupTableSource.LookupRuntimeProvider getLookupRuntimeProvider(
-            LookupTableSource.LookupContext context) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public TableStats reportStatistics() {
-        throw new UnsupportedOperationException();
+    public boolean isStreaming() {
+        return isStreamingMode;
     }
 }

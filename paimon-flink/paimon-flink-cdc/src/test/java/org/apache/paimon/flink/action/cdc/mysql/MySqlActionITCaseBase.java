@@ -20,7 +20,6 @@ package org.apache.paimon.flink.action.cdc.mysql;
 
 import org.apache.paimon.flink.action.cdc.CdcActionITCaseBase;
 
-import org.apache.flink.api.java.utils.MultipleParameterTool;
 import org.junit.jupiter.api.AfterAll;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,10 +31,7 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -88,6 +84,11 @@ public class MySqlActionITCaseBase extends CdcActionITCaseBase {
         config.put("password", PASSWORD);
         // see mysql/my.cnf in test resources
         config.put("server-time-zone", ZoneId.of("America/New_York").toString());
+
+        // TODO When setting the parameter scan.newly-added-table.enabled=true in version 2.4.2, the
+        // Insert data inserted after the newly created table cannot be captured. When set to false,
+        // the mysql cdc works normally.
+        config.put("scan.newly-added-table.enabled", "false");
         return config;
     }
 
@@ -105,37 +106,7 @@ public class MySqlActionITCaseBase extends CdcActionITCaseBase {
             extends SyncTableActionBuilder<MySqlSyncTableAction> {
 
         public MySqlSyncTableActionBuilder(Map<String, String> mySqlConfig) {
-            super(mySqlConfig);
-        }
-
-        public MySqlSyncTableAction build() {
-            List<String> args =
-                    new ArrayList<>(
-                            Arrays.asList(
-                                    "--warehouse",
-                                    warehouse,
-                                    "--database",
-                                    database,
-                                    "--table",
-                                    tableName));
-
-            args.addAll(mapToArgs("--mysql-conf", sourceConfig));
-            args.addAll(mapToArgs("--catalog-conf", catalogConfig));
-            args.addAll(mapToArgs("--table-conf", tableConfig));
-
-            args.addAll(listToArgs("--partition-keys", partitionKeys));
-            args.addAll(listToArgs("--primary-keys", primaryKeys));
-            args.addAll(listToArgs("--type-mapping", typeMappingModes));
-
-            args.addAll(listToMultiArgs("--computed-column", computedColumnArgs));
-            args.addAll(listToMultiArgs("--metadata-column", metadataColumn));
-
-            MultipleParameterTool params =
-                    MultipleParameterTool.fromArgs(args.toArray(args.toArray(new String[0])));
-            return (MySqlSyncTableAction)
-                    new MySqlSyncTableActionFactory()
-                            .create(params)
-                            .orElseThrow(RuntimeException::new);
+            super(MySqlSyncTableAction.class, mySqlConfig);
         }
     }
 
@@ -144,35 +115,7 @@ public class MySqlActionITCaseBase extends CdcActionITCaseBase {
             extends SyncDatabaseActionBuilder<MySqlSyncDatabaseAction> {
 
         public MySqlSyncDatabaseActionBuilder(Map<String, String> mySqlConfig) {
-            super(mySqlConfig);
-        }
-
-        public MySqlSyncDatabaseAction build() {
-            List<String> args =
-                    new ArrayList<>(
-                            Arrays.asList("--warehouse", warehouse, "--database", database));
-
-            args.addAll(mapToArgs("--mysql-conf", sourceConfig));
-            args.addAll(mapToArgs("--catalog-conf", catalogConfig));
-            args.addAll(mapToArgs("--table-conf", tableConfig));
-
-            args.addAll(nullableToArgs("--ignore-incompatible", ignoreIncompatible));
-            args.addAll(nullableToArgs("--merge-shards", mergeShards));
-            args.addAll(nullableToArgs("--table-prefix", tablePrefix));
-            args.addAll(nullableToArgs("--table-suffix", tableSuffix));
-            args.addAll(nullableToArgs("--including-tables", includingTables));
-            args.addAll(nullableToArgs("--excluding-tables", excludingTables));
-            args.addAll(nullableToArgs("--mode", mode));
-
-            args.addAll(listToArgs("--type-mapping", typeMappingModes));
-            args.addAll(listToArgs("--metadata-column", metadataColumn));
-
-            MultipleParameterTool params =
-                    MultipleParameterTool.fromArgs(args.toArray(args.toArray(new String[0])));
-            return (MySqlSyncDatabaseAction)
-                    new MySqlSyncDatabaseActionFactory()
-                            .create(params)
-                            .orElseThrow(RuntimeException::new);
+            super(MySqlSyncDatabaseAction.class, mySqlConfig);
         }
     }
 }

@@ -15,7 +15,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.spark.sql.catalyst.parser.extensions
+
+import org.apache.paimon.spark.catalyst.plans.logical
+import org.apache.paimon.spark.catalyst.plans.logical._
+import org.apache.paimon.utils.TimeUtils
 
 import org.antlr.v4.runtime._
 import org.antlr.v4.runtime.misc.Interval
@@ -26,7 +31,6 @@ import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.parser.extensions.PaimonParserUtils.withOrigin
 import org.apache.spark.sql.catalyst.parser.extensions.PaimonSqlExtensionsParser._
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.trees.{CurrentOrigin, Origin}
 
 import scala.collection.JavaConverters._
 
@@ -52,25 +56,25 @@ class PaimonSqlExtensionsAstBuilder(delegate: ParserInterface)
     visit(ctx.statement).asInstanceOf[LogicalPlan]
   }
 
-  /** Creates a [[CallStatement]] for a stored procedure call. */
-  override def visitCall(ctx: CallContext): CallStatement = withOrigin(ctx) {
-    val name = toSeq(ctx.multipartIdentifier.parts).map(_.getText)
-    val args = toSeq(ctx.callArgument).map(typedVisit[CallArgument])
-    CallStatement(name, args)
+  /** Creates a [[PaimonCallStatement]] for a stored procedure call. */
+  override def visitCall(ctx: CallContext): PaimonCallStatement = withOrigin(ctx) {
+    val name = ctx.multipartIdentifier.parts.asScala.map(_.getText).toSeq
+    val args = ctx.callArgument.asScala.map(typedVisit[PaimonCallArgument]).toSeq
+    logical.PaimonCallStatement(name, args)
   }
 
   /** Creates a positional argument in a stored procedure call. */
-  override def visitPositionalArgument(ctx: PositionalArgumentContext): CallArgument =
+  override def visitPositionalArgument(ctx: PositionalArgumentContext): PaimonCallArgument =
     withOrigin(ctx) {
       val expression = typedVisit[Expression](ctx.expression)
-      PositionalArgument(expression)
+      PaimonPositionalArgument(expression)
     }
 
   /** Creates a named argument in a stored procedure call. */
-  override def visitNamedArgument(ctx: NamedArgumentContext): CallArgument = withOrigin(ctx) {
+  override def visitNamedArgument(ctx: NamedArgumentContext): PaimonCallArgument = withOrigin(ctx) {
     val name = ctx.identifier.getText
     val expression = typedVisit[Expression](ctx.expression)
-    NamedArgument(name, expression)
+    PaimonNamedArgument(name, expression)
   }
 
   /** Creates a [[Expression]] in a positional and named argument. */
@@ -86,8 +90,68 @@ class PaimonSqlExtensionsAstBuilder(delegate: ParserInterface)
   /** Returns a multi-part identifier as Seq[String]. */
   override def visitMultipartIdentifier(ctx: MultipartIdentifierContext): Seq[String] =
     withOrigin(ctx) {
-      ctx.parts.asScala.map(_.getText)
+      ctx.parts.asScala.map(_.getText).toSeq
     }
+
+  /** Create a SHOW TAGS logical command. */
+  override def visitShowTags(ctx: ShowTagsContext): ShowTagsCommand = withOrigin(ctx) {
+    ShowTagsCommand(typedVisit[Seq[String]](ctx.multipartIdentifier))
+  }
+
+  /** Create a CREATE OR REPLACE TAG logical command. */
+  override def visitCreateOrReplaceTag(ctx: CreateOrReplaceTagContext): CreateOrReplaceTagCommand =
+    withOrigin(ctx) {
+      val createTagClause = ctx.createReplaceTagClause()
+
+      val tagName = createTagClause.identifier().getText
+      val tagOptionsContext = Option(createTagClause.tagOptions())
+      val snapshotId =
+        tagOptionsContext
+          .flatMap(tagOptions => Option(tagOptions.snapshotId()))
+          .map(_.getText.toLong)
+      val timeRetainCtx = tagOptionsContext.flatMap(tagOptions => Option(tagOptions.timeRetain()))
+      val timeRetained = if (timeRetainCtx.nonEmpty) {
+        val (number, timeUnit) =
+          timeRetainCtx
+            .map(retain => (retain.number().getText.toLong, retain.timeUnit().getText))
+            .get
+        Option(TimeUtils.parseDuration(number, timeUnit))
+      } else {
+        None
+      }
+      val tagOptions = TagOptions(
+        snapshotId,
+        timeRetained
+      )
+
+      val create = createTagClause.CREATE() != null
+      val replace = createTagClause.REPLACE() != null
+      val ifNotExists = createTagClause.EXISTS() != null
+
+      CreateOrReplaceTagCommand(
+        typedVisit[Seq[String]](ctx.multipartIdentifier),
+        tagName,
+        tagOptions,
+        create,
+        replace,
+        ifNotExists)
+    }
+
+  /** Create a DELETE TAG logical command. */
+  override def visitDeleteTag(ctx: DeleteTagContext): DeleteTagCommand = withOrigin(ctx) {
+    DeleteTagCommand(
+      typedVisit[Seq[String]](ctx.multipartIdentifier),
+      ctx.identifier().getText,
+      ctx.EXISTS() != null)
+  }
+
+  /** Create a RENAME TAG logical command. */
+  override def visitRenameTag(ctx: RenameTagContext): RenameTagCommand = withOrigin(ctx) {
+    RenameTagCommand(
+      typedVisit[Seq[String]](ctx.multipartIdentifier),
+      ctx.identifier(0).getText,
+      ctx.identifier(1).getText)
+  }
 
   private def toBuffer[T](list: java.util.List[T]) = list.asScala
 
@@ -130,3 +194,34 @@ object PaimonParserUtils {
     stream.getText(Interval.of(0, stream.size() - 1))
   }
 }
+
+case class Origin(
+    line: Option[Int] = None,
+    startPosition: Option[Int] = None,
+    startIndex: Option[Int] = None,
+    stopIndex: Option[Int] = None,
+    sqlText: Option[String] = None,
+    objectType: Option[String] = None,
+    objectName: Option[String] = None) {}
+
+object CurrentOrigin {
+  private val value = new ThreadLocal[Origin]() {
+    override def initialValue: Origin = Origin()
+  }
+
+  def get: Origin = value.get()
+  def set(o: Origin): Unit = value.set(o)
+  def reset(): Unit = value.set(Origin())
+
+  def withOrigin[A](o: Origin)(f: => A): A = {
+    // remember the previous one so it can be reset to this
+    // way withOrigin can be recursive
+    val previous = get
+    set(o)
+    val ret =
+      try f
+      finally { set(previous) }
+    ret
+  }
+}
+/* Apache Spark copy end */

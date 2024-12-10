@@ -18,9 +18,12 @@
 
 package org.apache.paimon.format.parquet;
 
+import org.apache.paimon.fileindex.FileIndexResult;
+import org.apache.paimon.format.SimpleStatsExtractor;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.utils.Pair;
 
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.column.statistics.Statistics;
@@ -44,9 +47,9 @@ public class ParquetUtil {
      * @return result sets as map, key is column name, value is statistics (for example, null count,
      *     minimum value, maximum value)
      */
-    public static Map<String, Statistics<?>> extractColumnStats(FileIO fileIO, Path path)
-            throws IOException {
-        try (ParquetFileReader reader = getParquetReader(fileIO, path)) {
+    public static Pair<Map<String, Statistics<?>>, SimpleStatsExtractor.FileInfo>
+            extractColumnStats(FileIO fileIO, Path path) throws IOException {
+        try (ParquetFileReader reader = getParquetReader(fileIO, path, null)) {
             ParquetMetadata parquetMetadata = reader.getFooter();
             List<BlockMetaData> blockMetaDataList = parquetMetadata.getBlocks();
             Map<String, Statistics<?>> resultStats = new HashMap<>();
@@ -65,7 +68,7 @@ public class ParquetUtil {
                     resultStats.put(columnName, midStats);
                 }
             }
-            return resultStats;
+            return Pair.of(resultStats, new SimpleStatsExtractor.FileInfo(reader.getRecordCount()));
         }
     }
 
@@ -75,9 +78,12 @@ public class ParquetUtil {
      * @param path the path of parquet files to be read
      * @return parquet reader, used for reading footer, status, etc.
      */
-    public static ParquetFileReader getParquetReader(FileIO fileIO, Path path) throws IOException {
-        return ParquetFileReader.open(
-                ParquetInputFile.fromPath(fileIO, path), ParquetReadOptions.builder().build());
+    public static ParquetFileReader getParquetReader(
+            FileIO fileIO, Path path, FileIndexResult fileIndexResult) throws IOException {
+        return new ParquetFileReader(
+                ParquetInputFile.fromPath(fileIO, path),
+                ParquetReadOptions.builder().build(),
+                fileIndexResult);
     }
 
     static void assertStatsClass(

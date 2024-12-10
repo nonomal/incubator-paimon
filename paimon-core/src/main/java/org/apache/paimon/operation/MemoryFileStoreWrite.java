@@ -19,11 +19,16 @@
 package org.apache.paimon.operation;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.deletionvectors.DeletionVectorsMaintainer;
 import org.apache.paimon.index.IndexMaintainer;
 import org.apache.paimon.io.cache.CacheManager;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
 import org.apache.paimon.memory.MemoryOwner;
 import org.apache.paimon.memory.MemoryPoolFactory;
+import org.apache.paimon.metrics.MetricRegistry;
+import org.apache.paimon.operation.metrics.WriterBufferMetric;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.RecordWriter;
 import org.apache.paimon.utils.SnapshotManager;
 
@@ -35,9 +40,8 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
-
-import static org.apache.paimon.CoreOptions.LOOKUP_CACHE_MAX_MEMORY_SIZE;
 
 /**
  * Base {@link FileStoreWrite} implementation which supports using shared memory and preempting
@@ -46,24 +50,38 @@ import static org.apache.paimon.CoreOptions.LOOKUP_CACHE_MAX_MEMORY_SIZE;
  * @param <T> type of record to write.
  */
 public abstract class MemoryFileStoreWrite<T> extends AbstractFileStoreWrite<T> {
+
     private static final Logger LOG = LoggerFactory.getLogger(MemoryFileStoreWrite.class);
 
-    private final CoreOptions options;
+    protected final CoreOptions options;
     protected final CacheManager cacheManager;
     private MemoryPoolFactory writeBufferPool;
 
+    private WriterBufferMetric writerBufferMetric;
+
     public MemoryFileStoreWrite(
-            String commitUser,
             SnapshotManager snapshotManager,
             FileStoreScan scan,
             CoreOptions options,
-            @Nullable IndexMaintainer.Factory<T> indexFactory) {
-        super(commitUser, snapshotManager, scan, indexFactory);
+            RowType partitionType,
+            @Nullable IndexMaintainer.Factory<T> indexFactory,
+            @Nullable DeletionVectorsMaintainer.Factory dvMaintainerFactory,
+            String tableName) {
+        super(
+                snapshotManager,
+                scan,
+                indexFactory,
+                dvMaintainerFactory,
+                tableName,
+                options,
+                options.bucket(),
+                partitionType,
+                options.writeMaxWritersToSpill(),
+                options.legacyPartitionName());
         this.options = options;
         this.cacheManager =
                 new CacheManager(
-                        options.pageSize(),
-                        options.toConfiguration().get(LOOKUP_CACHE_MAX_MEMORY_SIZE));
+                        options.lookupCacheMaxMemory(), options.lookupCacheHighPrioPoolRatio());
     }
 
     @Override
@@ -101,6 +119,7 @@ public abstract class MemoryFileStoreWrite<T> extends AbstractFileStoreWrite<T> 
                             + " but this is: "
                             + writer.getClass());
         }
+
         if (writeBufferPool == null) {
             LOG.debug("Use default heap memory segment pool for write buffer.");
             writeBufferPool =
@@ -110,5 +129,41 @@ public abstract class MemoryFileStoreWrite<T> extends AbstractFileStoreWrite<T> 
                             .addOwners(this::memoryOwners);
         }
         writeBufferPool.notifyNewOwner((MemoryOwner) writer);
+
+        if (writerBufferMetric != null) {
+            writerBufferMetric.increaseNumWriters();
+        }
+    }
+
+    @Override
+    public FileStoreWrite<T> withMetricRegistry(MetricRegistry metricRegistry) {
+        super.withMetricRegistry(metricRegistry);
+        registerWriterBufferMetric(metricRegistry);
+        return this;
+    }
+
+    private void registerWriterBufferMetric(MetricRegistry metricRegistry) {
+        if (metricRegistry != null) {
+            writerBufferMetric =
+                    new WriterBufferMetric(() -> writeBufferPool, metricRegistry, tableName);
+        }
+    }
+
+    @Override
+    public List<CommitMessage> prepareCommit(boolean waitCompaction, long commitIdentifier)
+            throws Exception {
+        List<CommitMessage> result = super.prepareCommit(waitCompaction, commitIdentifier);
+        if (writerBufferMetric != null) {
+            writerBufferMetric.setNumWriters(writers.values().stream().mapToInt(Map::size).sum());
+        }
+        return result;
+    }
+
+    @Override
+    public void close() throws Exception {
+        super.close();
+        if (this.writerBufferMetric != null) {
+            this.writerBufferMetric.close();
+        }
     }
 }

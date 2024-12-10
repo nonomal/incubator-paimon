@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,7 +27,7 @@ import org.apache.paimon.data.columnar.writable.WritableColumnVector;
 public class HeapRowVector extends AbstractHeapVector
         implements WritableColumnVector, RowColumnVector {
 
-    private final WritableColumnVector[] fields;
+    private WritableColumnVector[] fields;
 
     public HeapRowVector(int len, WritableColumnVector... fields) {
         super(len);
@@ -46,10 +46,19 @@ public class HeapRowVector extends AbstractHeapVector
     }
 
     @Override
+    public VectorizedColumnBatch getBatch() {
+        return new VectorizedColumnBatch(fields);
+    }
+
+    @Override
     public void reset() {
         super.reset();
         for (WritableColumnVector field : fields) {
             field.reset();
         }
+    }
+
+    public void setFields(WritableColumnVector[] fields) {
+        this.fields = fields;
     }
 }

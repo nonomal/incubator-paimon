@@ -32,6 +32,7 @@ import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.InnerTableRead;
 import org.apache.paimon.table.source.InnerTableScan;
 import org.apache.paimon.table.source.ReadOnceTableScan;
+import org.apache.paimon.table.source.SingletonSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.DataField;
@@ -42,7 +43,6 @@ import org.apache.paimon.utils.ProjectedRow;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.Iterators;
 
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -121,27 +121,18 @@ public class AllTableOptionsTable implements ReadonlyTable {
 
         @Override
         public Plan innerPlan() {
-            return () -> Collections.singletonList(new AllTableSplit(fileIO, allTablePaths));
+            return () -> Collections.singletonList(new AllTableSplit(allTablePaths));
         }
     }
 
-    private static class AllTableSplit implements Split {
+    private static class AllTableSplit extends SingletonSplit {
 
         private static final long serialVersionUID = 1L;
 
-        private final FileIO fileIO;
         private final Map<String, Map<String, Path>> allTablePaths;
 
-        private AllTableSplit(FileIO fileIO, Map<String, Map<String, Path>> allTablePaths) {
-            this.fileIO = fileIO;
+        private AllTableSplit(Map<String, Map<String, Path>> allTablePaths) {
             this.allTablePaths = allTablePaths;
-        }
-
-        @Override
-        public long rowCount() {
-            return options(fileIO, allTablePaths).values().stream()
-                    .flatMap(t -> t.values().stream())
-                    .reduce(0, (a, b) -> a + b.size(), Integer::sum);
         }
 
         @Override
@@ -165,7 +156,7 @@ public class AllTableOptionsTable implements ReadonlyTable {
     private static class AllTableOptionsRead implements InnerTableRead {
 
         private final FileIO fileIO;
-        private int[][] projection;
+        private RowType readType;
 
         public AllTableOptionsRead(FileIO fileIO) {
             this.fileIO = fileIO;
@@ -177,8 +168,8 @@ public class AllTableOptionsTable implements ReadonlyTable {
         }
 
         @Override
-        public InnerTableRead withProjection(int[][] projection) {
-            this.projection = projection;
+        public InnerTableRead withReadType(RowType readType) {
+            this.readType = readType;
             return this;
         }
 
@@ -188,43 +179,48 @@ public class AllTableOptionsTable implements ReadonlyTable {
         }
 
         @Override
-        public RecordReader<InternalRow> createReader(Split split) throws IOException {
+        public RecordReader<InternalRow> createReader(Split split) {
             if (!(split instanceof AllTableSplit)) {
                 throw new IllegalArgumentException("Unsupported split: " + split.getClass());
             }
             Map<String, Map<String, Path>> location = ((AllTableSplit) split).allTablePaths;
             Iterator<InternalRow> rows = toRow(options(fileIO, location));
-            if (projection != null) {
+            if (readType != null) {
                 rows =
                         Iterators.transform(
-                                rows, row -> ProjectedRow.from(projection).replaceRow(row));
+                                rows,
+                                row ->
+                                        ProjectedRow.from(
+                                                        readType, AggregationFieldsTable.TABLE_TYPE)
+                                                .replaceRow(row));
             }
             return new IteratorRecordReader<>(rows);
         }
-
-        private Iterator<InternalRow> toRow(Map<String, Map<String, Map<String, String>>> option) {
-            List<InternalRow> rows = new ArrayList<>();
-            for (Map.Entry<String, Map<String, Map<String, String>>> entry0 : option.entrySet()) {
-                String database = entry0.getKey();
-                for (Map.Entry<String, Map<String, String>> entry1 : entry0.getValue().entrySet()) {
-                    String tableName = entry1.getKey();
-                    for (Map.Entry<String, String> entry2 : entry1.getValue().entrySet()) {
-                        String key = entry2.getKey();
-                        String value = entry2.getValue();
-                        rows.add(
-                                GenericRow.of(
-                                        BinaryString.fromString(database),
-                                        BinaryString.fromString(tableName),
-                                        BinaryString.fromString(key),
-                                        BinaryString.fromString(value)));
-                    }
-                }
-            }
-            return rows.iterator();
-        }
     }
 
-    private static Map<String, Map<String, Map<String, String>>> options(
+    protected static Iterator<InternalRow> toRow(
+            Map<String, Map<String, Map<String, String>>> option) {
+        List<InternalRow> rows = new ArrayList<>();
+        for (Map.Entry<String, Map<String, Map<String, String>>> entry0 : option.entrySet()) {
+            String database = entry0.getKey();
+            for (Map.Entry<String, Map<String, String>> entry1 : entry0.getValue().entrySet()) {
+                String tableName = entry1.getKey();
+                for (Map.Entry<String, String> entry2 : entry1.getValue().entrySet()) {
+                    String key = entry2.getKey();
+                    String value = entry2.getValue();
+                    rows.add(
+                            GenericRow.of(
+                                    BinaryString.fromString(database),
+                                    BinaryString.fromString(tableName),
+                                    BinaryString.fromString(key),
+                                    BinaryString.fromString(value)));
+                }
+            }
+        }
+        return rows.iterator();
+    }
+
+    protected static Map<String, Map<String, Map<String, String>>> options(
             FileIO fileIO, Map<String, Map<String, Path>> allTablePaths) {
         Map<String, Map<String, Map<String, String>>> allOptions = new HashMap<>();
         for (Map.Entry<String, Map<String, Path>> entry0 : allTablePaths.entrySet()) {

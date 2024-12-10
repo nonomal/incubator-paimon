@@ -21,9 +21,9 @@ package org.apache.paimon.flink.sink;
 import org.apache.paimon.table.sink.CommitMessageSerializer;
 
 import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.serialization.SerializerConfig;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
-import org.apache.flink.core.io.SimpleVersionedSerializerTypeSerializerProxy;
 
 /** Type information of {@link Committable}. */
 public class CommittableTypeInfo extends TypeInformation<Committable> {
@@ -58,21 +58,20 @@ public class CommittableTypeInfo extends TypeInformation<Committable> {
         return false;
     }
 
-    @Override
+    /**
+     * Do not annotate with <code>@override</code> here to maintain compatibility with Flink 1.18-.
+     */
+    public TypeSerializer<Committable> createSerializer(SerializerConfig config) {
+        return this.createSerializer((ExecutionConfig) null);
+    }
+
+    /**
+     * Do not annotate with <code>@override</code> here to maintain compatibility with Flink 2.0+.
+     */
     public TypeSerializer<Committable> createSerializer(ExecutionConfig config) {
         // no copy, so that data from writer is directly going into committer while chaining
-        return new SimpleVersionedSerializerTypeSerializerProxy<Committable>(
-                () -> new CommittableSerializer(new CommitMessageSerializer())) {
-            @Override
-            public Committable copy(Committable from) {
-                return from;
-            }
-
-            @Override
-            public Committable copy(Committable from, Committable reuse) {
-                return from;
-            }
-        };
+        return new NoneCopyVersionedSerializerTypeSerializerProxy<Committable>(
+                () -> new CommittableSerializer(new CommitMessageSerializer())) {};
     }
 
     @Override

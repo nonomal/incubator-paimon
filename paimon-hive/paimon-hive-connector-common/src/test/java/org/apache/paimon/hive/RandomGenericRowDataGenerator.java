@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -59,6 +59,7 @@ public class RandomGenericRowDataGenerator {
                     DataTypes.DATE(),
                     DataTypes.TIME(),
                     DataTypes.TIMESTAMP(3),
+                    DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(3),
                     DataTypes.ARRAY(DataTypes.BIGINT()),
                     DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()));
 
@@ -79,6 +80,7 @@ public class RandomGenericRowDataGenerator {
                     "binary",
                     "date",
                     "string",
+                    "timestamp",
                     "timestamp",
                     "array<bigint>",
                     "map<string,int>");
@@ -101,6 +103,7 @@ public class RandomGenericRowDataGenerator {
                     "f_date",
                     "f_time",
                     "f_timestamp",
+                    "f_timestamp_ltz",
                     "f_list_long",
                     "f_map_string_int");
 
@@ -122,6 +125,7 @@ public class RandomGenericRowDataGenerator {
                     "comment_date",
                     "comment_time",
                     "comment_timestamp",
+                    "comment_timestamp_ltz",
                     "comment_list_long",
                     "comment_map_string_int");
 
@@ -171,6 +175,7 @@ public class RandomGenericRowDataGenerator {
                         randomBytes,
                         random.nextInt(10000),
                         random.nextInt(86400),
+                        Timestamp.fromEpochMillis(random.nextLong(Integer.MAX_VALUE)),
                         Timestamp.fromEpochMillis(random.nextLong(Integer.MAX_VALUE)),
                         new GenericArray(randomLongArray),
                         new GenericMap(randomMap));

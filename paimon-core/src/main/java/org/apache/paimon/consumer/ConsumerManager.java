@@ -20,14 +20,12 @@ package org.apache.paimon.consumer;
 
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
-import org.apache.paimon.fs.PositionOutputStream;
 import org.apache.paimon.utils.DateTimeUtils;
+import org.apache.paimon.utils.StringUtils;
 
 import java.io.IOException;
-import java.io.OutputStreamWriter;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
@@ -36,6 +34,8 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.utils.BranchManager.DEFAULT_MAIN_BRANCH;
+import static org.apache.paimon.utils.BranchManager.branchPath;
 import static org.apache.paimon.utils.FileUtils.listOriginalVersionedFiles;
 import static org.apache.paimon.utils.FileUtils.listVersionedFileStatus;
 
@@ -49,9 +49,17 @@ public class ConsumerManager implements Serializable {
     private final FileIO fileIO;
     private final Path tablePath;
 
+    private final String branch;
+
     public ConsumerManager(FileIO fileIO, Path tablePath) {
+        this(fileIO, tablePath, DEFAULT_MAIN_BRANCH);
+    }
+
+    public ConsumerManager(FileIO fileIO, Path tablePath, String branchName) {
         this.fileIO = fileIO;
         this.tablePath = tablePath;
+        this.branch =
+                StringUtils.isNullOrWhitespaceOnly(branchName) ? DEFAULT_MAIN_BRANCH : branchName;
     }
 
     public Optional<Consumer> consumer(String consumerId) {
@@ -59,10 +67,8 @@ public class ConsumerManager implements Serializable {
     }
 
     public void resetConsumer(String consumerId, Consumer consumer) {
-        try (PositionOutputStream out = fileIO.newOutputStream(consumerPath(consumerId), true)) {
-            OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8);
-            writer.write(consumer.toJson());
-            writer.flush();
+        try {
+            fileIO.overwriteFileUtf8(consumerPath(consumerId), consumer.toJson());
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -124,10 +130,11 @@ public class ConsumerManager implements Serializable {
     }
 
     private Path consumerDirectory() {
-        return new Path(tablePath + "/consumer");
+        return new Path(branchPath(tablePath, branch) + "/consumer");
     }
 
     private Path consumerPath(String consumerId) {
-        return new Path(tablePath + "/consumer/" + CONSUMER_PREFIX + consumerId);
+        return new Path(
+                branchPath(tablePath, branch) + "/consumer/" + CONSUMER_PREFIX + consumerId);
     }
 }

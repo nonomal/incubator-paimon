@@ -30,39 +30,56 @@ import java.util.concurrent.atomic.AtomicInteger;
 @ThreadSafe
 public class DataFilePathFactory {
 
-    public static final String DATA_FILE_PREFIX = "data-";
+    public static final String INDEX_PATH_SUFFIX = ".index";
 
-    public static final String CHANGELOG_FILE_PREFIX = "changelog-";
-
-    private final Path bucketDir;
+    private final Path parent;
     private final String uuid;
 
     private final AtomicInteger pathCount;
     private final String formatIdentifier;
+    private final String dataFilePrefix;
+    private final String changelogFilePrefix;
+    private final boolean fileSuffixIncludeCompression;
+    private final String fileCompression;
 
-    public DataFilePathFactory(Path root, String partition, int bucket, String formatIdentifier) {
-        this.bucketDir = bucketPath(root, partition, bucket);
+    public DataFilePathFactory(
+            Path parent,
+            String formatIdentifier,
+            String dataFilePrefix,
+            String changelogFilePrefix,
+            boolean fileSuffixIncludeCompression,
+            String fileCompression) {
+        this.parent = parent;
         this.uuid = UUID.randomUUID().toString();
-
         this.pathCount = new AtomicInteger(0);
         this.formatIdentifier = formatIdentifier;
+        this.dataFilePrefix = dataFilePrefix;
+        this.changelogFilePrefix = changelogFilePrefix;
+        this.fileSuffixIncludeCompression = fileSuffixIncludeCompression;
+        this.fileCompression = fileCompression;
     }
 
     public Path newPath() {
-        return newPath(DATA_FILE_PREFIX);
+        return newPath(dataFilePrefix);
     }
 
     public Path newChangelogPath() {
-        return newPath(CHANGELOG_FILE_PREFIX);
+        return newPath(changelogFilePrefix);
     }
 
     private Path newPath(String prefix) {
-        String name = prefix + uuid + "-" + pathCount.getAndIncrement() + "." + formatIdentifier;
-        return new Path(bucketDir, name);
+        String extension;
+        if (fileSuffixIncludeCompression) {
+            extension = "." + fileCompression + "." + formatIdentifier;
+        } else {
+            extension = "." + formatIdentifier;
+        }
+        String name = prefix + uuid + "-" + pathCount.getAndIncrement() + extension;
+        return new Path(parent, name);
     }
 
     public Path toPath(String fileName) {
-        return new Path(bucketDir + "/" + fileName);
+        return new Path(parent + "/" + fileName);
     }
 
     @VisibleForTesting
@@ -70,8 +87,27 @@ public class DataFilePathFactory {
         return uuid;
     }
 
-    public static Path bucketPath(Path tablePath, String partition, int bucket) {
-        return new Path(tablePath + "/" + partition + "/bucket-" + bucket);
+    public static Path dataFileToFileIndexPath(Path dataFilePath) {
+        return new Path(dataFilePath.getParent(), dataFilePath.getName() + INDEX_PATH_SUFFIX);
+    }
+
+    public static Path createNewFileIndexFilePath(Path filePath) {
+        String fileName = filePath.getName();
+        int dot = fileName.lastIndexOf(".");
+        int dash = fileName.lastIndexOf("-");
+
+        if (dash != -1) {
+            try {
+                int num = Integer.parseInt(fileName.substring(dash + 1, dot));
+                return new Path(
+                        filePath.getParent(),
+                        fileName.substring(0, dash + 1) + (num + 1) + INDEX_PATH_SUFFIX);
+            } catch (NumberFormatException ignore) {
+                // it is the first index file, has no number
+            }
+        }
+        return new Path(
+                filePath.getParent(), fileName.substring(0, dot) + "-" + 1 + INDEX_PATH_SUFFIX);
     }
 
     public static String formatIdentifier(String fileName) {

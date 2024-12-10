@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -41,7 +41,7 @@ import java.util.stream.Collectors;
 
 import static org.apache.paimon.predicate.PredicateBuilder.convertJavaObject;
 
-/** Converts {@link SearchArgument} to {@link Predicate} with best effort. */
+/** Converts {@link SearchArgument} to {@link Predicate} with the best effort. */
 public class SearchArgumentToPredicateConverter {
 
     private static final Logger LOG =
@@ -49,25 +49,31 @@ public class SearchArgumentToPredicateConverter {
 
     private final ExpressionTree root;
     private final List<PredicateLeaf> leaves;
-    private final List<String> columnNames;
+    private final List<String> hiveColumnNames;
     private final List<DataType> columnTypes;
     @Nullable private final Set<String> readColumnNames;
     private final PredicateBuilder builder;
 
     public SearchArgumentToPredicateConverter(
-            SearchArgument sarg,
+            SearchArgument searchArgument,
             List<String> columnNames,
             List<DataType> columnTypes,
             @Nullable Set<String> readColumnNames) {
-        this.root = sarg.getExpression();
-        this.leaves = sarg.getLeaves();
-        this.columnNames = columnNames;
+        this.root = searchArgument.getExpression();
+        this.leaves = searchArgument.getLeaves();
+        this.hiveColumnNames =
+                columnNames.stream().map(String::toLowerCase).collect(Collectors.toList());
         this.columnTypes = columnTypes;
+        if (readColumnNames != null) {
+            readColumnNames =
+                    readColumnNames.stream().map(String::toLowerCase).collect(Collectors.toSet());
+        }
         this.readColumnNames = readColumnNames;
+
         this.builder =
                 new PredicateBuilder(
                         RowType.of(
-                                columnTypes.toArray(new DataType[0]),
+                                this.columnTypes.toArray(new DataType[0]),
                                 columnNames.toArray(new String[0])));
     }
 
@@ -134,7 +140,7 @@ public class SearchArgumentToPredicateConverter {
                             + " is a partition column.");
         }
 
-        int idx = columnNames.indexOf(columnName);
+        int idx = hiveColumnNames.indexOf(columnName);
         Preconditions.checkArgument(idx >= 0, "Column " + columnName + " not found.");
         DataType columnType = columnTypes.get(idx);
         switch (leaf.getOperator()) {

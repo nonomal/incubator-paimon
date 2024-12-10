@@ -24,6 +24,9 @@ import org.apache.paimon.consumer.Consumer;
 import org.apache.paimon.consumer.ConsumerManager;
 import org.apache.paimon.table.FileStoreTable;
 
+import org.apache.flink.table.annotation.ArgumentHint;
+import org.apache.flink.table.annotation.DataTypeHint;
+import org.apache.flink.table.annotation.ProcedureHint;
 import org.apache.flink.table.procedure.ProcedureContext;
 
 /**
@@ -31,38 +34,44 @@ import org.apache.flink.table.procedure.ProcedureContext;
  *
  * <pre><code>
  *  -- reset the new next snapshot id in the consumer
- *  CALL reset_consumer('tableId', 'consumerId', nextSnapshotId)
+ *  CALL sys.reset_consumer('tableId', 'consumerId', nextSnapshotId)
  *
  *  -- delete consumer
- *  CALL reset_consumer('tableId', 'consumerId')
+ *  CALL sys.reset_consumer('tableId', 'consumerId')
  * </code></pre>
  */
 public class ResetConsumerProcedure extends ProcedureBase {
 
     public static final String IDENTIFIER = "reset_consumer";
 
+    @ProcedureHint(
+            argument = {
+                @ArgumentHint(name = "table", type = @DataTypeHint("STRING")),
+                @ArgumentHint(name = "consumer_id", type = @DataTypeHint("STRING")),
+                @ArgumentHint(
+                        name = "next_snapshot_id",
+                        type = @DataTypeHint("BIGINT"),
+                        isOptional = true)
+            })
     public String[] call(
             ProcedureContext procedureContext,
             String tableId,
             String consumerId,
-            long nextSnapshotId)
+            Long nextSnapshotId)
             throws Catalog.TableNotExistException {
         FileStoreTable fileStoreTable =
                 (FileStoreTable) catalog.getTable(Identifier.fromString(tableId));
         ConsumerManager consumerManager =
-                new ConsumerManager(fileStoreTable.fileIO(), fileStoreTable.location());
-        consumerManager.resetConsumer(consumerId, new Consumer(nextSnapshotId));
-
-        return new String[] {"Success"};
-    }
-
-    public String[] call(ProcedureContext procedureContext, String tableId, String consumerId)
-            throws Catalog.TableNotExistException {
-        FileStoreTable fileStoreTable =
-                (FileStoreTable) catalog.getTable(Identifier.fromString(tableId));
-        ConsumerManager consumerManager =
-                new ConsumerManager(fileStoreTable.fileIO(), fileStoreTable.location());
-        consumerManager.deleteConsumer(consumerId);
+                new ConsumerManager(
+                        fileStoreTable.fileIO(),
+                        fileStoreTable.location(),
+                        fileStoreTable.snapshotManager().branch());
+        if (nextSnapshotId != null) {
+            fileStoreTable.snapshotManager().snapshot(nextSnapshotId);
+            consumerManager.resetConsumer(consumerId, new Consumer(nextSnapshotId));
+        } else {
+            consumerManager.deleteConsumer(consumerId);
+        }
 
         return new String[] {"Success"};
     }

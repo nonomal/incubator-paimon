@@ -38,11 +38,23 @@ Options for paimon catalog.
 
 {{< generated/catalog_configuration >}}
 
+### FilesystemCatalogOptions
+
+Options for Filesystem catalog.
+
+{{< generated/file_system_catalog_configuration >}}
+
 ### HiveCatalogOptions
 
 Options for Hive catalog.
 
 {{< generated/hive_catalog_configuration >}}
+
+### JdbcCatalogOptions
+
+Options for Jdbc catalog.
+
+{{< generated/jdbc_catalog_configuration >}}
 
 ### FlinkCatalogOptions
 
@@ -56,8 +68,24 @@ Flink connector options for paimon.
 
 {{< generated/flink_connector_configuration >}}
 
+### SparkCatalogOptions
+
+Spark catalog options for paimon.
+
+{{< generated/spark_catalog_configuration >}}
+
 ### SparkConnectorOptions
 
 Spark connector options for paimon.
 
 {{< generated/spark_connector_configuration >}}
+
+### ORC Options
+
+{{< generated/orc_configuration >}}
+
+### RocksDB Options
+
+The following options allow users to finely adjust RocksDB for better performance. You can either specify them in table properties or in dynamic table hints.
+
+{{< generated/rocksdb_configuration >}}

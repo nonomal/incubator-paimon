@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,26 +18,21 @@
 
 package org.apache.paimon;
 
+import org.apache.paimon.annotation.Public;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
-import org.apache.paimon.manifest.FileKind;
-import org.apache.paimon.manifest.ManifestEntry;
-import org.apache.paimon.manifest.ManifestFileMeta;
-import org.apache.paimon.manifest.ManifestList;
-import org.apache.paimon.operation.FileStoreScan;
 import org.apache.paimon.utils.JsonSerdeUtil;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonCreator;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonGetter;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonInclude;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
 
 import javax.annotation.Nullable;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -61,66 +56,71 @@ import java.util.Objects;
  *       commitIdentifier (which is a long value). Json can automatically perform type conversion so
  *       there is no compatibility issue.
  * </ul>
+ *
+ * @since 0.9.0
  */
+@Public
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Snapshot {
 
     public static final long FIRST_SNAPSHOT_ID = 1;
 
     public static final int TABLE_STORE_02_VERSION = 1;
-    private static final int CURRENT_VERSION = 3;
+    protected static final int CURRENT_VERSION = 3;
 
-    private static final String FIELD_VERSION = "version";
-    private static final String FIELD_ID = "id";
-    private static final String FIELD_SCHEMA_ID = "schemaId";
-    private static final String FIELD_BASE_MANIFEST_LIST = "baseManifestList";
-    private static final String FIELD_DELTA_MANIFEST_LIST = "deltaManifestList";
-    private static final String FIELD_CHANGELOG_MANIFEST_LIST = "changelogManifestList";
-    private static final String FIELD_INDEX_MANIFEST = "indexManifest";
-    private static final String FIELD_COMMIT_USER = "commitUser";
-    private static final String FIELD_COMMIT_IDENTIFIER = "commitIdentifier";
-    private static final String FIELD_COMMIT_KIND = "commitKind";
-    private static final String FIELD_TIME_MILLIS = "timeMillis";
-    private static final String FIELD_LOG_OFFSETS = "logOffsets";
-    private static final String FIELD_TOTAL_RECORD_COUNT = "totalRecordCount";
-    private static final String FIELD_DELTA_RECORD_COUNT = "deltaRecordCount";
-    private static final String FIELD_CHANGELOG_RECORD_COUNT = "changelogRecordCount";
-    private static final String FIELD_WATERMARK = "watermark";
+    protected static final String FIELD_VERSION = "version";
+    protected static final String FIELD_ID = "id";
+    protected static final String FIELD_SCHEMA_ID = "schemaId";
+    protected static final String FIELD_BASE_MANIFEST_LIST = "baseManifestList";
+    protected static final String FIELD_DELTA_MANIFEST_LIST = "deltaManifestList";
+    protected static final String FIELD_CHANGELOG_MANIFEST_LIST = "changelogManifestList";
+    protected static final String FIELD_INDEX_MANIFEST = "indexManifest";
+    protected static final String FIELD_COMMIT_USER = "commitUser";
+    protected static final String FIELD_COMMIT_IDENTIFIER = "commitIdentifier";
+    protected static final String FIELD_COMMIT_KIND = "commitKind";
+    protected static final String FIELD_TIME_MILLIS = "timeMillis";
+    protected static final String FIELD_LOG_OFFSETS = "logOffsets";
+    protected static final String FIELD_TOTAL_RECORD_COUNT = "totalRecordCount";
+    protected static final String FIELD_DELTA_RECORD_COUNT = "deltaRecordCount";
+    protected static final String FIELD_CHANGELOG_RECORD_COUNT = "changelogRecordCount";
+    protected static final String FIELD_WATERMARK = "watermark";
+    protected static final String FIELD_STATISTICS = "statistics";
 
     // version of snapshot
     // null for paimon <= 0.2
     @JsonProperty(FIELD_VERSION)
     @Nullable
-    private final Integer version;
+    protected final Integer version;
 
     @JsonProperty(FIELD_ID)
-    private final long id;
+    protected final long id;
 
     @JsonProperty(FIELD_SCHEMA_ID)
-    private final long schemaId;
+    protected final long schemaId;
 
     // a manifest list recording all changes from the previous snapshots
     @JsonProperty(FIELD_BASE_MANIFEST_LIST)
-    private final String baseManifestList;
+    protected final String baseManifestList;
 
     // a manifest list recording all new changes occurred in this snapshot
     // for faster expire and streaming reads
     @JsonProperty(FIELD_DELTA_MANIFEST_LIST)
-    private final String deltaManifestList;
+    protected final String deltaManifestList;
 
     // a manifest list recording all changelog produced in this snapshot
     // null if no changelog is produced, or for paimon <= 0.2
     @JsonProperty(FIELD_CHANGELOG_MANIFEST_LIST)
     @Nullable
-    private final String changelogManifestList;
+    protected final String changelogManifestList;
 
     // a manifest recording all index files of this table
     // null if no index file
     @JsonProperty(FIELD_INDEX_MANIFEST)
     @JsonInclude(JsonInclude.Include.NON_NULL)
-    private final String indexManifest;
+    protected final String indexManifest;
 
     @JsonProperty(FIELD_COMMIT_USER)
-    private final String commitUser;
+    protected final String commitUser;
 
     // Mainly for snapshot deduplication.
     //
@@ -130,42 +130,53 @@ public class Snapshot {
     // If snapshot A has a smaller commitIdentifier than snapshot B, then snapshot A must be
     // committed before snapshot B, and thus snapshot A must contain older records than snapshot B.
     @JsonProperty(FIELD_COMMIT_IDENTIFIER)
-    private final long commitIdentifier;
+    protected final long commitIdentifier;
 
     @JsonProperty(FIELD_COMMIT_KIND)
-    private final CommitKind commitKind;
+    protected final CommitKind commitKind;
 
     @JsonProperty(FIELD_TIME_MILLIS)
-    private final long timeMillis;
+    protected final long timeMillis;
 
     @JsonProperty(FIELD_LOG_OFFSETS)
-    private final Map<Integer, Long> logOffsets;
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @Nullable
+    protected final Map<Integer, Long> logOffsets;
 
     // record count of all changes occurred in this snapshot
     // null for paimon <= 0.3
     @JsonProperty(FIELD_TOTAL_RECORD_COUNT)
     @Nullable
-    private final Long totalRecordCount;
+    protected final Long totalRecordCount;
 
     // record count of all new changes occurred in this snapshot
     // null for paimon <= 0.3
     @JsonProperty(FIELD_DELTA_RECORD_COUNT)
     @Nullable
-    private final Long deltaRecordCount;
+    protected final Long deltaRecordCount;
 
     // record count of all changelog produced in this snapshot
     // null for paimon <= 0.3
     @JsonProperty(FIELD_CHANGELOG_RECORD_COUNT)
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     @Nullable
-    private final Long changelogRecordCount;
+    protected final Long changelogRecordCount;
 
     // watermark for input records
     // null for paimon <= 0.3
     // null if there is no watermark in new committing, and the previous snapshot does not have a
     // watermark
     @JsonProperty(FIELD_WATERMARK)
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     @Nullable
-    private final Long watermark;
+    protected final Long watermark;
+
+    // stats file name for statistics of this table
+    // null if no stats file
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    @JsonProperty(FIELD_STATISTICS)
+    @Nullable
+    protected final String statistics;
 
     public Snapshot(
             long id,
@@ -182,7 +193,8 @@ public class Snapshot {
             @Nullable Long totalRecordCount,
             @Nullable Long deltaRecordCount,
             @Nullable Long changelogRecordCount,
-            @Nullable Long watermark) {
+            @Nullable Long watermark,
+            @Nullable String statistics) {
         this(
                 CURRENT_VERSION,
                 id,
@@ -199,7 +211,8 @@ public class Snapshot {
                 totalRecordCount,
                 deltaRecordCount,
                 changelogRecordCount,
-                watermark);
+                watermark,
+                statistics);
     }
 
     @JsonCreator
@@ -215,11 +228,12 @@ public class Snapshot {
             @JsonProperty(FIELD_COMMIT_IDENTIFIER) long commitIdentifier,
             @JsonProperty(FIELD_COMMIT_KIND) CommitKind commitKind,
             @JsonProperty(FIELD_TIME_MILLIS) long timeMillis,
-            @JsonProperty(FIELD_LOG_OFFSETS) Map<Integer, Long> logOffsets,
-            @JsonProperty(FIELD_TOTAL_RECORD_COUNT) Long totalRecordCount,
-            @JsonProperty(FIELD_DELTA_RECORD_COUNT) Long deltaRecordCount,
-            @JsonProperty(FIELD_CHANGELOG_RECORD_COUNT) Long changelogRecordCount,
-            @JsonProperty(FIELD_WATERMARK) Long watermark) {
+            @JsonProperty(FIELD_LOG_OFFSETS) @Nullable Map<Integer, Long> logOffsets,
+            @JsonProperty(FIELD_TOTAL_RECORD_COUNT) @Nullable Long totalRecordCount,
+            @JsonProperty(FIELD_DELTA_RECORD_COUNT) @Nullable Long deltaRecordCount,
+            @JsonProperty(FIELD_CHANGELOG_RECORD_COUNT) @Nullable Long changelogRecordCount,
+            @JsonProperty(FIELD_WATERMARK) @Nullable Long watermark,
+            @JsonProperty(FIELD_STATISTICS) @Nullable String statistics) {
         this.version = version;
         this.id = id;
         this.schemaId = schemaId;
@@ -236,6 +250,7 @@ public class Snapshot {
         this.deltaRecordCount = deltaRecordCount;
         this.changelogRecordCount = changelogRecordCount;
         this.watermark = watermark;
+        this.statistics = statistics;
     }
 
     @JsonGetter(FIELD_VERSION)
@@ -297,6 +312,7 @@ public class Snapshot {
     }
 
     @JsonGetter(FIELD_LOG_OFFSETS)
+    @Nullable
     public Map<Integer, Long> logOffsets() {
         return logOffsets;
     }
@@ -325,100 +341,14 @@ public class Snapshot {
         return watermark;
     }
 
-    /**
-     * Return all {@link ManifestFileMeta} instances for either data or changelog manifests in this
-     * snapshot.
-     *
-     * @param manifestList a {@link ManifestList} instance used for reading files at snapshot.
-     * @return a list of ManifestFileMeta.
-     */
-    public List<ManifestFileMeta> allManifests(ManifestList manifestList) {
-        List<ManifestFileMeta> result = new ArrayList<>();
-        result.addAll(dataManifests(manifestList));
-        result.addAll(changelogManifests(manifestList));
-        return result;
-    }
-
-    /**
-     * Return a {@link ManifestFileMeta} for each data manifest in this snapshot.
-     *
-     * @param manifestList a {@link ManifestList} instance used for reading files at snapshot.
-     * @return a list of ManifestFileMeta.
-     */
-    public List<ManifestFileMeta> dataManifests(ManifestList manifestList) {
-        List<ManifestFileMeta> result = new ArrayList<>();
-        result.addAll(manifestList.read(baseManifestList));
-        result.addAll(deltaManifests(manifestList));
-        return result;
-    }
-
-    /**
-     * Return a {@link ManifestFileMeta} for each delta manifest in this snapshot.
-     *
-     * @param manifestList a {@link ManifestList} instance used for reading files at snapshot.
-     * @return a list of ManifestFileMeta.
-     */
-    public List<ManifestFileMeta> deltaManifests(ManifestList manifestList) {
-        return manifestList.read(deltaManifestList);
-    }
-
-    /**
-     * Return a {@link ManifestFileMeta} for each changelog manifest in this snapshot.
-     *
-     * @param manifestList a {@link ManifestList} instance used for reading files at snapshot.
-     * @return a list of ManifestFileMeta.
-     */
-    public List<ManifestFileMeta> changelogManifests(ManifestList manifestList) {
-        return changelogManifestList == null
-                ? Collections.emptyList()
-                : manifestList.read(changelogManifestList);
-    }
-
-    /**
-     * Return record count of all changes occurred in this snapshot given the scan.
-     *
-     * @param scan a {@link FileStoreScan} instance used for count of reading files at snapshot.
-     * @return total record count of Snapshot.
-     */
-    public Long totalRecordCount(FileStoreScan scan) {
-        return totalRecordCount == null
-                ? recordCount(scan.withSnapshot(id).plan().files())
-                : totalRecordCount;
-    }
-
-    public static long recordCount(List<ManifestEntry> manifestEntries) {
-        return manifestEntries.stream().mapToLong(manifest -> manifest.file().rowCount()).sum();
-    }
-
-    public static long recordCountAdd(List<ManifestEntry> manifestEntries) {
-        return manifestEntries.stream()
-                .filter(manifestEntry -> FileKind.ADD.equals(manifestEntry.kind()))
-                .mapToLong(manifest -> manifest.file().rowCount())
-                .sum();
-    }
-
-    public static long recordCountDelete(List<ManifestEntry> manifestEntries) {
-        return manifestEntries.stream()
-                .filter(manifestEntry -> FileKind.DELETE.equals(manifestEntry.kind()))
-                .mapToLong(manifest -> manifest.file().rowCount())
-                .sum();
+    @JsonGetter(FIELD_STATISTICS)
+    @Nullable
+    public String statistics() {
+        return statistics;
     }
 
     public String toJson() {
         return JsonSerdeUtil.toJson(this);
-    }
-
-    public static Snapshot fromJson(String json) {
-        return JsonSerdeUtil.fromJson(json, Snapshot.class);
-    }
-
-    public static Snapshot fromPath(FileIO fileIO, Path path) {
-        try {
-            String json = fileIO.readFileUtf8(path);
-            return Snapshot.fromJson(json);
-        } catch (IOException e) {
-            throw new RuntimeException("Fails to read snapshot from path " + path, e);
-        }
     }
 
     @Override
@@ -476,6 +406,41 @@ public class Snapshot {
         COMPACT,
 
         /** Changes that clear up the whole partition and then add new records. */
-        OVERWRITE
+        OVERWRITE,
+
+        /** Collect statistics. */
+        ANALYZE
+    }
+
+    // =================== Utils for reading =========================
+
+    public static Snapshot fromJson(String json) {
+        return JsonSerdeUtil.fromJson(json, Snapshot.class);
+    }
+
+    public static Snapshot fromPath(FileIO fileIO, Path path) {
+        try {
+            return tryFromPath(fileIO, path);
+        } catch (FileNotFoundException e) {
+            String errorMessage =
+                    String.format(
+                            "Snapshot file %s does not exist. "
+                                    + "It might have been expired by other jobs operating on this table. "
+                                    + "In this case, you can avoid concurrent modification issues by configuring "
+                                    + "write-only = true and use a dedicated compaction job, or configuring "
+                                    + "different expiration thresholds for different jobs.",
+                            path);
+            throw new RuntimeException(errorMessage, e);
+        }
+    }
+
+    public static Snapshot tryFromPath(FileIO fileIO, Path path) throws FileNotFoundException {
+        try {
+            return Snapshot.fromJson(fileIO.readFileUtf8(path));
+        } catch (FileNotFoundException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new RuntimeException("Fails to read snapshot from path " + path, e);
+        }
     }
 }

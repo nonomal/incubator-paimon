@@ -21,11 +21,24 @@ package org.apache.paimon.codegen;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Pair;
 
+import org.apache.paimon.shade.guava30.com.google.common.cache.Cache;
+import org.apache.paimon.shade.guava30.com.google.common.cache.CacheBuilder;
+
+import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Supplier;
+import java.util.stream.IntStream;
+
+import static org.apache.paimon.codegen.CodeGenLoader.getCodeGenerator;
 
 /** Utils for code generations. */
 public class CodeGenUtils {
+
+    private static final Cache<ClassKey, Pair<Class<?>, Object[]>> COMPILED_CLASS_CACHE =
+            CacheBuilder.newBuilder().maximumSize(300).softValues().build();
 
     public static final Projection EMPTY_PROJECTION = input -> BinaryRow.EMPTY_ROW;
 
@@ -40,30 +53,131 @@ public class CodeGenUtils {
             return EMPTY_PROJECTION;
         }
 
-        return CodeGenLoader.getCodeGenerator()
-                .generateProjection("Projection", inputType, mapping)
-                .newInstance(CodeGenUtils.class.getClassLoader());
+        return generate(
+                Projection.class,
+                inputType.getFieldTypes(),
+                mapping,
+                () -> getCodeGenerator().generateProjection(inputType, mapping));
     }
 
     public static NormalizedKeyComputer newNormalizedKeyComputer(
-            List<DataType> fieldTypes, String name) {
-        return CodeGenLoader.getCodeGenerator()
-                .generateNormalizedKeyComputer(fieldTypes, name)
-                .newInstance(CodeGenUtils.class.getClassLoader());
+            List<DataType> inputTypes, int[] sortFields) {
+        return generate(
+                NormalizedKeyComputer.class,
+                inputTypes,
+                sortFields,
+                () -> getCodeGenerator().generateNormalizedKeyComputer(inputTypes, sortFields));
     }
 
-    public static GeneratedClass<RecordComparator> generateRecordComparator(
-            List<DataType> fieldTypes, String name) {
-        return CodeGenLoader.getCodeGenerator().generateRecordComparator(fieldTypes, name);
+    public static RecordComparator newRecordComparator(List<DataType> inputTypes) {
+        return newRecordComparator(
+                inputTypes, IntStream.range(0, inputTypes.size()).toArray(), true);
     }
 
-    public static GeneratedClass<RecordEqualiser> generateRecordEqualiser(
-            List<DataType> fieldTypes, String name) {
-        return CodeGenLoader.getCodeGenerator().generateRecordEqualiser(fieldTypes, name);
+    public static RecordComparator newRecordComparator(
+            List<DataType> inputTypes, int[] sortFields, boolean isAscendingOrder) {
+        return generate(
+                RecordComparator.class,
+                inputTypes,
+                sortFields,
+                () ->
+                        getCodeGenerator()
+                                .generateRecordComparator(
+                                        inputTypes, sortFields, isAscendingOrder));
     }
 
-    public static RecordComparator newRecordComparator(List<DataType> fieldTypes, String name) {
-        return generateRecordComparator(fieldTypes, name)
-                .newInstance(CodeGenUtils.class.getClassLoader());
+    public static RecordEqualiser newRecordEqualiser(List<DataType> fieldTypes) {
+        return newRecordEqualiser(fieldTypes, IntStream.range(0, fieldTypes.size()).toArray());
+    }
+
+    public static RecordEqualiser newRecordEqualiser(List<DataType> fieldTypes, int[] fields) {
+        return generate(
+                RecordEqualiser.class,
+                fieldTypes,
+                fields,
+                () -> getCodeGenerator().generateRecordEqualiser(fieldTypes, fields));
+    }
+
+    private static <T> T generate(
+            Class<?> classType,
+            List<DataType> fields,
+            int[] fieldsIndex,
+            Supplier<GeneratedClass<T>> supplier) {
+        ClassKey classKey = new ClassKey(classType, fields, fieldsIndex);
+
+        try {
+            Pair<Class<?>, Object[]> result =
+                    COMPILED_CLASS_CACHE.get(classKey, () -> generateClass(supplier));
+
+            //noinspection unchecked
+            return (T) GeneratedClass.newInstance(result.getLeft(), result.getRight());
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Could not instantiate generated class '" + classType + "'", e);
+        }
+    }
+
+    private static <T> Pair<Class<?>, Object[]> generateClass(
+            Supplier<GeneratedClass<T>> supplier) {
+        long time = System.currentTimeMillis();
+        OutOfMemoryError toThrow;
+
+        do {
+            try {
+                GeneratedClass<T> generatedClass = supplier.get();
+                return Pair.of(
+                        generatedClass.compile(CodeGenUtils.class.getClassLoader()),
+                        generatedClass.getReferences());
+            } catch (OutOfMemoryError error) {
+                // try to gc meta space
+                System.gc();
+                try {
+                    Thread.sleep(5_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw error;
+                }
+                toThrow = error;
+            }
+        } while ((System.currentTimeMillis() - time) < 120_000);
+
+        // retry fail
+        throw toThrow;
+    }
+
+    private static class ClassKey {
+
+        private final Class<?> classType;
+
+        private final List<DataType> fields;
+
+        private final int[] fieldsIndex;
+
+        public ClassKey(Class<?> classType, List<DataType> fields, int[] fieldsIndex) {
+            this.classType = classType;
+            this.fields = fields;
+            this.fieldsIndex = fieldsIndex;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            ClassKey classKey = (ClassKey) o;
+            return Objects.equals(classType, classKey.classType)
+                    && Objects.equals(fields, classKey.fields)
+                    && Arrays.equals(fieldsIndex, classKey.fieldsIndex);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(classType, fields);
+            result = 31 * result + Arrays.hashCode(fieldsIndex);
+            return result;
+        }
     }
 }

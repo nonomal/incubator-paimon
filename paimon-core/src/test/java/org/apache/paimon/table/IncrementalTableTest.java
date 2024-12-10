@@ -50,6 +50,7 @@ public class IncrementalTableTest extends TableTestBase {
                         .column("col1", DataTypes.INT())
                         .partitionKeys("pt")
                         .primaryKey("pk", "pt")
+                        .option("bucket", "1")
                         .build();
         catalog.createTable(identifier, schema, true);
         Table table = catalog.getTable(identifier);
@@ -161,6 +162,7 @@ public class IncrementalTableTest extends TableTestBase {
                         .column("col1", DataTypes.INT())
                         .partitionKeys("pt")
                         .primaryKey("pk", "pt")
+                        .option("bucket", "1")
                         .build();
         catalog.createTable(identifier, schema, true);
         Table table = catalog.getTable(identifier);
@@ -211,6 +213,7 @@ public class IncrementalTableTest extends TableTestBase {
                         .column("col1", DataTypes.INT())
                         .partitionKeys("pt")
                         .primaryKey("pk", "pt")
+                        .option("bucket", "1")
                         .build();
         catalog.createTable(identifier, schema, true);
         Table table = catalog.getTable(identifier);
@@ -222,6 +225,8 @@ public class IncrementalTableTest extends TableTestBase {
                 GenericRow.of(1, 1, 1),
                 GenericRow.of(1, 2, 1),
                 GenericRow.of(1, 3, 1),
+                GenericRow.of(1, 4, 1),
+                GenericRow.of(1, 5, 1),
                 GenericRow.of(2, 1, 1));
 
         // snapshot 2: append
@@ -232,7 +237,7 @@ public class IncrementalTableTest extends TableTestBase {
                 // UPDATE
                 GenericRow.of(1, 2, 2),
                 // NEW
-                GenericRow.of(1, 4, 1));
+                GenericRow.of(1, 6, 1));
 
         // snapshot 3: compact
         compact(table, row(1), 0);
@@ -244,24 +249,30 @@ public class IncrementalTableTest extends TableTestBase {
         // read tag1 tag2
         List<InternalRow> result = read(table, Pair.of(INCREMENTAL_BETWEEN, "TAG1,TAG2"));
         assertThat(result)
-                .containsExactlyInAnyOrder(GenericRow.of(1, 2, 2), GenericRow.of(1, 4, 1));
+                .containsExactlyInAnyOrder(GenericRow.of(1, 2, 2), GenericRow.of(1, 6, 1));
         result = read(auditLog, Pair.of(INCREMENTAL_BETWEEN, "TAG1,TAG2"));
         assertThat(result)
                 .containsExactlyInAnyOrder(
                         GenericRow.of(fromString("-D"), 1, 1, 1),
                         GenericRow.of(fromString("+I"), 1, 2, 2),
-                        GenericRow.of(fromString("+I"), 1, 4, 1));
+                        GenericRow.of(fromString("+I"), 1, 6, 1));
 
         // read tag1 tag3
         result = read(table, Pair.of(INCREMENTAL_BETWEEN, "TAG1,TAG3"));
         assertThat(result)
-                .containsExactlyInAnyOrder(GenericRow.of(1, 2, 2), GenericRow.of(1, 4, 1));
+                .containsExactlyInAnyOrder(GenericRow.of(1, 2, 2), GenericRow.of(1, 6, 1));
+
+        // read tag1 tag3 auditLog
         result = read(auditLog, Pair.of(INCREMENTAL_BETWEEN, "TAG1,TAG3"));
         assertThat(result)
                 .containsExactlyInAnyOrder(
                         GenericRow.of(fromString("-D"), 1, 1, 1),
                         GenericRow.of(fromString("+I"), 1, 2, 2),
-                        GenericRow.of(fromString("+I"), 1, 4, 1));
+                        GenericRow.of(fromString("+I"), 1, 6, 1));
+
+        // read tag1 tag3 projection
+        result = read(table, new int[][] {{1}}, Pair.of(INCREMENTAL_BETWEEN, "TAG1,TAG3"));
+        assertThat(result).containsExactlyInAnyOrder(GenericRow.of(2), GenericRow.of(6));
 
         assertThatThrownBy(() -> read(table, Pair.of(INCREMENTAL_BETWEEN, "TAG2,TAG1")))
                 .hasMessageContaining(

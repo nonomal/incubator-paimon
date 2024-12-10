@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,7 +24,7 @@ import org.apache.hadoop.hive.serde2.objectinspector.primitive.AbstractPrimitive
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.TimestampObjectInspector;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 
-/** {@link AbstractPrimitiveJavaObjectInspector} for TIMESTAMP type. */
+/** {@link AbstractPrimitiveJavaObjectInspector} for TIMESTAMP type. The precision is maintained. */
 public class PaimonTimestampObjectInspector extends AbstractPrimitiveJavaObjectInspector
         implements TimestampObjectInspector, WriteableObjectInspector {
 
@@ -34,9 +34,14 @@ public class PaimonTimestampObjectInspector extends AbstractPrimitiveJavaObjectI
 
     @Override
     public Timestamp getPrimitiveJavaObject(Object o) {
-        return o == null
-                ? null
-                : Timestamp.ofEpochMilli(((org.apache.paimon.data.Timestamp) o).getMillisecond());
+        if (o == null) {
+            return null;
+        }
+
+        org.apache.paimon.data.Timestamp timestamp = (org.apache.paimon.data.Timestamp) o;
+        long millis = timestamp.getMillisecond();
+        int nanos = (int) (millis % 1000 * 1_000_000) + timestamp.getNanoOfMillisecond();
+        return Timestamp.ofEpochMilli(millis, nanos);
     }
 
     @Override

@@ -18,19 +18,23 @@
 
 package org.apache.paimon.flink.sink;
 
+import org.apache.paimon.flink.ProcessRecordAttributesUtil;
+import org.apache.paimon.flink.utils.RuntimeContextUtils;
 import org.apache.paimon.index.BucketAssigner;
 import org.apache.paimon.index.HashBucketAssigner;
 import org.apache.paimon.index.SimpleHashBucketAssigner;
 import org.apache.paimon.schema.TableSchema;
-import org.apache.paimon.table.AbstractFileStoreTable;
+import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
 import org.apache.paimon.table.sink.PartitionKeyExtractor;
+import org.apache.paimon.utils.MathUtils;
 import org.apache.paimon.utils.SerializableFunction;
 
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.runtime.streamrecord.RecordAttributes;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
 /** Assign bucket for the input record, output record with bucket. */
@@ -41,7 +45,8 @@ public class HashBucketAssignerOperator<T> extends AbstractStreamOperator<Tuple2
 
     private final String initialCommitUser;
 
-    private final AbstractFileStoreTable table;
+    private final FileStoreTable table;
+    private final Integer numAssigners;
     private final SerializableFunction<TableSchema, PartitionKeyExtractor<T>> extractorFunction;
     private final boolean overwrite;
 
@@ -51,10 +56,12 @@ public class HashBucketAssignerOperator<T> extends AbstractStreamOperator<Tuple2
     public HashBucketAssignerOperator(
             String commitUser,
             Table table,
+            Integer numAssigners,
             SerializableFunction<TableSchema, PartitionKeyExtractor<T>> extractorFunction,
             boolean overwrite) {
         this.initialCommitUser = commitUser;
-        this.table = (AbstractFileStoreTable) table;
+        this.table = (FileStoreTable) table;
+        this.numAssigners = numAssigners;
         this.extractorFunction = extractorFunction;
         this.overwrite = overwrite;
     }
@@ -70,19 +77,20 @@ public class HashBucketAssignerOperator<T> extends AbstractStreamOperator<Tuple2
                 StateUtils.getSingleValueFromState(
                         context, "commit_user_state", String.class, initialCommitUser);
 
+        int numberTasks = RuntimeContextUtils.getNumberOfParallelSubtasks(getRuntimeContext());
+        int taskId = RuntimeContextUtils.getIndexOfThisSubtask(getRuntimeContext());
+        long targetRowNum = table.coreOptions().dynamicBucketTargetRowNum();
         this.assigner =
                 overwrite
-                        ? new SimpleHashBucketAssigner(
-                                getRuntimeContext().getNumberOfParallelSubtasks(),
-                                getRuntimeContext().getIndexOfThisSubtask(),
-                                table.coreOptions().dynamicBucketTargetRowNum())
+                        ? new SimpleHashBucketAssigner(numberTasks, taskId, targetRowNum)
                         : new HashBucketAssigner(
                                 table.snapshotManager(),
                                 commitUser,
                                 table.store().newIndexFileHandler(),
-                                getRuntimeContext().getNumberOfParallelSubtasks(),
-                                getRuntimeContext().getIndexOfThisSubtask(),
-                                table.coreOptions().dynamicBucketTargetRowNum());
+                                numberTasks,
+                                MathUtils.min(numAssigners, numberTasks),
+                                taskId,
+                                targetRowNum);
         this.extractor = extractorFunction.apply(table.schema());
     }
 
@@ -93,6 +101,11 @@ public class HashBucketAssignerOperator<T> extends AbstractStreamOperator<Tuple2
                 assigner.assign(
                         extractor.partition(value), extractor.trimmedPrimaryKey(value).hashCode());
         output.collect(new StreamRecord<>(new Tuple2<>(value, bucket)));
+    }
+
+    @Override
+    public void processRecordAttributes(RecordAttributes recordAttributes) {
+        ProcessRecordAttributesUtil.processWithOutput(recordAttributes, output);
     }
 
     @Override

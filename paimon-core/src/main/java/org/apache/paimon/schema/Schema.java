@@ -96,6 +96,10 @@ public class Schema {
         return comment;
     }
 
+    public Schema copy(RowType rowType) {
+        return new Schema(rowType.getFields(), partitionKeys, primaryKeys, options, comment);
+    }
+
     private static List<DataField> normalizeFields(
             List<DataField> fields, List<String> primaryKeys, List<String> partitionKeys) {
         List<String> fieldNames = fields.stream().map(DataField::name).collect(Collectors.toList());
@@ -161,7 +165,11 @@ public class Schema {
                         "Cannot define primary key on DDL and table options at the same time.");
             }
             String pk = options.get(CoreOptions.PRIMARY_KEY.key());
-            primaryKeys = Arrays.asList(pk.split(","));
+            primaryKeys =
+                    Arrays.stream(pk.split(","))
+                            .map(String::trim)
+                            .filter(s -> !s.isEmpty())
+                            .collect(Collectors.toList());
             options.remove(CoreOptions.PRIMARY_KEY.key());
         }
         return primaryKeys;
@@ -174,7 +182,11 @@ public class Schema {
                         "Cannot define partition on DDL and table options at the same time.");
             }
             String partitions = options.get(CoreOptions.PARTITION.key());
-            partitionKeys = Arrays.asList(partitions.split(","));
+            partitionKeys =
+                    Arrays.stream(partitions.split(","))
+                            .map(String::trim)
+                            .filter(s -> !s.isEmpty())
+                            .collect(Collectors.toList());
             options.remove(CoreOptions.PARTITION.key());
         }
         return partitionKeys;
@@ -319,7 +331,7 @@ public class Schema {
         }
 
         /** Declares table comment. */
-        public Builder comment(String comment) {
+        public Builder comment(@Nullable String comment) {
             this.comment = comment;
             return this;
         }

@@ -42,8 +42,8 @@ class OrcBulkWriterTest {
     @Test
     void testRowBatch(@TempDir java.nio.file.Path tempDir) throws IOException {
         Options options = new Options();
-        options.set(CoreOptions.ORC_WRITE_BATCH_SIZE, 1);
-        FileFormat orc = FileFormat.getFileFormat(options, "orc");
+        options.set(CoreOptions.WRITE_BATCH_SIZE, 1);
+        FileFormat orc = FileFormat.fromIdentifier("orc", options);
         Assertions.assertThat(orc).isInstanceOf(OrcFileFormat.class);
 
         RowType rowType =
@@ -56,7 +56,7 @@ class OrcBulkWriterTest {
 
         Path path = new Path(tempDir.toUri().toString(), "1.orc");
         PositionOutputStream out = LocalFileIO.create().newOutputStream(path, false);
-        FormatWriter formatWriter = writerFactory.create(out, null);
+        FormatWriter formatWriter = writerFactory.create(out, "zstd");
 
         Assertions.assertThat(formatWriter).isInstanceOf(OrcBulkWriter.class);
 

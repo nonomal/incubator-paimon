@@ -49,7 +49,7 @@ public class ManifestCommittable {
 
     public ManifestCommittable(
             long identifier,
-            Long watermark,
+            @Nullable Long watermark,
             Map<Integer, Long> logOffsets,
             List<CommitMessage> commitMessages) {
         this.identifier = identifier;
@@ -62,13 +62,14 @@ public class ManifestCommittable {
         commitMessages.add(commitMessage);
     }
 
-    public void addLogOffset(int bucket, long offset) {
-        if (logOffsets.containsKey(bucket)) {
+    public void addLogOffset(int bucket, long offset, boolean allowDuplicate) {
+        if (!allowDuplicate && logOffsets.containsKey(bucket)) {
             throw new RuntimeException(
                     String.format(
                             "bucket-%d appears multiple times, which is not possible.", bucket));
         }
-        logOffsets.put(bucket, offset);
+        long newOffset = Math.max(logOffsets.getOrDefault(bucket, offset), offset);
+        logOffsets.put(bucket, newOffset);
     }
 
     public long identifier() {

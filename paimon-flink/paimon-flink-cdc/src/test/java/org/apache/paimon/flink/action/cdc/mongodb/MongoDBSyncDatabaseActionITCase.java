@@ -18,7 +18,7 @@
 
 package org.apache.paimon.flink.action.cdc.mongodb;
 
-import org.apache.paimon.options.CatalogOptions;
+import org.apache.paimon.catalog.FileSystemCatalogOptions;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
@@ -196,7 +196,7 @@ public class MongoDBSyncDatabaseActionITCase extends MongoDBActionITCaseBase {
                         .withTableConfig(getBasicTableConfig())
                         .withCatalogConfig(
                                 Collections.singletonMap(
-                                        CatalogOptions.METASTORE.key(), "test-case-insensitive"))
+                                        FileSystemCatalogOptions.CASE_SENSITIVE.key(), "false"))
                         .build();
         runActionWithDefaultEnv(action);
 
@@ -258,6 +258,7 @@ public class MongoDBSyncDatabaseActionITCase extends MongoDBActionITCaseBase {
                         new String[] {"_id", "name", "description", "weight"}),
                 Collections.emptyList(),
                 Collections.singletonList("_id"),
+                Collections.emptyList(),
                 Collections.emptyMap());
 
         // try synchronization

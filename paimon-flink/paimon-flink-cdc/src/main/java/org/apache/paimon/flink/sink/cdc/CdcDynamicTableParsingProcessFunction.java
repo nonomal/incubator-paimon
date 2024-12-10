@@ -22,6 +22,7 @@ import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.types.DataField;
 
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.typeinfo.TypeHint;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.tuple.Tuple2;
@@ -74,7 +75,16 @@ public class CdcDynamicTableParsingProcessFunction<T> extends ProcessFunction<T,
         this.parserFactory = parserFactory;
     }
 
-    @Override
+    /**
+     * Do not annotate with <code>@override</code> here to maintain compatibility with Flink 1.18-.
+     */
+    public void open(OpenContext openContext) throws Exception {
+        open(new Configuration());
+    }
+
+    /**
+     * Do not annotate with <code>@override</code> here to maintain compatibility with Flink 2.0+.
+     */
     public void open(Configuration parameters) throws Exception {
         parser = parserFactory.create();
         catalog = catalogLoader.load();
@@ -95,17 +105,19 @@ public class CdcDynamicTableParsingProcessFunction<T> extends ProcessFunction<T,
         parser.parseNewTable()
                 .ifPresent(
                         schema -> {
-                            Identifier identifier =
-                                    new Identifier(database, parser.parseTableName());
+                            Identifier identifier = new Identifier(database, tableName);
                             try {
                                 catalog.createTable(identifier, schema, true);
                             } catch (Exception e) {
-                                LOG.error("create newly added paimon table error.", e);
+                                LOG.error(
+                                        "Cannot create newly added Paimon table {}",
+                                        identifier.getFullName(),
+                                        e);
                             }
                         });
 
         List<DataField> schemaChange = parser.parseSchemaChange();
-        if (schemaChange.size() > 0) {
+        if (!schemaChange.isEmpty()) {
             context.output(
                     DYNAMIC_SCHEMA_CHANGE_OUTPUT_TAG,
                     Tuple2.of(Identifier.create(database, tableName), schemaChange));
@@ -121,5 +133,13 @@ public class CdcDynamicTableParsingProcessFunction<T> extends ProcessFunction<T,
 
     private CdcMultiplexRecord wrapRecord(String databaseName, String tableName, CdcRecord record) {
         return CdcMultiplexRecord.fromCdcRecord(databaseName, tableName, record);
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (catalog != null) {
+            catalog.close();
+            catalog = null;
+        }
     }
 }

@@ -20,8 +20,9 @@ package org.apache.paimon.flink.sink.cdc;
 
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
-import org.apache.paimon.flink.sink.ChannelComputer;
+import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.ChannelComputer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,7 +31,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
-/** {@link ChannelComputer} for {@link CdcRecord}. */
+/** {@link ChannelComputer} for {@link CdcMultiplexRecord}. */
 public class CdcMultiplexRecordChannelComputer implements ChannelComputer<CdcMultiplexRecord> {
 
     private static final Logger LOG =
@@ -42,19 +43,14 @@ public class CdcMultiplexRecordChannelComputer implements ChannelComputer<CdcMul
     private transient int numChannels;
 
     private Map<Identifier, CdcRecordChannelComputer> channelComputers;
-    private Catalog catalog;
-    private final Map<String, String> dynamicOptions;
 
-    public CdcMultiplexRecordChannelComputer(
-            Catalog.Loader catalogLoader, Map<String, String> dynamicOptions) {
+    public CdcMultiplexRecordChannelComputer(Catalog.Loader catalogLoader) {
         this.catalogLoader = catalogLoader;
-        this.dynamicOptions = dynamicOptions;
     }
 
     @Override
     public void setup(int numChannels) {
         this.numChannels = numChannels;
-        this.catalog = catalogLoader.load();
         this.channelComputers = new HashMap<>();
     }
 
@@ -74,13 +70,22 @@ public class CdcMultiplexRecordChannelComputer implements ChannelComputer<CdcMul
                 Identifier.create(record.databaseName(), record.tableName()),
                 id -> {
                     FileStoreTable table;
-                    try {
+                    try (Catalog catalog = catalogLoader.load()) {
                         table = (FileStoreTable) catalog.getTable(id);
-                        table.copy(dynamicOptions);
                     } catch (Catalog.TableNotExistException e) {
-                        LOG.error("Failed to get table " + id.getFullName());
+                        LOG.error("Failed to get table {}", id.getFullName(), e);
                         return null;
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
                     }
+
+                    if (table.bucketMode() != BucketMode.HASH_FIXED) {
+                        throw new UnsupportedOperationException(
+                                String.format(
+                                        "Combine mode Sink only supports FIXED bucket mode, but %s is %s",
+                                        table.name(), table.bucketMode()));
+                    }
+
                     CdcRecordChannelComputer channelComputer =
                             new CdcRecordChannelComputer(table.schema());
                     channelComputer.setup(numChannels);
@@ -90,6 +95,6 @@ public class CdcMultiplexRecordChannelComputer implements ChannelComputer<CdcMul
 
     @Override
     public String toString() {
-        return "shuffle by table";
+        return "shuffle by bucket";
     }
 }

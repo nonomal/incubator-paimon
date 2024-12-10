@@ -18,80 +18,111 @@
 
 package org.apache.paimon;
 
-import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.deletionvectors.DeletionVectorsIndexFile;
 import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.index.HashIndexFile;
 import org.apache.paimon.index.IndexFileHandler;
 import org.apache.paimon.manifest.IndexManifestFile;
 import org.apache.paimon.manifest.ManifestFile;
 import org.apache.paimon.manifest.ManifestList;
+import org.apache.paimon.metastore.AddPartitionTagCallback;
+import org.apache.paimon.metastore.MetastoreClient;
+import org.apache.paimon.operation.ChangelogDeletion;
 import org.apache.paimon.operation.FileStoreCommitImpl;
-import org.apache.paimon.operation.FileStoreExpireImpl;
+import org.apache.paimon.operation.ManifestsReader;
 import org.apache.paimon.operation.PartitionExpire;
 import org.apache.paimon.operation.SnapshotDeletion;
 import org.apache.paimon.operation.TagDeletion;
 import org.apache.paimon.options.MemorySize;
+import org.apache.paimon.partition.PartitionExpireStrategy;
 import org.apache.paimon.schema.SchemaManager;
-import org.apache.paimon.tag.TagAutoCreation;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.service.ServiceManager;
+import org.apache.paimon.stats.StatsFile;
+import org.apache.paimon.stats.StatsFileHandler;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.CatalogEnvironment;
+import org.apache.paimon.table.sink.CallbackUtils;
+import org.apache.paimon.table.sink.CommitCallback;
+import org.apache.paimon.table.sink.TagCallback;
+import org.apache.paimon.tag.TagAutoManager;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.SegmentsCache;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.TagManager;
 
+import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Cache;
+
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.List;
 
 /**
  * Base {@link FileStore} implementation.
  *
  * @param <T> type of record to read and write.
  */
-public abstract class AbstractFileStore<T> implements FileStore<T> {
+abstract class AbstractFileStore<T> implements FileStore<T> {
 
     protected final FileIO fileIO;
     protected final SchemaManager schemaManager;
-    protected final long schemaId;
+    protected final TableSchema schema;
+    protected final String tableName;
     protected final CoreOptions options;
     protected final RowType partitionType;
+    private final CatalogEnvironment catalogEnvironment;
 
-    @Nullable private final SegmentsCache<String> writeManifestCache;
+    @Nullable private final SegmentsCache<Path> writeManifestCache;
+    @Nullable private SegmentsCache<Path> readManifestCache;
+    @Nullable private Cache<Path, Snapshot> snapshotCache;
 
-    public AbstractFileStore(
+    protected AbstractFileStore(
             FileIO fileIO,
             SchemaManager schemaManager,
-            long schemaId,
+            TableSchema schema,
+            String tableName,
             CoreOptions options,
-            RowType partitionType) {
+            RowType partitionType,
+            CatalogEnvironment catalogEnvironment) {
         this.fileIO = fileIO;
         this.schemaManager = schemaManager;
-        this.schemaId = schemaId;
+        this.schema = schema;
+        this.tableName = tableName;
         this.options = options;
         this.partitionType = partitionType;
-        MemorySize writeManifestCache = options.writeManifestCache();
+        this.catalogEnvironment = catalogEnvironment;
         this.writeManifestCache =
-                writeManifestCache.getBytes() == 0
-                        ? null
-                        : new SegmentsCache<>(options.pageSize(), writeManifestCache);
+                SegmentsCache.create(
+                        options.pageSize(), options.writeManifestCache(), Long.MAX_VALUE);
     }
 
+    @Override
     public FileStorePathFactory pathFactory() {
         return new FileStorePathFactory(
                 options.path(),
                 partitionType,
                 options.partitionDefaultName(),
-                options.fileFormat().getFormatIdentifier());
+                options.fileFormat().getFormatIdentifier(),
+                options.dataFilePrefix(),
+                options.changelogFilePrefix(),
+                options.legacyPartitionName(),
+                options.fileSuffixIncludeCompression(),
+                options.fileCompression());
     }
 
     @Override
     public SnapshotManager snapshotManager() {
-        return new SnapshotManager(fileIO, options.path());
+        return new SnapshotManager(fileIO, options.path(), options.branch(), snapshotCache);
     }
 
-    @VisibleForTesting
+    @Override
     public ManifestFile.Factory manifestFileFactory() {
         return manifestFileFactory(false);
     }
@@ -102,12 +133,13 @@ public abstract class AbstractFileStore<T> implements FileStore<T> {
                 schemaManager,
                 partitionType,
                 options.manifestFormat(),
+                options.manifestCompression(),
                 pathFactory(),
                 options.manifestTargetSize().getBytes(),
-                forWrite ? writeManifestCache : null);
+                forWrite ? writeManifestCache : readManifestCache);
     }
 
-    @VisibleForTesting
+    @Override
     public ManifestList.Factory manifestListFactory() {
         return manifestListFactory(false);
     }
@@ -116,20 +148,46 @@ public abstract class AbstractFileStore<T> implements FileStore<T> {
         return new ManifestList.Factory(
                 fileIO,
                 options.manifestFormat(),
+                options.manifestCompression(),
                 pathFactory(),
-                forWrite ? writeManifestCache : null);
+                forWrite ? writeManifestCache : readManifestCache);
     }
 
-    protected IndexManifestFile.Factory indexManifestFileFactory() {
-        return new IndexManifestFile.Factory(fileIO, options.manifestFormat(), pathFactory());
+    @Override
+    public IndexManifestFile.Factory indexManifestFileFactory() {
+        return new IndexManifestFile.Factory(
+                fileIO,
+                options.manifestFormat(),
+                options.manifestCompression(),
+                pathFactory(),
+                readManifestCache);
     }
 
     @Override
     public IndexFileHandler newIndexFileHandler() {
         return new IndexFileHandler(
                 snapshotManager(),
+                pathFactory().indexFileFactory(),
                 indexManifestFileFactory().create(),
-                new HashIndexFile(fileIO, pathFactory().indexFileFactory()));
+                new HashIndexFile(fileIO, pathFactory().indexFileFactory()),
+                new DeletionVectorsIndexFile(
+                        fileIO,
+                        pathFactory().indexFileFactory(),
+                        bucketMode() == BucketMode.BUCKET_UNAWARE
+                                ? options.deletionVectorIndexFileTargetSize()
+                                : MemorySize.ofBytes(Long.MAX_VALUE)));
+    }
+
+    @Override
+    public StatsFileHandler newStatsFileHandler() {
+        return new StatsFileHandler(
+                snapshotManager(),
+                schemaManager,
+                new StatsFile(fileIO, pathFactory().statsFileFactory()));
+    }
+
+    protected ManifestsReader newManifestsReader(boolean forWrite) {
+        return new ManifestsReader(partitionType, snapshotManager(), manifestListFactory(forWrite));
     }
 
     @Override
@@ -149,11 +207,19 @@ public abstract class AbstractFileStore<T> implements FileStore<T> {
 
     @Override
     public FileStoreCommitImpl newCommit(String commitUser) {
+        return newCommit(commitUser, Collections.emptyList());
+    }
+
+    @Override
+    public FileStoreCommitImpl newCommit(String commitUser, List<CommitCallback> callbacks) {
         return new FileStoreCommitImpl(
                 fileIO,
                 schemaManager,
+                tableName,
                 commitUser,
                 partitionType,
+                options,
+                options.partitionDefaultName(),
                 pathFactory(),
                 snapshotManager(),
                 manifestFileFactory(),
@@ -165,19 +231,13 @@ public abstract class AbstractFileStore<T> implements FileStore<T> {
                 options.manifestFullCompactionThresholdSize(),
                 options.manifestMergeMinCount(),
                 partitionType.getFieldCount() > 0 && options.dynamicPartitionOverwrite(),
-                newKeyComparator());
-    }
-
-    @Override
-    public FileStoreExpireImpl newExpire() {
-        return new FileStoreExpireImpl(
-                options.snapshotNumRetainMin(),
-                options.snapshotNumRetainMax(),
-                options.snapshotTimeRetain().toMillis(),
-                snapshotManager(),
-                newSnapshotDeletion(),
-                newTagManager(),
-                options.snapshotExpireLimit());
+                newKeyComparator(),
+                options.branch(),
+                newStatsFileHandler(),
+                bucketMode(),
+                options.scanManifestParallelism(),
+                callbacks,
+                options.commitMaxRetries());
     }
 
     @Override
@@ -187,7 +247,24 @@ public abstract class AbstractFileStore<T> implements FileStore<T> {
                 pathFactory(),
                 manifestFileFactory().create(),
                 manifestListFactory().create(),
-                newIndexFileHandler());
+                newIndexFileHandler(),
+                newStatsFileHandler(),
+                options.changelogProducer() != CoreOptions.ChangelogProducer.NONE,
+                options.cleanEmptyDirectories(),
+                options.deleteFileThreadNum());
+    }
+
+    @Override
+    public ChangelogDeletion newChangelogDeletion() {
+        return new ChangelogDeletion(
+                fileIO,
+                pathFactory(),
+                manifestFileFactory().create(),
+                manifestListFactory().create(),
+                newIndexFileHandler(),
+                newStatsFileHandler(),
+                options.cleanEmptyDirectories(),
+                options.deleteFileThreadNum());
     }
 
     @Override
@@ -202,7 +279,10 @@ public abstract class AbstractFileStore<T> implements FileStore<T> {
                 pathFactory(),
                 manifestFileFactory().create(),
                 manifestListFactory().create(),
-                newIndexFileHandler());
+                newIndexFileHandler(),
+                newStatsFileHandler(),
+                options.cleanEmptyDirectories(),
+                options.deleteFileThreadNum());
     }
 
     public abstract Comparator<InternalRow> newKeyComparator();
@@ -215,20 +295,59 @@ public abstract class AbstractFileStore<T> implements FileStore<T> {
             return null;
         }
 
+        MetastoreClient.Factory metastoreClientFactory =
+                catalogEnvironment.metastoreClientFactory();
+        MetastoreClient metastoreClient = null;
+        if (options.partitionedTableInMetastore() && metastoreClientFactory != null) {
+            metastoreClient = metastoreClientFactory.create();
+        }
+
         return new PartitionExpire(
-                partitionType(),
                 partitionExpireTime,
                 options.partitionExpireCheckInterval(),
-                options.partitionTimestampPattern(),
-                options.partitionTimestampFormatter(),
+                PartitionExpireStrategy.createPartitionExpireStrategy(options, partitionType()),
                 newScan(),
-                newCommit(commitUser));
+                newCommit(commitUser),
+                metastoreClient,
+                options.endInputCheckPartitionExpire(),
+                options.partitionExpireMaxNum());
     }
 
     @Override
-    @Nullable
-    public TagAutoCreation newTagCreationManager() {
-        return TagAutoCreation.create(
-                options, snapshotManager(), newTagManager(), newTagDeletion());
+    public TagAutoManager newTagCreationManager() {
+        return TagAutoManager.create(
+                options,
+                snapshotManager(),
+                newTagManager(),
+                newTagDeletion(),
+                createTagCallbacks());
+    }
+
+    @Override
+    public List<TagCallback> createTagCallbacks() {
+        List<TagCallback> callbacks = new ArrayList<>(CallbackUtils.loadTagCallbacks(options));
+        String partitionField = options.tagToPartitionField();
+        MetastoreClient.Factory metastoreClientFactory =
+                catalogEnvironment.metastoreClientFactory();
+        if (partitionField != null && metastoreClientFactory != null) {
+            callbacks.add(
+                    new AddPartitionTagCallback(metastoreClientFactory.create(), partitionField));
+        }
+        return callbacks;
+    }
+
+    @Override
+    public ServiceManager newServiceManager() {
+        return new ServiceManager(fileIO, options.path());
+    }
+
+    @Override
+    public void setManifestCache(SegmentsCache<Path> manifestCache) {
+        this.readManifestCache = manifestCache;
+    }
+
+    @Override
+    public void setSnapshotCache(Cache<Path, Snapshot> cache) {
+        this.snapshotCache = cache;
     }
 }

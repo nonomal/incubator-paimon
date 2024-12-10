@@ -19,13 +19,27 @@
 package org.apache.paimon.flink;
 
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.flink.utils.RuntimeContextUtils;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.reader.RecordReaderIterator;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
 import org.apache.paimon.utils.FailingFileIO;
+import org.apache.paimon.utils.TimeUtils;
 
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.planner.factories.TestValuesTableFactory;
 import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.io.File;
 import java.time.Duration;
@@ -37,7 +51,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 
-import static org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions.CHECKPOINTING_INTERVAL;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -188,24 +201,59 @@ public class UnawareBucketAppendOnlyTableITCase extends CatalogITCaseBase {
     public void testCompactionInStreamingMode() throws Exception {
         batchSql("ALTER TABLE append_table SET ('compaction.min.file-num' = '2')");
         batchSql("ALTER TABLE append_table SET ('compaction.early-max.file-num' = '4')");
+        batchSql("ALTER TABLE append_table SET ('continuous.discovery-interval' = '1 s')");
 
-        sEnv.getConfig().getConfiguration().set(CHECKPOINTING_INTERVAL, Duration.ofMillis(500));
+        sEnv.getConfig()
+                .getConfiguration()
+                .setString(
+                        "execution.checkpointing.interval",
+                        TimeUtils.formatWithHighestUnit(Duration.ofMillis(500)));
         sEnv.executeSql(
                 "CREATE TEMPORARY TABLE Orders_in (\n"
                         + "    f0        INT,\n"
                         + "    f1        STRING\n"
                         + ") WITH (\n"
                         + "    'connector' = 'datagen',\n"
-                        + "    'rows-per-second' = '1',\n"
-                        + "    'number-of-rows' = '10'\n"
+                        + "    'rows-per-second' = '1'\n"
                         + ")");
 
         assertStreamingHasCompact("INSERT INTO append_table SELECT * FROM Orders_in", 60000);
         // ensure data gen finished
         Thread.sleep(5000);
+    }
 
-        List<Row> rows = batchSql("SELECT * FROM append_table");
-        assertThat(rows.size()).isEqualTo(10);
+    @Test
+    public void testCompactionInStreamingModeWithMaxWatermark() throws Exception {
+        batchSql("ALTER TABLE append_table SET ('compaction.min.file-num' = '2')");
+        batchSql("ALTER TABLE append_table SET ('compaction.early-max.file-num' = '4')");
+        batchSql("ALTER TABLE append_table SET ('continuous.discovery-interval' = '1 s')");
+
+        sEnv.getConfig()
+                .getConfiguration()
+                .setString(
+                        "execution.checkpointing.interval",
+                        TimeUtils.formatWithHighestUnit(Duration.ofMillis(500)));
+        sEnv.executeSql(
+                "CREATE TEMPORARY TABLE Orders_in (\n"
+                        + "    f0        INT,\n"
+                        + "    f1        STRING,\n"
+                        + "    ts        TIMESTAMP(3),\n"
+                        + "WATERMARK FOR ts AS ts - INTERVAL '0' SECOND"
+                        + ") WITH (\n"
+                        + "    'connector' = 'datagen',\n"
+                        + "    'rows-per-second' = '1',\n"
+                        + "    'number-of-rows' = '10'\n"
+                        + ")");
+
+        assertStreamingHasCompact("INSERT INTO append_table SELECT f0, f1 FROM Orders_in", 60000);
+        // ensure data gen finished
+        Thread.sleep(5000);
+
+        Snapshot snapshot = findLatestSnapshot("append_table");
+        Assertions.assertNotNull(snapshot);
+        Long watermark = snapshot.watermark();
+        Assertions.assertNotNull(watermark);
+        Assertions.assertTrue(watermark > Long.MIN_VALUE);
     }
 
     @Test
@@ -231,8 +279,7 @@ public class UnawareBucketAppendOnlyTableITCase extends CatalogITCaseBase {
 
     @Test
     public void testTimestampLzType() {
-        sql(
-                "CREATE TABLE t_table (id INT, data TIMESTAMP_LTZ(3)) WITH ('write-mode'='append-only')");
+        sql("CREATE TABLE t_table (id INT, data TIMESTAMP_LTZ(3))");
         batchSql("INSERT INTO t_table VALUES (1, TIMESTAMP '2023-02-03 20:20:20')");
         assertThat(batchSql("SELECT * FROM t_table"))
                 .containsExactly(
@@ -243,6 +290,7 @@ public class UnawareBucketAppendOnlyTableITCase extends CatalogITCaseBase {
                                         .toInstant()));
     }
 
+    // test is not correct, append table may insert twice if always retry when file io fails
     @Test
     public void testReadWriteFailRandom() throws Exception {
         setFailRate(100, 1000);
@@ -266,7 +314,7 @@ public class UnawareBucketAppendOnlyTableITCase extends CatalogITCaseBase {
                 () -> {
                     batchSql("SELECT * FROM append_table");
                     List<Row> rows = batchSql("SELECT * FROM append_table");
-                    assertThat(rows.size()).isEqualTo(size);
+                    assertThat(rows.size()).isGreaterThanOrEqualTo(size);
                     assertThat(rows).containsExactlyInAnyOrder(results.toArray(new Row[0]));
                 });
     }
@@ -295,17 +343,124 @@ public class UnawareBucketAppendOnlyTableITCase extends CatalogITCaseBase {
                 () -> {
                     batchSql("SELECT * FROM append_table");
                     List<Row> rows = batchSql("SELECT * FROM append_table");
-                    assertThat(rows.size()).isEqualTo(size);
+                    assertThat(rows.size()).isGreaterThanOrEqualTo(size);
                     assertThat(rows).containsExactlyInAnyOrder(results.toArray(new Row[0]));
                 });
+    }
+
+    @Test
+    public void testLimit() {
+        sql("INSERT INTO append_table VALUES (1, 'AAA')");
+        sql("INSERT INTO append_table VALUES (2, 'BBB')");
+        assertThat(sql("SELECT * FROM append_table LIMIT 1")).hasSize(1);
+    }
+
+    @Test
+    public void testFileIndex() {
+        batchSql(
+                "INSERT INTO index_table VALUES (1, 'a', 'AAA'), (1, 'a', 'AAA'), (2, 'c', 'BBB'), (3, 'c', 'BBB')");
+        batchSql(
+                "INSERT INTO index_table VALUES (1, 'a', 'AAA'), (1, 'a', 'AAA'), (2, 'd', 'BBB'), (3, 'd', 'BBB')");
+
+        assertThat(batchSql("SELECT * FROM index_table WHERE indexc = 'c' and (id = 2 or id = 3)"))
+                .containsExactlyInAnyOrder(Row.of(2, "c", "BBB"), Row.of(3, "c", "BBB"));
+    }
+
+    @Timeout(60)
+    @Test
+    public void testStatelessWriter() throws Exception {
+        FileStoreTable table =
+                FileStoreTableFactory.create(
+                        LocalFileIO.create(), new Path(path, "default.db/append_table"));
+
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder()
+                        .streamingMode()
+                        .parallelism(2)
+                        .checkpointIntervalMs(500)
+                        .build();
+        DataStream<Integer> source =
+                env.addSource(new TestStatelessWriterSource(table)).setParallelism(2).forward();
+
+        StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+        tEnv.registerCatalog("mycat", sEnv.getCatalog("PAIMON").get());
+        tEnv.executeSql("USE CATALOG mycat");
+        tEnv.createTemporaryView("S", tEnv.fromDataStream(source).as("id"));
+
+        tEnv.executeSql("INSERT INTO append_table SELECT id, 'test' FROM S").await();
+        assertThat(batchSql("SELECT * FROM append_table"))
+                .containsExactlyInAnyOrder(Row.of(1, "test"), Row.of(2, "test"));
+    }
+
+    private static class TestStatelessWriterSource extends RichParallelSourceFunction<Integer> {
+
+        private final FileStoreTable table;
+
+        private volatile boolean isRunning = true;
+
+        private TestStatelessWriterSource(FileStoreTable table) {
+            this.table = table;
+        }
+
+        @Override
+        public void run(SourceContext<Integer> sourceContext) throws Exception {
+            int taskId = RuntimeContextUtils.getIndexOfThisSubtask(getRuntimeContext());
+            // wait some time in parallelism #2,
+            // so that it does not commit in the same checkpoint with parallelism #1
+            int waitCount = (taskId == 0 ? 0 : 10);
+
+            while (isRunning) {
+                synchronized (sourceContext.getCheckpointLock()) {
+                    if (taskId == 0) {
+                        if (waitCount == 0) {
+                            sourceContext.collect(1);
+                        } else if (countNumRecords() >= 1) {
+                            // wait for the record to commit before exiting
+                            break;
+                        }
+                    } else {
+                        int numRecords = countNumRecords();
+                        if (numRecords >= 1) {
+                            if (waitCount == 0) {
+                                sourceContext.collect(2);
+                            } else if (countNumRecords() >= 2) {
+                                // make sure the next checkpoint is successful
+                                break;
+                            }
+                        }
+                    }
+                    waitCount--;
+                }
+                Thread.sleep(1000);
+            }
+        }
+
+        private int countNumRecords() throws Exception {
+            int ret = 0;
+            RecordReader<InternalRow> reader =
+                    table.newRead().createReader(table.newSnapshotReader().read());
+            try (RecordReaderIterator<InternalRow> it = new RecordReaderIterator<>(reader)) {
+                while (it.hasNext()) {
+                    it.next();
+                    ret++;
+                }
+            }
+            return ret;
+        }
+
+        @Override
+        public void cancel() {
+            isRunning = false;
+        }
     }
 
     @Override
     protected List<String> ddl() {
         return Arrays.asList(
-                "CREATE TABLE IF NOT EXISTS append_table (id INT, data STRING) WITH ('write-mode'='append-only', 'bucket' = '-1')",
-                "CREATE TABLE IF NOT EXISTS part_table (id INT, data STRING, dt STRING) PARTITIONED BY (dt) WITH ('write-mode'='append-only', 'bucket' = '-1')",
-                "CREATE TABLE IF NOT EXISTS complex_table (id INT, data MAP<INT, INT>) WITH ('write-mode'='append-only', 'bucket' = '-1')");
+                "CREATE TABLE IF NOT EXISTS append_table (id INT, data STRING) WITH ('bucket' = '-1')",
+                "CREATE TABLE IF NOT EXISTS part_table (id INT, data STRING, dt STRING) PARTITIONED BY (dt) WITH ('bucket' = '-1')",
+                "CREATE TABLE IF NOT EXISTS complex_table (id INT, data MAP<INT, INT>) WITH ('bucket' = '-1')",
+                "CREATE TABLE IF NOT EXISTS index_table (id INT, indexc STRING, data STRING) WITH ('bucket' = '-1', 'file-index.bloom-filter.columns'='indexc', 'file-index.bloom-filter.indexc.items' = '500')");
     }
 
     @Override

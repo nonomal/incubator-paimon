@@ -20,7 +20,6 @@ package org.apache.paimon.flink.source.align;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.disk.IOManager;
-import org.apache.paimon.disk.IOManagerImpl;
 import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.flink.source.ContinuousFileStoreSource;
 import org.apache.paimon.flink.source.FileStoreSourceSplit;
@@ -60,7 +59,7 @@ public class AlignedContinuousFileStoreSource extends ContinuousFileStoreSource 
     @Override
     public SourceReader<RowData, FileStoreSourceSplit> createReader(SourceReaderContext context) {
         IOManager ioManager =
-                new IOManagerImpl(
+                IOManager.create(
                         splitPaths(
                                 context.getConfiguration()
                                         .get(org.apache.flink.configuration.CoreOptions.TMP_DIRS)));
@@ -68,12 +67,13 @@ public class AlignedContinuousFileStoreSource extends ContinuousFileStoreSource 
                 new FileStoreSourceReaderMetrics(context.metricGroup());
         return new AlignedSourceReader(
                 context,
-                readBuilder.newRead().withIOManager(ioManager),
+                readBuilder.newRead(),
+                sourceReaderMetrics,
+                ioManager,
                 limit,
                 new FutureCompletingBlockingQueue<>(
                         context.getConfiguration()
-                                .getInteger(SourceReaderOptions.ELEMENT_QUEUE_CAPACITY)),
-                sourceReaderMetrics);
+                                .get(SourceReaderOptions.ELEMENT_QUEUE_CAPACITY)));
     }
 
     @Override
@@ -90,6 +90,8 @@ public class AlignedContinuousFileStoreSource extends ContinuousFileStoreSource 
                 options.get(CoreOptions.CONTINUOUS_DISCOVERY_INTERVAL).toMillis(),
                 scan,
                 bucketMode,
-                options.get(FlinkConnectorOptions.SOURCE_CHECKPOINT_ALIGN_TIMEOUT).toMillis());
+                options.get(FlinkConnectorOptions.SOURCE_CHECKPOINT_ALIGN_TIMEOUT).toMillis(),
+                options.get(CoreOptions.SCAN_MAX_SPLITS_PER_TASK),
+                options.get(FlinkConnectorOptions.STREAMING_READ_SHUFFLE_BUCKET_WITH_PARTITION));
     }
 }

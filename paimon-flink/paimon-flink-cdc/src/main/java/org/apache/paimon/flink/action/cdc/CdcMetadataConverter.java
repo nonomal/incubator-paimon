@@ -18,12 +18,17 @@
 
 package org.apache.paimon.flink.action.cdc;
 
+import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.DateTimeUtils;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
 
+import io.debezium.connector.AbstractSourceInfo;
+
 import java.io.Serializable;
-import java.util.Map;
+import java.util.TimeZone;
 
 /**
  * A functional interface for converting CDC metadata.
@@ -34,9 +39,96 @@ import java.util.Map;
  */
 public interface CdcMetadataConverter extends Serializable {
 
-    Map<String, String> read(JsonNode payload);
+    String read(JsonNode payload);
 
-    DataType getDataType();
+    DataType dataType();
 
-    String getColumnName();
+    String columnName();
+
+    /** Name of the database that contain the row. */
+    class DatabaseNameConverter implements CdcMetadataConverter {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public String read(JsonNode source) {
+            return source.get(AbstractSourceInfo.DATABASE_NAME_KEY).asText();
+        }
+
+        @Override
+        public DataType dataType() {
+            return DataTypes.STRING().notNull();
+        }
+
+        @Override
+        public String columnName() {
+            return "database_name";
+        }
+    }
+
+    /** Name of the table that contain the row. */
+    class TableNameConverter implements CdcMetadataConverter {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public String read(JsonNode source) {
+            return source.get(AbstractSourceInfo.TABLE_NAME_KEY).asText();
+        }
+
+        @Override
+        public DataType dataType() {
+            return DataTypes.STRING().notNull();
+        }
+
+        @Override
+        public String columnName() {
+            return "table_name";
+        }
+    }
+
+    /** Name of the schema that contain the row. */
+    class SchemaNameConverter implements CdcMetadataConverter {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public String read(JsonNode source) {
+            return source.get(AbstractSourceInfo.SCHEMA_NAME_KEY).asText();
+        }
+
+        @Override
+        public DataType dataType() {
+            return DataTypes.STRING().notNull();
+        }
+
+        @Override
+        public String columnName() {
+            return "schema_name";
+        }
+    }
+
+    /**
+     * It indicates the time that the change was made in the database. If the record is read from
+     * snapshot of the table instead of the binlog, the value is always 0.
+     */
+    class OpTsConverter implements CdcMetadataConverter {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public String read(JsonNode source) {
+            return DateTimeUtils.formatTimestamp(
+                    Timestamp.fromEpochMillis(
+                            source.get(AbstractSourceInfo.TIMESTAMP_KEY).asLong()),
+                    TimeZone.getDefault(),
+                    3);
+        }
+
+        @Override
+        public DataType dataType() {
+            return DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(3).notNull();
+        }
+
+        @Override
+        public String columnName() {
+            return "op_ts";
+        }
+    }
 }

@@ -59,8 +59,7 @@ public class ParquetRowDataWriter {
 
     public ParquetRowDataWriter(RecordConsumer recordConsumer, RowType rowType, GroupType schema) {
         this.recordConsumer = recordConsumer;
-
-        rowWriter = new RowWriter(rowType, schema);
+        this.rowWriter = new RowWriter(rowType, schema);
     }
 
     /**
@@ -404,9 +403,16 @@ public class ParquetRowDataWriter {
 
         @Override
         public void write(InternalRow row, int ordinal) {
-            recordConsumer.startGroup();
+            writeMapData(row.getMap(ordinal));
+        }
 
-            InternalMap mapData = row.getMap(ordinal);
+        @Override
+        public void write(InternalArray arrayData, int ordinal) {
+            writeMapData(arrayData.getMap(ordinal));
+        }
+
+        private void writeMapData(InternalMap mapData) {
+            recordConsumer.startGroup();
 
             if (mapData != null && mapData.size() > 0) {
                 recordConsumer.startField(repeatedGroupName, 0);
@@ -420,6 +426,11 @@ public class ParquetRowDataWriter {
                         recordConsumer.startField(keyName, 0);
                         keyWriter.write(keyArray, i);
                         recordConsumer.endField(keyName, 0);
+                    } else {
+                        throw new IllegalArgumentException(
+                                "Parquet does not support null keys in maps. "
+                                        + "See https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#maps "
+                                        + "for more details.");
                     }
 
                     if (!valueArray.isNullAt(i)) {
@@ -435,9 +446,6 @@ public class ParquetRowDataWriter {
             }
             recordConsumer.endGroup();
         }
-
-        @Override
-        public void write(InternalArray arrayData, int ordinal) {}
     }
 
     /** It writes an array type field to parquet. */
@@ -461,8 +469,16 @@ public class ParquetRowDataWriter {
 
         @Override
         public void write(InternalRow row, int ordinal) {
+            writeArrayData(row.getArray(ordinal));
+        }
+
+        @Override
+        public void write(InternalArray arrayData, int ordinal) {
+            writeArrayData(arrayData.getArray(ordinal));
+        }
+
+        private void writeArrayData(InternalArray arrayData) {
             recordConsumer.startGroup();
-            InternalArray arrayData = row.getArray(ordinal);
             int listLength = arrayData.size();
 
             if (listLength > 0) {
@@ -481,9 +497,6 @@ public class ParquetRowDataWriter {
             }
             recordConsumer.endGroup();
         }
-
-        @Override
-        public void write(InternalArray arrayData, int ordinal) {}
     }
 
     /** It writes a row type field to parquet. */
@@ -522,7 +535,12 @@ public class ParquetRowDataWriter {
         }
 
         @Override
-        public void write(InternalArray arrayData, int ordinal) {}
+        public void write(InternalArray arrayData, int ordinal) {
+            recordConsumer.startGroup();
+            InternalRow rowData = arrayData.getRow(ordinal, fieldWriters.length);
+            write(rowData);
+            recordConsumer.endGroup();
+        }
     }
 
     private Binary timestampToInt96(Timestamp timestamp) {

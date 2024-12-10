@@ -15,26 +15,42 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.paimon.spark.extensions
 
+import org.apache.paimon.spark.catalyst.analysis.{PaimonAnalysis, PaimonDeleteTable, PaimonIncompatiblePHRRules, PaimonIncompatibleResolutionRules, PaimonMergeInto, PaimonPostHocResolutionRules, PaimonProcedureResolver, PaimonUpdateTable, PaimonViewResolver}
+import org.apache.paimon.spark.catalyst.optimizer.{EvalSubqueriesForDeleteTable, MergePaimonScalarSubqueries}
+import org.apache.paimon.spark.catalyst.plans.logical.PaimonTableValuedFunctions
+import org.apache.paimon.spark.execution.PaimonStrategy
+import org.apache.paimon.spark.execution.adaptive.DisableUnnecessaryPaimonBucketedScan
+
 import org.apache.spark.sql.SparkSessionExtensions
-import org.apache.spark.sql.catalyst.analysis.{CoerceArguments, PaimonAnalysis, ResolveProcedures}
-import org.apache.spark.sql.catalyst.parser.extensions.PaimonSparkSqlExtensionsParser
-import org.apache.spark.sql.catalyst.plans.logical.PaimonTableValuedFunctions
-import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Strategy
+import org.apache.spark.sql.paimon.shims.SparkShimLoader
 
 /** Spark session extension to extends the syntax and adds the rules. */
 class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
   override def apply(extensions: SparkSessionExtensions): Unit = {
     // parser extensions
-    extensions.injectParser { case (_, parser) => new PaimonSparkSqlExtensionsParser(parser) }
+    extensions.injectParser {
+      case (_, parser) => SparkShimLoader.getSparkShim.createSparkParser(parser)
+    }
 
     // analyzer extensions
-    // resolution rule extensions
-    extensions.injectResolutionRule(sparkSession => new PaimonAnalysis(sparkSession))
-    extensions.injectResolutionRule(spark => ResolveProcedures(spark))
-    extensions.injectResolutionRule(_ => CoerceArguments)
+    extensions.injectResolutionRule(spark => new PaimonAnalysis(spark))
+    extensions.injectResolutionRule(spark => PaimonProcedureResolver(spark))
+    extensions.injectResolutionRule(spark => PaimonViewResolver(spark))
+    extensions.injectResolutionRule(
+      spark => SparkShimLoader.getSparkShim.createCustomResolution(spark))
+    extensions.injectResolutionRule(spark => PaimonIncompatibleResolutionRules(spark))
+
+    extensions.injectPostHocResolutionRule(spark => PaimonPostHocResolutionRules(spark))
+    extensions.injectPostHocResolutionRule(spark => PaimonIncompatiblePHRRules(spark))
+
+    extensions.injectPostHocResolutionRule(_ => PaimonUpdateTable)
+    extensions.injectPostHocResolutionRule(_ => PaimonDeleteTable)
+    extensions.injectPostHocResolutionRule(spark => PaimonMergeInto(spark))
+
     // table function extensions
     PaimonTableValuedFunctions.supportedFnNames.foreach {
       fnName =>
@@ -42,7 +58,14 @@ class PaimonSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
           PaimonTableValuedFunctions.getTableValueFunctionInjection(fnName))
     }
 
+    // optimization rules
+    extensions.injectOptimizerRule(_ => EvalSubqueriesForDeleteTable)
+    extensions.injectOptimizerRule(_ => MergePaimonScalarSubqueries)
+
     // planner extensions
-    extensions.injectPlannerStrategy(spark => ExtendedDataSourceV2Strategy(spark))
+    extensions.injectPlannerStrategy(spark => PaimonStrategy(spark))
+
+    // query stage preparation
+    extensions.injectQueryStagePrepRule(_ => DisableUnnecessaryPaimonBucketedScan)
   }
 }

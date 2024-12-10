@@ -19,9 +19,10 @@
 package org.apache.paimon.flink;
 
 import org.apache.flink.types.Row;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -31,7 +32,7 @@ public class GlobalDynamicBucketTableITCase extends CatalogITCaseBase {
 
     @Override
     protected List<String> ddl() {
-        return Collections.singletonList(
+        return Arrays.asList(
                 "CREATE TABLE IF NOT EXISTS T ("
                         + "pt INT, "
                         + "pk INT, "
@@ -40,7 +41,64 @@ public class GlobalDynamicBucketTableITCase extends CatalogITCaseBase {
                         + ") PARTITIONED BY (pt) WITH ("
                         + " 'bucket'='-1', "
                         + " 'dynamic-bucket.target-row-num'='3' "
+                        + ")",
+                "CREATE TABLE IF NOT EXISTS partial_update_t ("
+                        + "pt INT, "
+                        + "pk INT, "
+                        + "v1 INT, "
+                        + "v2 INT, "
+                        + "PRIMARY KEY (pk) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'merge-engine'='partial-update', "
+                        + " 'bucket'='-1', "
+                        + " 'dynamic-bucket.target-row-num'='3' "
+                        + ")",
+                "CREATE TABLE IF NOT EXISTS first_row_t ("
+                        + "pt INT, "
+                        + "pk INT, "
+                        + "v INT, "
+                        + "PRIMARY KEY (pk) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'merge-engine'='first-row', "
+                        + " 'changelog-producer'='lookup', "
+                        + " 'bucket'='-1', "
+                        + " 'dynamic-bucket.target-row-num'='3' "
                         + ")");
+    }
+
+    @Test
+    public void testBulkLoad() {
+        sql("INSERT INTO T VALUES (1, 1, 1), (2, 1, 2), (1, 3, 3), (2, 4, 4), (3, 3, 5)");
+        assertThat(sql("SELECT * FROM T"))
+                .containsExactlyInAnyOrder(Row.of(2, 1, 2), Row.of(3, 3, 5), Row.of(2, 4, 4));
+
+        sql(
+                "INSERT INTO partial_update_t VALUES"
+                        + " (1, 1, 1, 1),"
+                        + " (2, 1, 2, 3),"
+                        + " (1, 3, 3, 3),"
+                        + " (2, 4, 4, 4)");
+        sql("INSERT INTO partial_update_t VALUES (3, 3, CAST(NULL AS INT), 5)");
+        assertThat(sql("SELECT * FROM partial_update_t"))
+                .containsExactlyInAnyOrder(
+                        Row.of(1, 1, 2, 3), Row.of(2, 4, 4, 4), Row.of(1, 3, 3, 5));
+
+        sql("INSERT INTO first_row_t VALUES (1, 1, 1), (2, 1, 2), (1, 3, 3), (2, 4, 4), (3, 3, 5)");
+        assertThat(sql("SELECT * FROM first_row_t"))
+                .containsExactlyInAnyOrder(Row.of(1, 1, 1), Row.of(1, 3, 3), Row.of(2, 4, 4));
+    }
+
+    @Test
+    public void testBulkLoad2() {
+        sql(
+                "INSERT INTO partial_update_t VALUES"
+                        + " (1, 3, 1, 1),"
+                        + " (2, 3, 2, 3),"
+                        + " (1, 3, 3, 3),"
+                        + " (2, 3, 4, 4)");
+        sql("INSERT INTO partial_update_t VALUES (3, 3, CAST(NULL AS INT), 5)");
+        assertThat(sql("SELECT * FROM partial_update_t"))
+                .containsExactlyInAnyOrder(Row.of(1, 3, 4, 5));
     }
 
     @Test
@@ -90,6 +148,7 @@ public class GlobalDynamicBucketTableITCase extends CatalogITCaseBase {
         sql(
                 "create table large_t (pt int, k int, v int, primary key (k) not enforced) partitioned by (pt) with ("
                         + "'bucket'='-1', "
+                        + "'rocksdb.compaction.level.target-file-size-base'='2 kb', "
                         + "'dynamic-bucket.target-row-num'='10000')");
         sql(
                 "create temporary table src (pt int, k int, v int) with ("
@@ -102,5 +161,15 @@ public class GlobalDynamicBucketTableITCase extends CatalogITCaseBase {
         sql("insert into large_t select * from src");
         sql("insert into large_t select * from src");
         assertThat(sql("select k, count(*) from large_t group by k having count(*) > 1")).isEmpty();
+    }
+
+    @Disabled // TODO support this
+    @Test
+    public void testPkContainsPartialPartitionFields() {
+        sql(
+                "create table partial_part (pt1 int, pt2 int, k int, v int, primary key (k, pt1) not enforced) partitioned by (pt1, pt2)");
+        sql("insert into partial_part values (1, 1, 1, 1)");
+        sql("insert into partial_part values (1, 2, 1, 2)");
+        assertThat(sql("select * from partial_part")).containsExactlyInAnyOrder(Row.of(1, 2, 1, 2));
     }
 }

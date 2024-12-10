@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,17 +19,18 @@
 package org.apache.paimon.format;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.format.FileFormatFactory.FormatContext;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
-import org.apache.paimon.statistics.FieldStatsCollector;
+import org.apache.paimon.statistics.SimpleColStatsCollector;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceLoader;
 
@@ -53,11 +54,11 @@ public abstract class FileFormat {
     /**
      * Create a {@link FormatReaderFactory} from the type, with projection pushed down.
      *
-     * @param type Type without projection.
+     * @param projectedRowType Type with projection.
      * @param filters A list of filters in conjunctive form for filtering on a best-effort basis.
      */
     public abstract FormatReaderFactory createReaderFactory(
-            RowType type, int[][] projection, @Nullable List<Predicate> filters);
+            RowType projectedRowType, @Nullable List<Predicate> filters);
 
     /** Create a {@link FormatWriterFactory} from the type. */
     public abstract FormatWriterFactory createWriterFactory(RowType type);
@@ -66,41 +67,34 @@ public abstract class FileFormat {
     public abstract void validateDataFields(RowType rowType);
 
     public FormatReaderFactory createReaderFactory(RowType rowType) {
-        int[][] projection = new int[rowType.getFieldCount()][];
-        for (int i = 0; i < projection.length; i++) {
-            projection[i] = new int[] {i};
-        }
-        return createReaderFactory(rowType, projection);
+        return createReaderFactory(rowType, new ArrayList<>());
     }
 
-    public FormatReaderFactory createReaderFactory(RowType rowType, int[][] projection) {
-        return createReaderFactory(rowType, projection, new ArrayList<>());
-    }
-
-    public Optional<TableStatsExtractor> createStatsExtractor(
-            RowType type, FieldStatsCollector.Factory[] statsCollectors) {
+    public Optional<SimpleStatsExtractor> createStatsExtractor(
+            RowType type, SimpleColStatsCollector.Factory[] statsCollectors) {
         return Optional.empty();
     }
 
-    @VisibleForTesting
     public static FileFormat fromIdentifier(String identifier, Options options) {
-        return fromIdentifier(identifier, new FormatContext(options, 1024));
+        return fromIdentifier(
+                identifier,
+                new FormatContext(
+                        options,
+                        options.get(CoreOptions.READ_BATCH_SIZE),
+                        options.get(CoreOptions.WRITE_BATCH_SIZE),
+                        options.get(CoreOptions.FILE_COMPRESSION_ZSTD_LEVEL),
+                        options.get(CoreOptions.FILE_BLOCK_SIZE)));
     }
 
     /** Create a {@link FileFormat} from format identifier and format options. */
     public static FileFormat fromIdentifier(String identifier, FormatContext context) {
-        Optional<FileFormat> format =
-                fromIdentifier(identifier, context, FileFormat.class.getClassLoader());
-        return format.orElseGet(
-                () ->
-                        fromIdentifier(identifier, context, FileFormat.class.getClassLoader())
-                                .orElseThrow(
-                                        () ->
-                                                new RuntimeException(
-                                                        String.format(
-                                                                "Could not find any factories that implement '%s' in the classpath.",
-                                                                FileFormatFactory.class
-                                                                        .getName()))));
+        return fromIdentifier(identifier, context, FileFormat.class.getClassLoader())
+                .orElseThrow(
+                        () ->
+                                new RuntimeException(
+                                        String.format(
+                                                "Could not find a FileFormatFactory implementation class for %s format",
+                                                identifier)));
     }
 
     private static Optional<FileFormat> fromIdentifier(
@@ -116,10 +110,14 @@ public abstract class FileFormat {
         return Optional.empty();
     }
 
-    public static FileFormat getFileFormat(Options options, String formatIdentifier) {
-        int readBatchSize = options.get(CoreOptions.READ_BATCH_SIZE);
-        return FileFormat.fromIdentifier(
-                formatIdentifier,
-                new FormatContext(options.removePrefix(formatIdentifier + "."), readBatchSize));
+    protected Options getIdentifierPrefixOptions(Options options) {
+        Map<String, String> result = new HashMap<>();
+        String prefix = formatIdentifier.toLowerCase() + ".";
+        for (String key : options.keySet()) {
+            if (key.toLowerCase().startsWith(prefix)) {
+                result.put(prefix + key.substring(prefix.length()), options.get(key));
+            }
+        }
+        return new Options(result);
     }
 }

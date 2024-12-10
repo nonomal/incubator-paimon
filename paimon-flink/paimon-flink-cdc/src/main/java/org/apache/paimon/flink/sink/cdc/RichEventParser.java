@@ -19,20 +19,18 @@
 package org.apache.paimon.flink.sink.cdc;
 
 import org.apache.paimon.types.DataField;
-import org.apache.paimon.types.DataType;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Objects;
 
 /** A {@link EventParser} for {@link RichCdcRecord}. */
 public class RichEventParser implements EventParser<RichCdcRecord> {
 
     private RichCdcRecord record;
 
-    private final LinkedHashMap<String, DataType> previousDataFields = new LinkedHashMap<>();
+    private final LinkedHashMap<String, DataField> previousDataFields = new LinkedHashMap<>();
 
     @Override
     public void setRawEvent(RichCdcRecord rawEvent) {
@@ -42,13 +40,16 @@ public class RichEventParser implements EventParser<RichCdcRecord> {
     @Override
     public List<DataField> parseSchemaChange() {
         List<DataField> change = new ArrayList<>();
-        record.fieldTypes()
+        record.fields()
                 .forEach(
-                        (field, type) -> {
-                            DataType previous = previousDataFields.get(field);
-                            if (!Objects.equals(previous, type)) {
-                                previousDataFields.put(field, type);
-                                change.add(new DataField(0, field, type));
+                        dataField -> {
+                            DataField previous = previousDataFields.get(dataField.name());
+                            // When the order of the same field is different, its ID may also be
+                            // different,
+                            // so the comparison should not include the ID.
+                            if (!DataField.dataFieldEqualsIgnoreId(previous, dataField)) {
+                                previousDataFields.put(dataField.name(), dataField);
+                                change.add(dataField);
                             }
                         });
         return change;

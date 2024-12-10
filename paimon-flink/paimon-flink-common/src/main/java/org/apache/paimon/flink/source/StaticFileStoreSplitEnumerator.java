@@ -19,34 +19,58 @@
 package org.apache.paimon.flink.source;
 
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.flink.source.assigners.DynamicPartitionPruningAssigner;
+import org.apache.paimon.flink.source.assigners.PreAssignSplitAssigner;
 import org.apache.paimon.flink.source.assigners.SplitAssigner;
 
+import org.apache.flink.api.connector.source.SourceEvent;
 import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.api.connector.source.SplitsAssignment;
+import org.apache.flink.api.connector.source.SupportsHandleExecutionAttemptSourceEvent;
+import org.apache.flink.table.connector.source.DynamicFilteringEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
 import java.util.Collections;
 import java.util.List;
 
+import static org.apache.paimon.utils.Preconditions.checkNotNull;
+
 /** A {@link SplitEnumerator} implementation for {@link StaticFileStoreSource} input. */
 public class StaticFileStoreSplitEnumerator
-        implements SplitEnumerator<FileStoreSourceSplit, PendingSplitsCheckpoint> {
+        implements SplitEnumerator<FileStoreSourceSplit, PendingSplitsCheckpoint>,
+                SupportsHandleExecutionAttemptSourceEvent {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StaticFileStoreSplitEnumerator.class);
 
     private final SplitEnumeratorContext<FileStoreSourceSplit> context;
 
     @Nullable private final Snapshot snapshot;
 
-    private final SplitAssigner splitAssigner;
+    private SplitAssigner splitAssigner;
+
+    @Nullable private final DynamicPartitionFilteringInfo dynamicPartitionFilteringInfo;
 
     public StaticFileStoreSplitEnumerator(
             SplitEnumeratorContext<FileStoreSourceSplit> context,
             @Nullable Snapshot snapshot,
             SplitAssigner splitAssigner) {
+        this(context, snapshot, splitAssigner, null);
+    }
+
+    public StaticFileStoreSplitEnumerator(
+            SplitEnumeratorContext<FileStoreSourceSplit> context,
+            @Nullable Snapshot snapshot,
+            SplitAssigner splitAssigner,
+            @Nullable DynamicPartitionFilteringInfo dynamicPartitionFilteringInfo) {
         this.context = context;
         this.snapshot = snapshot;
         this.splitAssigner = splitAssigner;
+        this.dynamicPartitionFilteringInfo = dynamicPartitionFilteringInfo;
     }
 
     @Override
@@ -94,5 +118,55 @@ public class StaticFileStoreSplitEnumerator
     @Nullable
     public Snapshot snapshot() {
         return snapshot;
+    }
+
+    @Override
+    public void handleSourceEvent(int subtaskId, int attemptNumber, SourceEvent sourceEvent) {
+        // Only recognize events that don't care attemptNumber.
+        handleSourceEvent(subtaskId, sourceEvent);
+    }
+
+    /**
+     * When to support a new kind of event, pay attention that whether the new event can be sent
+     * multiple times from different attempts of one subtask. If so, it should be handled via method
+     * {@link #handleSourceEvent(int, int, SourceEvent)}
+     */
+    @Override
+    public void handleSourceEvent(int subtaskId, SourceEvent sourceEvent) {
+        if (sourceEvent instanceof ReaderConsumeProgressEvent) {
+            // batch reading doesn't handle consumer
+            // avoid meaningless error logs
+            return;
+        }
+
+        if (sourceEvent.getClass().getSimpleName().equals("DynamicFilteringEvent")) {
+            checkNotNull(
+                    dynamicPartitionFilteringInfo,
+                    "Cannot apply dynamic filtering because dynamicPartitionFilteringInfo hasn't been set.");
+
+            if (splitAssigner instanceof PreAssignSplitAssigner) {
+                this.splitAssigner =
+                        ((PreAssignSplitAssigner) splitAssigner)
+                                .ofDynamicPartitionPruning(
+                                        dynamicPartitionFilteringInfo.getPartitionRowProjection(),
+                                        ((DynamicFilteringEvent) sourceEvent).getData());
+            } else {
+                this.splitAssigner =
+                        DynamicPartitionPruningAssigner
+                                .createDynamicPartitionPruningAssignerIfNeeded(
+                                        subtaskId,
+                                        splitAssigner,
+                                        dynamicPartitionFilteringInfo.getPartitionRowProjection(),
+                                        sourceEvent,
+                                        LOG);
+            }
+        } else {
+            LOG.error("Received unrecognized event: {}", sourceEvent);
+        }
+    }
+
+    @VisibleForTesting
+    public SplitAssigner getSplitAssigner() {
+        return splitAssigner;
     }
 }

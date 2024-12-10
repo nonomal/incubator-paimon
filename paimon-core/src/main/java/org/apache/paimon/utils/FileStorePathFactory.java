@@ -18,12 +18,10 @@
 
 package org.apache.paimon.utils;
 
-import org.apache.paimon.CoreOptions;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.DataFilePathFactory;
-import org.apache.paimon.options.ConfigOption;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.concurrent.ThreadSafe;
@@ -33,51 +31,53 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-import static org.apache.paimon.options.ConfigOptions.key;
-
 /** Factory which produces {@link Path}s for manifest files. */
 @ThreadSafe
 public class FileStorePathFactory {
 
-    public static final ConfigOption<String> PARTITION_DEFAULT_NAME =
-            key("partition.default-name")
-                    .stringType()
-                    .defaultValue("__DEFAULT_PARTITION__")
-                    .withDescription(
-                            "The default partition name in case the dynamic partition"
-                                    + " column value is null/empty string.");
+    public static final String BUCKET_PATH_PREFIX = "bucket-";
 
     private final Path root;
     private final String uuid;
-    private final RowDataPartitionComputer partitionComputer;
+    private final InternalRowPartitionComputer partitionComputer;
     private final String formatIdentifier;
+    private final String dataFilePrefix;
+    private final String changelogFilePrefix;
+    private final boolean fileSuffixIncludeCompression;
+    private final String fileCompression;
 
     private final AtomicInteger manifestFileCount;
     private final AtomicInteger manifestListCount;
     private final AtomicInteger indexManifestCount;
     private final AtomicInteger indexFileCount;
+    private final AtomicInteger statsFileCount;
 
-    public FileStorePathFactory(Path root) {
-        this(
-                root,
-                RowType.builder().build(),
-                PARTITION_DEFAULT_NAME.defaultValue(),
-                CoreOptions.FILE_FORMAT.defaultValue().toString());
-    }
-
-    // for tables without partition, partitionType should be a row type with 0 columns (not null)
     public FileStorePathFactory(
-            Path root, RowType partitionType, String defaultPartValue, String formatIdentifier) {
+            Path root,
+            RowType partitionType,
+            String defaultPartValue,
+            String formatIdentifier,
+            String dataFilePrefix,
+            String changelogFilePrefix,
+            boolean legacyPartitionName,
+            boolean fileSuffixIncludeCompression,
+            String fileCompression) {
         this.root = root;
         this.uuid = UUID.randomUUID().toString();
 
-        this.partitionComputer = getPartitionComputer(partitionType, defaultPartValue);
+        this.partitionComputer =
+                getPartitionComputer(partitionType, defaultPartValue, legacyPartitionName);
         this.formatIdentifier = formatIdentifier;
+        this.dataFilePrefix = dataFilePrefix;
+        this.changelogFilePrefix = changelogFilePrefix;
+        this.fileSuffixIncludeCompression = fileSuffixIncludeCompression;
+        this.fileCompression = fileCompression;
 
         this.manifestFileCount = new AtomicInteger(0);
         this.manifestListCount = new AtomicInteger(0);
         this.indexManifestCount = new AtomicInteger(0);
         this.indexFileCount = new AtomicInteger(0);
+        this.statsFileCount = new AtomicInteger(0);
     }
 
     public Path root() {
@@ -85,10 +85,11 @@ public class FileStorePathFactory {
     }
 
     @VisibleForTesting
-    public static RowDataPartitionComputer getPartitionComputer(
-            RowType partitionType, String defaultPartValue) {
+    public static InternalRowPartitionComputer getPartitionComputer(
+            RowType partitionType, String defaultPartValue, boolean legacyPartitionName) {
         String[] partitionColumns = partitionType.getFieldNames().toArray(new String[0]);
-        return new RowDataPartitionComputer(defaultPartValue, partitionType, partitionColumns);
+        return new InternalRowPartitionComputer(
+                defaultPartValue, partitionType, partitionColumns, legacyPartitionName);
     }
 
     public Path newManifestFile() {
@@ -115,11 +116,25 @@ public class FileStorePathFactory {
 
     public DataFilePathFactory createDataFilePathFactory(BinaryRow partition, int bucket) {
         return new DataFilePathFactory(
-                root, getPartitionString(partition), bucket, formatIdentifier);
+                bucketPath(partition, bucket),
+                formatIdentifier,
+                dataFilePrefix,
+                changelogFilePrefix,
+                fileSuffixIncludeCompression,
+                fileCompression);
     }
 
     public Path bucketPath(BinaryRow partition, int bucket) {
-        return DataFilePathFactory.bucketPath(root, getPartitionString(partition), bucket);
+        return new Path(root + "/" + relativePartitionAndBucketPath(partition, bucket));
+    }
+
+    public Path relativePartitionAndBucketPath(BinaryRow partition, int bucket) {
+        String partitionPath = getPartitionString(partition);
+        String fullPath =
+                partitionPath.isEmpty()
+                        ? BUCKET_PATH_PREFIX + bucket
+                        : partitionPath + "/" + BUCKET_PATH_PREFIX + bucket;
+        return new Path(fullPath);
     }
 
     /** IMPORTANT: This method is NOT THREAD SAFE. */
@@ -204,6 +219,25 @@ public class FileStorePathFactory {
             @Override
             public Path toPath(String fileName) {
                 return new Path(root + "/index/" + fileName);
+            }
+        };
+    }
+
+    public PathFactory statsFileFactory() {
+        return new PathFactory() {
+            @Override
+            public Path newPath() {
+                return new Path(
+                        root
+                                + "/statistics/stats-"
+                                + uuid
+                                + "-"
+                                + statsFileCount.getAndIncrement());
+            }
+
+            @Override
+            public Path toPath(String fileName) {
+                return new Path(root + "/statistics/" + fileName);
             }
         };
     }

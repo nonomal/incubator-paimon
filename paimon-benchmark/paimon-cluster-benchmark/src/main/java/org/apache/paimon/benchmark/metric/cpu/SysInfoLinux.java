@@ -23,6 +23,7 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.Reader;
 import java.math.BigInteger;
 import java.nio.charset.Charset;
 import java.util.HashMap;
@@ -253,15 +254,8 @@ public class SysInfoLinux {
             }
         } catch (IOException io) {
         } finally {
-            // Close the streams
-            try {
-                fReader.close();
-                try {
-                    in.close();
-                } catch (IOException i) {
-                }
-            } catch (IOException i) {
-            }
+            closeReader(fReader);
+            closeReader(in);
         }
 
         readMemInfoFile = true;
@@ -317,15 +311,8 @@ public class SysInfoLinux {
             numCpuSocket = physicalIds.size();
         } catch (IOException io) {
         } finally {
-            // Close the streams
-            try {
-                fReader.close();
-                try {
-                    in.close();
-                } catch (IOException i) {
-                }
-            } catch (IOException i) {
-            }
+            closeReader(fReader);
+            closeReader(in);
         }
         readCpuInfoFile = true;
     }
@@ -362,15 +349,8 @@ public class SysInfoLinux {
             }
         } catch (IOException io) {
         } finally {
-            // Close the streams
-            try {
-                fReader.close();
-                try {
-                    in.close();
-                } catch (IOException i) {
-                }
-            } catch (IOException i) {
-            }
+            closeReader(fReader);
+            closeReader(in);
         }
     }
 
@@ -415,15 +395,8 @@ public class SysInfoLinux {
             }
         } catch (IOException io) {
         } finally {
-            // Close the streams
-            try {
-                fReader.close();
-                try {
-                    in.close();
-                } catch (IOException i) {
-                }
-            } catch (IOException i) {
-            }
+            closeReader(fReader);
+            closeReader(in);
         }
     }
 
@@ -485,11 +458,7 @@ public class SysInfoLinux {
             }
         } catch (IOException e) {
         } finally {
-            // Close the streams
-            try {
-                in.close();
-            } catch (IOException e) {
-            }
+            closeReader(in);
         }
     }
 
@@ -533,11 +502,7 @@ public class SysInfoLinux {
         } catch (IOException | NumberFormatException e) {
             return defSector;
         } finally {
-            // Close the streams
-            try {
-                in.close();
-            } catch (IOException e) {
-            }
+            closeReader(in);
         }
     }
 
@@ -621,6 +586,17 @@ public class SysInfoLinux {
     public long getStorageBytesWritten() {
         readProcDisksInfoFile();
         return numDisksBytesWritten;
+    }
+
+    public void closeReader(Reader reader) {
+        // Close the streams
+        if (reader != null) {
+            try {
+                reader.close();
+            } catch (IOException e) {
+
+            }
+        }
     }
 
     /**

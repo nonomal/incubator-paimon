@@ -15,22 +15,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.paimon.spark
 
 import org.apache.spark.sql.{SaveMode => SparkSaveMode}
 import org.apache.spark.sql.sources.{AlwaysTrue, Filter}
 
-sealed trait SaveMode extends Serializable
+sealed private[spark] trait SaveMode extends Serializable
 
-object InsertInto extends SaveMode
+case object InsertInto extends SaveMode
 
 case class Overwrite(filters: Option[Filter]) extends SaveMode
 
-object DynamicOverWrite extends SaveMode
+case object DynamicOverWrite extends SaveMode
 
-object ErrorIfExists extends SaveMode
+case object ErrorIfExists extends SaveMode
 
-object Ignore extends SaveMode
+case object Ignore extends SaveMode
 
 object SaveMode {
   def transform(saveMode: SparkSaveMode): SaveMode = {

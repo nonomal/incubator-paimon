@@ -23,6 +23,7 @@ import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.fs.hadoop.HadoopFileIOLoader;
 import org.apache.paimon.fs.local.LocalFileIO;
 
+import org.apache.commons.io.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,17 +38,19 @@ import java.io.Serializable;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.Set;
-import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.fs.FileIOUtils.checkAccess;
+import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /**
  * File IO to read and write file.
@@ -100,6 +103,22 @@ public interface FileIO extends Serializable {
      * @return the statuses of the files/directories in the given path
      */
     FileStatus[] listStatus(Path path) throws IOException;
+
+    /**
+     * List the statuses of the directories in the given path if the path is a directory.
+     *
+     * <p>{@link FileIO} implementation may have optimization for list directories.
+     *
+     * @param path given path
+     * @return the statuses of the directories in the given path
+     */
+    default FileStatus[] listDirectories(Path path) throws IOException {
+        FileStatus[] statuses = listStatus(path);
+        if (statuses != null) {
+            statuses = Arrays.stream(statuses).filter(FileStatus::isDir).toArray(FileStatus[]::new);
+        }
+        return statuses;
+    }
 
     /**
      * Check if exists.
@@ -157,6 +176,12 @@ public interface FileIO extends Serializable {
         }
     }
 
+    default void deleteFilesQuietly(List<Path> files) {
+        for (Path file : files) {
+            deleteQuietly(file);
+        }
+    }
+
     default void deleteDirectoryQuietly(Path directory) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Ready to delete " + directory.toString());
@@ -179,6 +204,14 @@ public interface FileIO extends Serializable {
         return getFileStatus(path).isDir();
     }
 
+    default void checkOrMkdirs(Path path) throws IOException {
+        if (exists(path)) {
+            checkArgument(isDir(path), "The path '%s' should be a directory.", path);
+        } else {
+            mkdirs(path);
+        }
+    }
+
     /** Read file to UTF_8 decoding. */
     default String readFileUtf8(Path path) throws IOException {
         try (SeekableInputStream in = newInputStream(path)) {
@@ -199,20 +232,11 @@ public interface FileIO extends Serializable {
      *
      * @return false if target file exists
      */
-    default boolean writeFileUtf8(Path path, String content) throws IOException {
-        if (exists(path)) {
-            return false;
-        }
-
-        Path tmp = new Path(path.getParent(), "." + path.getName() + UUID.randomUUID());
+    default boolean tryToWriteAtomic(Path path, String content) throws IOException {
+        Path tmp = path.createTempPath();
         boolean success = false;
         try {
-            try (PositionOutputStream out = newOutputStream(tmp, false)) {
-                OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8);
-                writer.write(content);
-                writer.flush();
-            }
-
+            writeFile(tmp, content, false);
             success = rename(tmp, path);
         } finally {
             if (!success) {
@@ -221,6 +245,89 @@ public interface FileIO extends Serializable {
         }
 
         return success;
+    }
+
+    default void writeFile(Path path, String content, boolean overwrite) throws IOException {
+        try (PositionOutputStream out = newOutputStream(path, overwrite)) {
+            OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8);
+            writer.write(content);
+            writer.flush();
+        }
+    }
+
+    /**
+     * Overwrite file by content atomically, different {@link FileIO}s have different atomic
+     * implementations.
+     */
+    default void overwriteFileUtf8(Path path, String content) throws IOException {
+        try (PositionOutputStream out = newOutputStream(path, true)) {
+            OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8);
+            writer.write(content);
+            writer.flush();
+        }
+    }
+
+    /**
+     * Copy content of one file into another.
+     *
+     * @throws IOException Thrown, if the stream could not be opened because of an I/O, or because
+     *     target file already exists at that path and the write mode indicates to not overwrite the
+     *     file.
+     */
+    default void copyFile(Path sourcePath, Path targetPath, boolean overwrite) throws IOException {
+        try (SeekableInputStream is = newInputStream(sourcePath);
+                PositionOutputStream os = newOutputStream(targetPath, overwrite)) {
+            IOUtils.copy(is, os);
+        }
+    }
+
+    /** Copy all files in sourceDirectory to directory targetDirectory. */
+    default void copyFiles(Path sourceDirectory, Path targetDirectory, boolean overwrite)
+            throws IOException {
+        FileStatus[] fileStatuses = listStatus(sourceDirectory);
+        List<Path> copyFiles =
+                Arrays.stream(fileStatuses).map(FileStatus::getPath).collect(Collectors.toList());
+        for (Path file : copyFiles) {
+            String fileName = file.getName();
+            Path targetPath = new Path(targetDirectory.toString() + "/" + fileName);
+            copyFile(file, targetPath, overwrite);
+        }
+    }
+
+    /** Read file from {@link #overwriteFileUtf8} file. */
+    default Optional<String> readOverwrittenFileUtf8(Path path) throws IOException {
+        int retryNumber = 0;
+        Exception exception = null;
+        while (retryNumber++ < 5) {
+            try {
+                return Optional.of(readFileUtf8(path));
+            } catch (FileNotFoundException e) {
+                return Optional.empty();
+            } catch (Exception e) {
+                if (!exists(path)) {
+                    return Optional.empty();
+                }
+
+                if (e.getClass()
+                        .getName()
+                        .endsWith("org.apache.hadoop.fs.s3a.RemoteFileChangedException")) {
+                    // retry for S3 RemoteFileChangedException
+                    exception = e;
+                } else if (e.getMessage() != null
+                        && e.getMessage().contains("Blocklist for")
+                        && e.getMessage().contains("has changed")) {
+                    // retry for HDFS blocklist has changed exception
+                    exception = e;
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        if (exception instanceof IOException) {
+            throw (IOException) exception;
+        }
+        throw new RuntimeException(exception);
     }
 
     // -------------------------------------------------------------------------
@@ -233,6 +340,10 @@ public interface FileIO extends Serializable {
      */
     static FileIO get(Path path, CatalogContext config) throws IOException {
         URI uri = path.toUri();
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Getting FileIO by scheme {}.", uri.getScheme());
+        }
+
         if (uri.getScheme() == null) {
             return new LocalFileIO();
         }
@@ -253,13 +364,42 @@ public interface FileIO extends Serializable {
                             + "')");
         }
 
-        Map<String, FileIOLoader> loaders = discoverLoaders();
-        FileIOLoader loader = loaders.get(uri.getScheme());
+        FileIOLoader loader = null;
+        List<IOException> ioExceptionList = new ArrayList<>();
+
+        // load preferIO
+        FileIOLoader preferIOLoader = config.preferIO();
+        try {
+            loader = checkAccess(preferIOLoader, path, config);
+            if (loader != null && LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Found preferIOLoader {} with scheme {}.",
+                        loader.getClass().getName(),
+                        loader.getScheme());
+            }
+        } catch (IOException ioException) {
+            ioExceptionList.add(ioException);
+        }
+
+        if (loader == null) {
+            Map<String, FileIOLoader> loaders = discoverLoaders();
+            loader = loaders.get(uri.getScheme());
+            if (!loaders.isEmpty() && LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "Discovered FileIOLoaders: {}.",
+                        loaders.entrySet().stream()
+                                .map(
+                                        e ->
+                                                String.format(
+                                                        "{%s,%s}",
+                                                        e.getKey(),
+                                                        e.getValue().getClass().getName()))
+                                .collect(Collectors.joining(",")));
+            }
+        }
 
         // load fallbackIO
         FileIOLoader fallbackIO = config.fallbackIO();
-
-        List<IOException> ioExceptionList = new ArrayList<>();
 
         if (loader != null) {
             Set<String> options =
@@ -288,6 +428,11 @@ public interface FileIO extends Serializable {
                                                 + "%s",
                                         String.join("\n", missOptions)));
                 ioExceptionList.add(exception);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                            "Got {} but miss options. Will try to get fallback IO and Hadoop IO respectively.",
+                            loader.getClass().getName());
+                }
                 loader = null;
             }
         }
@@ -295,6 +440,9 @@ public interface FileIO extends Serializable {
         if (loader == null) {
             try {
                 loader = checkAccess(fallbackIO, path, config);
+                if (loader != null && LOG.isDebugEnabled()) {
+                    LOG.debug("Got fallback FileIOLoader: {}.", loader.getClass().getName());
+                }
             } catch (IOException ioException) {
                 ioExceptionList.add(ioException);
             }
@@ -304,6 +452,9 @@ public interface FileIO extends Serializable {
         if (loader == null) {
             try {
                 loader = checkAccess(new HadoopFileIOLoader(), path, config);
+                if (loader != null && LOG.isDebugEnabled()) {
+                    LOG.debug("Got hadoop FileIOLoader: {}.", loader.getClass().getName());
+                }
             } catch (IOException ioException) {
                 ioExceptionList.add(ioException);
             }
@@ -311,6 +462,13 @@ public interface FileIO extends Serializable {
 
         if (loader == null) {
             String fallbackMsg = "";
+            String preferMsg = "";
+            if (preferIOLoader != null) {
+                preferMsg =
+                        " "
+                                + preferIOLoader.getClass().getSimpleName()
+                                + " also cannot access this path.";
+            }
             if (fallbackIO != null) {
                 fallbackMsg =
                         " "
@@ -321,8 +479,8 @@ public interface FileIO extends Serializable {
                     new UnsupportedSchemeException(
                             String.format(
                                     "Could not find a file io implementation for scheme '%s' in the classpath."
-                                            + "%s Hadoop FileSystem also cannot access this path '%s'.",
-                                    uri.getScheme(), fallbackMsg, path));
+                                            + "%s %s Hadoop FileSystem also cannot access this path '%s'.",
+                                    uri.getScheme(), preferMsg, fallbackMsg, path));
             for (IOException ioException : ioExceptionList) {
                 ex.addSuppressed(ioException);
             }

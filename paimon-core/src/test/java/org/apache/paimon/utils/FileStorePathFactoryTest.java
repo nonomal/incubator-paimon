@@ -32,6 +32,7 @@ import org.apache.paimon.types.VarCharType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import static org.apache.paimon.CoreOptions.PARTITION_DEFAULT_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link FileStorePathFactory}. */
@@ -41,7 +42,7 @@ public class FileStorePathFactoryTest {
 
     @Test
     public void testManifestPaths() {
-        FileStorePathFactory pathFactory = new FileStorePathFactory(new Path(tempDir.toString()));
+        FileStorePathFactory pathFactory = createNonPartFactory(new Path(tempDir.toString()));
         String uuid = pathFactory.uuid();
 
         for (int i = 0; i < 20; i++) {
@@ -68,7 +69,7 @@ public class FileStorePathFactoryTest {
 
     @Test
     public void testCreateDataFilePathFactoryNoPartition() {
-        FileStorePathFactory pathFactory = new FileStorePathFactory(new Path(tempDir.toString()));
+        FileStorePathFactory pathFactory = createNonPartFactory(new Path(tempDir.toString()));
         DataFilePathFactory dataFilePathFactory =
                 pathFactory.createDataFilePathFactory(new BinaryRow(0), 123);
         assertThat(dataFilePathFactory.toPath("my-data-file-name"))
@@ -84,7 +85,12 @@ public class FileStorePathFactoryTest {
                                 new DataType[] {new VarCharType(10), new IntType()},
                                 new String[] {"dt", "hr"}),
                         "default",
-                        CoreOptions.FILE_FORMAT.defaultValue().toString());
+                        CoreOptions.FILE_FORMAT.defaultValue().toString(),
+                        CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                        CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                        CoreOptions.PARTITION_GENERATE_LEGCY_NAME.defaultValue(),
+                        CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                        CoreOptions.FILE_COMPRESSION.defaultValue());
 
         assertPartition("20211224", 16, pathFactory, "/dt=20211224/hr=16");
         assertPartition("20211224", null, pathFactory, "/dt=20211224/hr=default");
@@ -112,5 +118,18 @@ public class FileStorePathFactoryTest {
         assertThat(dataFilePathFactory.toPath("my-data-file-name"))
                 .isEqualTo(
                         new Path(tempDir.toString() + expected + "/bucket-123/my-data-file-name"));
+    }
+
+    public static FileStorePathFactory createNonPartFactory(Path root) {
+        return new FileStorePathFactory(
+                root,
+                RowType.builder().build(),
+                PARTITION_DEFAULT_NAME.defaultValue(),
+                CoreOptions.FILE_FORMAT.defaultValue().toString(),
+                CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                CoreOptions.PARTITION_GENERATE_LEGCY_NAME.defaultValue(),
+                CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                CoreOptions.FILE_COMPRESSION.defaultValue());
     }
 }
