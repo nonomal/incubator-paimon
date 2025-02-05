@@ -20,7 +20,6 @@ package org.apache.paimon.reader;
 
 import org.apache.paimon.annotation.Public;
 import org.apache.paimon.utils.CloseableIterator;
-import org.apache.paimon.utils.ConsumerWithIOException;
 import org.apache.paimon.utils.Filter;
 
 import javax.annotation.Nullable;
@@ -28,6 +27,7 @@ import javax.annotation.Nullable;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.Iterator;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -143,17 +143,18 @@ public interface RecordReader<T> extends Closeable {
     }
 
     /**
-     * Performs the given action for each remaining element in {@link RecordReader} until all
-     * elements have been processed or the action throws an exception.
+     * Performs the given action for each remaining element with row position in {@link
+     * RecordReader} until all elements have been processed or the action throws an exception.
      */
-    default void forIOEachRemaining(ConsumerWithIOException<? super T> action) throws IOException {
-        RecordReader.RecordIterator<T> batch;
+    default void forEachRemainingWithPosition(BiConsumer<Long, ? super T> action)
+            throws IOException {
+        FileRecordIterator<T> batch;
         T record;
 
         try {
-            while ((batch = readBatch()) != null) {
+            while ((batch = (FileRecordIterator<T>) readBatch()) != null) {
                 while ((record = batch.next()) != null) {
-                    action.accept(record);
+                    action.accept(batch.returnedPosition(), record);
                 }
                 batch.releaseBatch();
             }

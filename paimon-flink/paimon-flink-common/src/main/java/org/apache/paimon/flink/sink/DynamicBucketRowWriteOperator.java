@@ -20,9 +20,11 @@ package org.apache.paimon.flink.sink;
 
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.table.sink.DynamicBucketRow;
 
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.streaming.api.operators.StreamOperator;
+import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
+import org.apache.flink.streaming.api.operators.StreamOperatorParameters;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
 /**
@@ -33,11 +35,12 @@ public class DynamicBucketRowWriteOperator
 
     private static final long serialVersionUID = 1L;
 
-    public DynamicBucketRowWriteOperator(
+    private DynamicBucketRowWriteOperator(
+            StreamOperatorParameters<Committable> parameters,
             FileStoreTable table,
             StoreSinkWrite.Provider storeSinkWriteProvider,
             String initialCommitUser) {
-        super(table, storeSinkWriteProvider, initialCommitUser);
+        super(parameters, table, storeSinkWriteProvider, initialCommitUser);
     }
 
     @Override
@@ -48,7 +51,32 @@ public class DynamicBucketRowWriteOperator
     @Override
     public void processElement(StreamRecord<Tuple2<InternalRow, Integer>> element)
             throws Exception {
-        DynamicBucketRow row = new DynamicBucketRow(element.getValue().f0, element.getValue().f1);
-        write.write(row);
+        write.write(element.getValue().f0, element.getValue().f1);
+    }
+
+    /** {@link StreamOperatorFactory} of {@link DynamicBucketRowWriteOperator}. */
+    public static class Factory extends TableWriteOperator.Factory<Tuple2<InternalRow, Integer>> {
+
+        public Factory(
+                FileStoreTable table,
+                StoreSinkWrite.Provider storeSinkWriteProvider,
+                String initialCommitUser) {
+            super(table, storeSinkWriteProvider, initialCommitUser);
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <T extends StreamOperator<Committable>> T createStreamOperator(
+                StreamOperatorParameters<Committable> parameters) {
+            return (T)
+                    new DynamicBucketRowWriteOperator(
+                            parameters, table, storeSinkWriteProvider, initialCommitUser);
+        }
+
+        @Override
+        @SuppressWarnings("rawtypes")
+        public Class<? extends StreamOperator> getStreamOperatorClass(ClassLoader classLoader) {
+            return DynamicBucketRowWriteOperator.class;
+        }
     }
 }

@@ -27,6 +27,7 @@ import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
+import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.ConfigOption;
 import org.apache.paimon.reader.RecordReader;
@@ -56,6 +57,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -71,7 +73,7 @@ public abstract class TableTestBase {
     protected Path warehouse;
     protected Catalog catalog;
     protected String database;
-    @TempDir java.nio.file.Path tempPath;
+    @TempDir public java.nio.file.Path tempPath;
 
     @BeforeEach
     public void beforeEach() throws Catalog.DatabaseAlreadyExistException {
@@ -97,10 +99,40 @@ public abstract class TableTestBase {
         return identifier(DEFAULT_TABLE_NAME);
     }
 
-    protected void write(Table table, InternalRow... rows) throws Exception {
+    @SafeVarargs
+    protected final void write(Table table, Pair<InternalRow, Integer>... rows) throws Exception {
         BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
         try (BatchTableWrite write = writeBuilder.newWrite();
                 BatchTableCommit commit = writeBuilder.newCommit()) {
+            for (Pair<InternalRow, Integer> row : rows) {
+                write.write(row.getKey(), row.getValue());
+            }
+            commit.commit(write.prepareCommit());
+        }
+    }
+
+    protected void writeWithBucketAssigner(
+            Table table, Function<InternalRow, Integer> bucketAssigner, InternalRow... rows)
+            throws Exception {
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            for (InternalRow row : rows) {
+                write.write(row, bucketAssigner.apply(row));
+            }
+            commit.commit(write.prepareCommit());
+        }
+    }
+
+    protected void write(Table table, InternalRow... rows) throws Exception {
+        write(table, null, rows);
+    }
+
+    protected void write(Table table, IOManager ioManager, InternalRow... rows) throws Exception {
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.withIOManager(ioManager);
             for (InternalRow row : rows) {
                 write.write(row);
             }
@@ -109,12 +141,27 @@ public abstract class TableTestBase {
     }
 
     protected void compact(Table table, BinaryRow partition, int bucket) throws Exception {
+        compact(table, partition, bucket, null, true);
+    }
+
+    protected void compact(
+            Table table,
+            BinaryRow partition,
+            int bucket,
+            IOManager ioManager,
+            boolean fullCompaction)
+            throws Exception {
         BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
         try (BatchTableWrite write = writeBuilder.newWrite();
                 BatchTableCommit commit = writeBuilder.newCommit()) {
-            write.compact(partition, bucket, true);
+            write.withIOManager(ioManager);
+            write.compact(partition, bucket, fullCompaction);
             commit.commit(write.prepareCommit());
         }
+    }
+
+    public void dropTableDefault() throws Exception {
+        catalog.dropTable(identifier(), true);
     }
 
     protected List<InternalRow> read(Table table, Pair<ConfigOption<?>, String>... dynamicOptions)
@@ -124,7 +171,7 @@ public abstract class TableTestBase {
 
     protected List<InternalRow> read(
             Table table,
-            @Nullable int[][] projection,
+            @Nullable int[] projection,
             Pair<ConfigOption<?>, String>... dynamicOptions)
             throws Exception {
         Map<String, String> options = new HashMap<>();
@@ -152,21 +199,34 @@ public abstract class TableTestBase {
         catalog.createTable(identifier(), schemaDefault(), true);
     }
 
+    public void createTable(Identifier identifier) throws Exception {
+        catalog.createTable(identifier, schemaDefault(), false);
+    }
+
     protected void commitDefault(List<CommitMessage> messages) throws Exception {
-        getTableDefault().newBatchWriteBuilder().newCommit().commit(messages);
+        BatchTableCommit commit = getTableDefault().newBatchWriteBuilder().newCommit();
+        commit.commit(messages);
+        commit.close();
     }
 
     protected List<CommitMessage> writeDataDefault(int size, int times) throws Exception {
+        return writeData(getTableDefault(), size, times);
+    }
+
+    protected List<CommitMessage> writeData(Table table, int size, int times) throws Exception {
         List<CommitMessage> messages = new ArrayList<>();
         for (int i = 0; i < times; i++) {
-            messages.addAll(writeOnce(getTableDefault(), i, size));
+            messages.addAll(writeOnce(table, i, size));
         }
-
         return messages;
     }
 
-    public Table getTableDefault() throws Exception {
-        return catalog.getTable(identifier());
+    public FileStoreTable getTableDefault() throws Exception {
+        return getTable(identifier());
+    }
+
+    public FileStoreTable getTable(Identifier identifier) throws Exception {
+        return (FileStoreTable) catalog.getTable(identifier);
     }
 
     private List<CommitMessage> writeOnce(Table table, int time, int size) throws Exception {

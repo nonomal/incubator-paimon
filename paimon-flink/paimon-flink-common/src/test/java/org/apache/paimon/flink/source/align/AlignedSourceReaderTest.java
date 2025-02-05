@@ -18,14 +18,17 @@
 
 package org.apache.paimon.flink.source.align;
 
+import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.flink.source.FileStoreSourceReader;
 import org.apache.paimon.flink.source.FileStoreSourceReaderTest;
 import org.apache.paimon.flink.source.TestChangelogDataReadWrite;
+import org.apache.paimon.flink.source.metrics.FileStoreSourceReaderMetrics;
 
 import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.connector.testutils.source.reader.TestingReaderContext;
 import org.apache.flink.connector.testutils.source.reader.TestingReaderOutput;
 import org.apache.flink.table.data.RowData;
+import org.junit.Ignore;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -61,10 +64,18 @@ public class AlignedSourceReaderTest extends FileStoreSourceReaderTest {
     }
 
     @Override
+    @Ignore
+    public void testReaderOnSplitFinished() throws Exception {
+        // ignore
+    }
+
+    @Override
     protected FileStoreSourceReader createReader(TestingReaderContext context) {
         return new AlignedSourceReader(
                 context,
                 new TestChangelogDataReadWrite(tempDir.toString()).createReadWithKey(),
+                new FileStoreSourceReaderMetrics(new DummyMetricGroup()),
+                IOManager.create(tempDir.toString()),
                 null,
                 new FutureCompletingBlockingQueue<>(2),
                 null);

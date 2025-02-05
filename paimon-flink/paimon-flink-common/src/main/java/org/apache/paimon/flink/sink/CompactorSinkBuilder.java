@@ -18,12 +18,15 @@
 
 package org.apache.paimon.flink.sink;
 
+import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
 
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.table.data.RowData;
+
+import java.util.Optional;
 
 import static org.apache.paimon.flink.sink.FlinkStreamPartitioner.partition;
 
@@ -34,8 +37,11 @@ public class CompactorSinkBuilder {
 
     private DataStream<RowData> input;
 
-    public CompactorSinkBuilder(FileStoreTable table) {
+    private final boolean fullCompaction;
+
+    public CompactorSinkBuilder(FileStoreTable table, boolean fullCompaction) {
         this.table = table;
+        this.fullCompaction = fullCompaction;
     }
 
     public CompactorSinkBuilder withInput(DataStream<RowData> input) {
@@ -46,17 +52,23 @@ public class CompactorSinkBuilder {
     public DataStreamSink<?> build() {
         BucketMode bucketMode = table.bucketMode();
         switch (bucketMode) {
-            case FIXED:
-            case DYNAMIC:
+            case HASH_FIXED:
+            case HASH_DYNAMIC:
                 return buildForBucketAware();
-            case UNAWARE:
+            case BUCKET_UNAWARE:
             default:
                 throw new UnsupportedOperationException("Unsupported bucket mode: " + bucketMode);
         }
     }
 
     private DataStreamSink<?> buildForBucketAware() {
-        DataStream<RowData> partitioned = partition(input, new BucketsRowChannelComputer(), null);
-        return new CompactorSink(table).sinkFrom(partitioned);
+        Integer parallelism =
+                Optional.ofNullable(
+                                table.options().get(FlinkConnectorOptions.SINK_PARALLELISM.key()))
+                        .map(Integer::valueOf)
+                        .orElse(null);
+        DataStream<RowData> partitioned =
+                partition(input, new BucketsRowChannelComputer(), parallelism);
+        return new CompactorSink(table, fullCompaction).sinkFrom(partitioned);
     }
 }

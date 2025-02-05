@@ -16,13 +16,9 @@
  * limitations under the License.
  */
 
-/* This file is based on source code from MySqlTypeUtils in the flink-cdc-connectors Project
- * (https://ververica.github.io/flink-cdc-connectors/), licensed by the Apache Software Foundation (ASF)
- * under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
- * additional information regarding copyright ownership. */
-
 package org.apache.paimon.flink.action.cdc.mysql;
 
+import org.apache.paimon.flink.action.cdc.JdbcToPaimonTypeVisitor;
 import org.apache.paimon.flink.action.cdc.TypeMapping;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
@@ -35,19 +31,25 @@ import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.ObjectMap
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.ObjectWriter;
 
 import com.esri.core.geometry.ogc.OGCGeometry;
+import org.apache.flink.api.java.tuple.Tuple3;
 
 import javax.annotation.Nullable;
 
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.paimon.flink.action.cdc.TypeMapping.TypeMappingMode.BIGINT_UNSIGNED_TO_BIGINT;
 import static org.apache.paimon.flink.action.cdc.TypeMapping.TypeMappingMode.CHAR_TO_STRING;
+import static org.apache.paimon.flink.action.cdc.TypeMapping.TypeMappingMode.LONGTEXT_TO_BYTES;
 import static org.apache.paimon.flink.action.cdc.TypeMapping.TypeMappingMode.TINYINT1_NOT_BOOL;
 import static org.apache.paimon.flink.action.cdc.TypeMapping.TypeMappingMode.TO_STRING;
+
+/* This file is based on source code from MySqlTypeUtils in the flink-cdc-connectors Project
+ * (https://github.com/apache/flink-cdc/), licensed by the Apache Software Foundation (ASF)
+ * under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
 
 /** Converts from MySQL type to {@link DataType}. */
 public class MySqlTypeUtils {
@@ -69,6 +71,9 @@ public class MySqlTypeUtils {
     private static final String INT = "INT";
     private static final String INT_UNSIGNED = "INT UNSIGNED";
     private static final String INT_UNSIGNED_ZEROFILL = "INT UNSIGNED ZEROFILL";
+    private static final String INTEGER = "INTEGER";
+    private static final String INTEGER_UNSIGNED = "INTEGER UNSIGNED";
+    private static final String INTEGER_UNSIGNED_ZEROFILL = "INTEGER UNSIGNED ZEROFILL";
     private static final String BIGINT = "BIGINT";
     private static final String SERIAL = "SERIAL";
     private static final String BIGINT_UNSIGNED = "BIGINT UNSIGNED";
@@ -134,17 +139,39 @@ public class MySqlTypeUtils {
     private static final String RIGHT_BRACKETS = ")";
     private static final String COMMA = ",";
 
-    private static final List<String> HAVE_SCALE_LIST =
-            Arrays.asList(DECIMAL, NUMERIC, DOUBLE, REAL, FIXED);
-
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
-    public static DataType toDataType(String mysqlFullType, TypeMapping typeMapping) {
-        return toDataType(
-                MySqlTypeUtils.getShortType(mysqlFullType),
-                MySqlTypeUtils.getPrecision(mysqlFullType),
-                MySqlTypeUtils.getScale(mysqlFullType),
-                typeMapping);
+    public static Tuple3<String, Integer, Integer> getTypeInfo(String typeName) {
+        int leftBracketIndex = typeName.indexOf(LEFT_BRACKETS);
+        String shortType;
+        int length = 0;
+        int scale = 0;
+        if (leftBracketIndex != -1) {
+            int rightBracketIndex = typeName.indexOf(RIGHT_BRACKETS);
+            shortType =
+                    typeName.substring(0, leftBracketIndex).trim().toUpperCase()
+                            + typeName.substring(rightBracketIndex + 1).toUpperCase();
+
+            String insideBrackets =
+                    typeName.substring(leftBracketIndex + 1, rightBracketIndex).trim();
+            int commaIndex = insideBrackets.indexOf(COMMA);
+
+            if (commaIndex != -1 && !isEnumType(shortType) && !isSetType(shortType)) {
+                length = Integer.parseInt(insideBrackets.substring(0, commaIndex).trim());
+                scale = Integer.parseInt(insideBrackets.substring(commaIndex + 1).trim());
+            } else if (!isEnumType(shortType) && !isSetType(shortType)) {
+                length = Integer.parseInt(insideBrackets);
+            }
+        } else {
+            shortType = typeName.toUpperCase();
+            if (isDecimalType(shortType)) {
+                // when missing precision and scale of the decimal, we
+                // use the max precision and scale to avoid parse error
+                length = 38;
+                scale = 18;
+            }
+        }
+        return Tuple3.of(shortType, length, scale);
     }
 
     public static DataType toDataType(
@@ -183,11 +210,14 @@ public class MySqlTypeUtils {
             case SMALLINT_UNSIGNED:
             case SMALLINT_UNSIGNED_ZEROFILL:
             case INT:
+            case INTEGER:
             case MEDIUMINT:
             case YEAR:
                 return DataTypes.INT();
             case INT_UNSIGNED:
+            case INTEGER_UNSIGNED:
             case INT_UNSIGNED_ZEROFILL:
+            case INTEGER_UNSIGNED_ZEROFILL:
             case MEDIUMINT_UNSIGNED:
             case MEDIUMINT_UNSIGNED_ZEROFILL:
             case BIGINT:
@@ -195,7 +225,9 @@ public class MySqlTypeUtils {
             case BIGINT_UNSIGNED:
             case BIGINT_UNSIGNED_ZEROFILL:
             case SERIAL:
-                return DataTypes.DECIMAL(20, 0);
+                return typeMapping.containsMode(BIGINT_UNSIGNED_TO_BIGINT)
+                        ? DataTypes.BIGINT()
+                        : DataTypes.DECIMAL(20, 0);
             case FLOAT:
             case FLOAT_UNSIGNED:
             case FLOAT_UNSIGNED_ZEROFILL:
@@ -261,7 +293,6 @@ public class MySqlTypeUtils {
             case TINYTEXT:
             case TEXT:
             case MEDIUMTEXT:
-            case LONGTEXT:
             case JSON:
             case ENUM:
             case GEOMETRY:
@@ -280,6 +311,10 @@ public class MySqlTypeUtils {
                 return length == null || length == 0
                         ? DataTypes.VARBINARY(VarBinaryType.DEFAULT_LENGTH)
                         : DataTypes.VARBINARY(length);
+            case LONGTEXT:
+                return typeMapping.containsMode(LONGTEXT_TO_BYTES)
+                        ? DataTypes.BYTES()
+                        : DataTypes.STRING();
             case TINYBLOB:
             case BLOB:
             case MEDIUMBLOB:
@@ -310,7 +345,11 @@ public class MySqlTypeUtils {
     }
 
     public static String convertWkbArray(byte[] wkb) throws JsonProcessingException {
-        String geoJson = OGCGeometry.fromBinary(ByteBuffer.wrap(wkb)).asGeoJson();
+        return convertWkbArray(ByteBuffer.wrap(wkb));
+    }
+
+    public static String convertWkbArray(ByteBuffer wkbByteBuffer) throws JsonProcessingException {
+        String geoJson = OGCGeometry.fromBinary(wkbByteBuffer).asGeoJson();
         JsonNode originGeoNode = objectMapper.readTree(geoJson);
 
         Optional<Integer> srid =
@@ -329,62 +368,46 @@ public class MySqlTypeUtils {
         return objectWriter.writeValueAsString(geometryInfo);
     }
 
-    public static boolean isScaleType(String typeName) {
-        return HAVE_SCALE_LIST.stream()
-                .anyMatch(type -> getShortType(typeName).toUpperCase().startsWith(type));
+    public static boolean isEnumType(String shortType) {
+        return shortType.equals(ENUM);
     }
 
-    public static boolean isEnumType(String typeName) {
-        return typeName.toUpperCase().startsWith(ENUM);
+    public static boolean isSetType(String shortType) {
+        return shortType.equals(SET);
     }
 
-    public static boolean isSetType(String typeName) {
-        return typeName.toUpperCase().startsWith(SET);
-    }
-
-    /* Get type after the brackets are removed.*/
-    public static String getShortType(String typeName) {
-
-        if (typeName.contains(LEFT_BRACKETS) && typeName.contains(RIGHT_BRACKETS)) {
-            return typeName.substring(0, typeName.indexOf(LEFT_BRACKETS)).trim()
-                    + typeName.substring(typeName.indexOf(RIGHT_BRACKETS) + 1);
-        } else {
-            return typeName;
+    private static boolean isDecimalType(String shortType) {
+        switch (shortType) {
+            case NUMERIC:
+            case NUMERIC_UNSIGNED:
+            case NUMERIC_UNSIGNED_ZEROFILL:
+            case FIXED:
+            case FIXED_UNSIGNED:
+            case FIXED_UNSIGNED_ZEROFILL:
+            case DECIMAL:
+            case DECIMAL_UNSIGNED:
+            case DECIMAL_UNSIGNED_ZEROFILL:
+                return true;
+            default:
+                return false;
         }
     }
 
-    public static int getPrecision(String typeName) {
-        if (typeName.contains(LEFT_BRACKETS)
-                && typeName.contains(RIGHT_BRACKETS)
-                && isScaleType(typeName)) {
-            return Integer.parseInt(
-                    typeName.substring(typeName.indexOf(LEFT_BRACKETS) + 1, typeName.indexOf(COMMA))
-                            .trim());
-        } else if ((typeName.contains(LEFT_BRACKETS)
-                && typeName.contains(RIGHT_BRACKETS)
-                && !isScaleType(typeName)
-                && !isEnumType(typeName)
-                && !isSetType(typeName))) {
-            return Integer.parseInt(
-                    typeName.substring(
-                                    typeName.indexOf(LEFT_BRACKETS) + 1,
-                                    typeName.indexOf(RIGHT_BRACKETS))
-                            .trim());
-        } else {
-            return 0;
-        }
+    public static JdbcToPaimonTypeVisitor toPaimonTypeVisitor() {
+        return MySqlToPaimonTypeVisitor.INSTANCE;
     }
 
-    public static int getScale(String typeName) {
-        if (typeName.contains(LEFT_BRACKETS)
-                && typeName.contains(RIGHT_BRACKETS)
-                && isScaleType(typeName)) {
-            return Integer.parseInt(
-                    typeName.substring(
-                                    typeName.indexOf(COMMA) + 1, typeName.indexOf(RIGHT_BRACKETS))
-                            .trim());
-        } else {
-            return 0;
+    private static class MySqlToPaimonTypeVisitor implements JdbcToPaimonTypeVisitor {
+
+        private static final MySqlToPaimonTypeVisitor INSTANCE = new MySqlToPaimonTypeVisitor();
+
+        @Override
+        public DataType visit(
+                String type,
+                @Nullable Integer length,
+                @Nullable Integer scale,
+                TypeMapping typeMapping) {
+            return toDataType(type, length, scale, typeMapping);
         }
     }
 }

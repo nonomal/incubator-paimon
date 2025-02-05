@@ -15,25 +15,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.paimon.codegen
 
 import org.apache.paimon.codegen.GenerateUtils._
-import org.apache.paimon.codegen.ScalarOperatorGens.generateEquals
-import org.apache.paimon.types.{BooleanType, DataType, RowType}
-import org.apache.paimon.types.DataTypeChecks.{getFieldTypes, isCompositeType}
+import org.apache.paimon.codegen.ScalarOperatorGens.{generateEquals, generateRowEqualiser}
+import org.apache.paimon.types.{BooleanType, DataType}
+import org.apache.paimon.types.DataTypeChecks.isCompositeType
 import org.apache.paimon.types.DataTypeRoot._
 import org.apache.paimon.utils.TypeUtils.isPrimitive
 
-import scala.collection.JavaConverters._
-
-class EqualiserCodeGenerator(fieldTypes: Array[DataType]) {
+class EqualiserCodeGenerator(fieldTypes: Array[DataType], fields: Array[Int]) {
 
   private val RECORD_EQUALISER = className[RecordEqualiser]
   private val LEFT_INPUT = "left"
   private val RIGHT_INPUT = "right"
 
-  def this(rowType: RowType) = {
-    this(rowType.getFieldTypes.asScala.toArray)
+  def this(fieldTypes: Array[DataType]) = {
+    this(fieldTypes, fieldTypes.indices.toArray)
   }
 
   def generateRecordEqualiser(name: String): GeneratedClass[RecordEqualiser] = {
@@ -41,8 +40,9 @@ class EqualiserCodeGenerator(fieldTypes: Array[DataType]) {
     val ctx = new CodeGeneratorContext
     val className = newName(name)
 
-    val equalsMethodCodes = for (idx <- fieldTypes.indices) yield generateEqualsMethod(ctx, idx)
-    val equalsMethodCalls = for (idx <- fieldTypes.indices) yield {
+    val containsIgnoreFields = fieldTypes.length > fields.length
+    val equalsMethodCodes = for (idx <- fields) yield generateEqualsMethod(ctx, idx)
+    val equalsMethodCalls = for (idx <- fields) yield {
       val methodName = getEqualsMethodName(idx)
       s"""result = result && $methodName($LEFT_INPUT, $RIGHT_INPUT);"""
     }
@@ -58,7 +58,7 @@ class EqualiserCodeGenerator(fieldTypes: Array[DataType]) {
 
           @Override
           public boolean equals($ROW_DATA $LEFT_INPUT, $ROW_DATA $RIGHT_INPUT) {
-            if ($LEFT_INPUT instanceof $BINARY_ROW && $RIGHT_INPUT instanceof $BINARY_ROW) {
+            if ($LEFT_INPUT instanceof $BINARY_ROW && $RIGHT_INPUT instanceof $BINARY_ROW && !$containsIgnoreFields) {
               return $LEFT_INPUT.equals($RIGHT_INPUT);
             }
 
@@ -135,19 +135,7 @@ class EqualiserCodeGenerator(fieldTypes: Array[DataType]) {
     if (isInternalPrimitive(fieldType)) {
       ("", s"$leftFieldTerm == $rightFieldTerm")
     } else if (isCompositeType(fieldType)) {
-      val equaliserGenerator =
-        new EqualiserCodeGenerator(getFieldTypes(fieldType).asScala.toArray)
-      val generatedEqualiser = equaliserGenerator.generateRecordEqualiser("fieldGeneratedEqualiser")
-      val generatedEqualiserTerm =
-        ctx.addReusableObject(generatedEqualiser, "fieldGeneratedEqualiser")
-      val equaliserTypeTerm = classOf[RecordEqualiser].getCanonicalName
-      val equaliserTerm = newName("equaliser")
-      ctx.addReusableMember(s"private $equaliserTypeTerm $equaliserTerm = null;")
-      ctx.addReusableInitStatement(
-        s"""
-           |$equaliserTerm = ($equaliserTypeTerm)
-           |  $generatedEqualiserTerm.newInstance(this.getClass().getClassLoader());
-           |""".stripMargin)
+      val equaliserTerm = generateRowEqualiser(ctx, fieldType)
       ("", s"$equaliserTerm.equals($leftFieldTerm, $rightFieldTerm)")
     } else {
       val left = GeneratedExpression(leftFieldTerm, leftNullTerm, "", fieldType)

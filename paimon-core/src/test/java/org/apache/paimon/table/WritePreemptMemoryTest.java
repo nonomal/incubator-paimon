@@ -19,7 +19,6 @@
 package org.apache.paimon.table;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.fs.FileIOFinder;
 import org.apache.paimon.fs.local.LocalFileIO;
@@ -33,6 +32,7 @@ import org.apache.paimon.table.sink.StreamTableCommit;
 import org.apache.paimon.table.sink.StreamTableWrite;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
+import org.apache.paimon.types.RowType;
 
 import org.junit.jupiter.api.Test;
 
@@ -45,7 +45,7 @@ import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Tests for {@link ChangelogWithKeyFileStoreTable}. */
+/** Tests for {@link PrimaryKeyFileStoreTable}. */
 public class WritePreemptMemoryTest extends FileStoreTableTestBase {
 
     @Test
@@ -58,7 +58,7 @@ public class WritePreemptMemoryTest extends FileStoreTableTestBase {
         testWritePreemptMemory(true);
     }
 
-    @Override // this has been tested in ChangelogWithKeyFileStoreTableTest
+    @Override // this has been tested in PrimaryKeyFileStoreTableTest
     @Test
     public void testReadFilter() {}
 
@@ -76,6 +76,7 @@ public class WritePreemptMemoryTest extends FileStoreTableTestBase {
         }
         commit.commit(0, write.prepareCommit(true, 0));
         write.close();
+        commit.close();
 
         // read
         List<Split> splits = toSplits(table.newSnapshotReader().read().dataSplits());
@@ -88,33 +89,59 @@ public class WritePreemptMemoryTest extends FileStoreTableTestBase {
     }
 
     @Override
-    protected FileStoreTable createFileStoreTable(Consumer<Options> configure) throws Exception {
-        Options conf = new Options();
-        conf.set(CoreOptions.PATH, tablePath.toString());
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.CHANGE_LOG);
+    protected FileStoreTable createFileStoreTable(Consumer<Options> configure, RowType rowType)
+            throws Exception {
+        Options options = new Options();
+        options.set(CoreOptions.BUCKET, 1);
+        options.set(CoreOptions.PATH, tablePath.toString());
         // Run with minimal memory to ensure a more intense preempt
         // Currently a writer needs at least one page
         int pages = 10;
-        conf.set(CoreOptions.WRITE_BUFFER_SIZE, new MemorySize(pages * 1024));
-        conf.set(CoreOptions.PAGE_SIZE, new MemorySize(1024));
-        configure.accept(conf);
+        options.set(CoreOptions.WRITE_BUFFER_SIZE, new MemorySize(pages * 1024));
+        options.set(CoreOptions.PAGE_SIZE, new MemorySize(1024));
+        configure.accept(options);
         TableSchema schema =
                 SchemaUtils.forceCommit(
                         new SchemaManager(LocalFileIO.create(), tablePath),
                         new Schema(
+                                rowType.getFields(),
+                                Collections.singletonList("pt"),
+                                Arrays.asList("pt", "a"),
+                                options.toMap(),
+                                ""));
+        return new PrimaryKeyFileStoreTable(FileIOFinder.find(tablePath), tablePath, schema);
+    }
+
+    @Override
+    protected FileStoreTable createFileStoreTable(String branch, Consumer<Options> configure)
+            throws Exception {
+        Options options = new Options();
+        options.set(CoreOptions.BUCKET, 1);
+        options.set(CoreOptions.PATH, tablePath.toString());
+        // Run with minimal memory to ensure a more intense preempt
+        // Currently a writer needs at least one page
+        int pages = 10;
+        options.set(CoreOptions.WRITE_BUFFER_SIZE, new MemorySize(pages * 1024));
+        options.set(CoreOptions.PAGE_SIZE, new MemorySize(1024));
+        options.set(CoreOptions.BRANCH, branch);
+        configure.accept(options);
+        TableSchema schema =
+                SchemaUtils.forceCommit(
+                        new SchemaManager(LocalFileIO.create(), tablePath, branch),
+                        new Schema(
                                 ROW_TYPE.getFields(),
                                 Collections.singletonList("pt"),
                                 Arrays.asList("pt", "a"),
-                                conf.toMap(),
+                                options.toMap(),
                                 ""));
-        return new ChangelogWithKeyFileStoreTable(FileIOFinder.find(tablePath), tablePath, schema);
+        return new PrimaryKeyFileStoreTable(FileIOFinder.find(tablePath), tablePath, schema);
     }
 
     @Override
     protected FileStoreTable overwriteTestFileStoreTable() throws Exception {
         Options conf = new Options();
         conf.set(CoreOptions.PATH, tablePath.toString());
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.CHANGE_LOG);
+        conf.set(CoreOptions.BUCKET, 1);
         // Run with minimal memory to ensure a more intense preempt
         // Currently a writer needs at least one page
         int pages = 10;
@@ -129,6 +156,6 @@ public class WritePreemptMemoryTest extends FileStoreTableTestBase {
                                 Arrays.asList("pk", "pt0", "pt1"),
                                 conf.toMap(),
                                 ""));
-        return new ChangelogWithKeyFileStoreTable(FileIOFinder.find(tablePath), tablePath, schema);
+        return new PrimaryKeyFileStoreTable(FileIOFinder.find(tablePath), tablePath, schema);
     }
 }

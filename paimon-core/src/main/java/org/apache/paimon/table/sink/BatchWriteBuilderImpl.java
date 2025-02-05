@@ -18,13 +18,16 @@
 
 package org.apache.paimon.table.sink;
 
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.InnerTable;
 import org.apache.paimon.types.RowType;
 
 import javax.annotation.Nullable;
 
 import java.util.Map;
-import java.util.UUID;
+import java.util.Optional;
+
+import static org.apache.paimon.CoreOptions.createCommitUser;
 
 /** Implementation for {@link WriteBuilder}. */
 public class BatchWriteBuilderImpl implements BatchWriteBuilder {
@@ -32,12 +35,13 @@ public class BatchWriteBuilderImpl implements BatchWriteBuilder {
     private static final long serialVersionUID = 1L;
 
     private final InnerTable table;
-    private final String commitUser = UUID.randomUUID().toString();
+    private final String commitUser;
 
     private Map<String, String> staticPartition;
 
     public BatchWriteBuilderImpl(InnerTable table) {
         this.table = table;
+        this.commitUser = createCommitUser(new Options(table.options()));
     }
 
     @Override
@@ -51,6 +55,11 @@ public class BatchWriteBuilderImpl implements BatchWriteBuilder {
     }
 
     @Override
+    public Optional<WriteSelector> newWriteSelector() {
+        return table.newWriteSelector();
+    }
+
+    @Override
     public BatchWriteBuilder withOverwrite(@Nullable Map<String, String> staticPartition) {
         this.staticPartition = staticPartition;
         return this;
@@ -60,7 +69,7 @@ public class BatchWriteBuilderImpl implements BatchWriteBuilder {
     public BatchTableWrite newWrite() {
         return table.newWrite(commitUser)
                 .withIgnorePreviousFiles(staticPartition != null)
-                .isStreamingMode(false);
+                .withExecutionMode(false);
     }
 
     @Override

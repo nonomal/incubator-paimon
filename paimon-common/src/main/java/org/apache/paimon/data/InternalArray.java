@@ -130,8 +130,16 @@ public interface InternalArray extends DataGetters {
                 final int rowFieldCount = getFieldCount(elementType);
                 elementGetter = (array, pos) -> array.getRow(pos, rowFieldCount);
                 break;
+            case VARIANT:
+                elementGetter = InternalArray::getVariant;
+                break;
             default:
-                throw new IllegalArgumentException();
+                String msg =
+                        String.format(
+                                "type %s not support in %s",
+                                elementType.getTypeRoot().toString(),
+                                InternalArray.class.getName());
+                throw new IllegalArgumentException(msg);
         }
         if (!elementType.isNullable()) {
             return elementGetter;

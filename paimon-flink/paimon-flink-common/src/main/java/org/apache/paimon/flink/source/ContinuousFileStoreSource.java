@@ -19,13 +19,19 @@
 package org.apache.paimon.flink.source;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.flink.FlinkConnectorOptions;
+import org.apache.paimon.flink.NestedProjectedRowData;
+import org.apache.paimon.flink.metrics.FlinkMetricRegistry;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.source.StreamDataTableScan;
 import org.apache.paimon.table.source.StreamTableScan;
 
 import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
+import org.apache.flink.metrics.groups.SplitEnumeratorMetricGroup;
 
 import javax.annotation.Nullable;
 
@@ -43,15 +49,16 @@ public class ContinuousFileStoreSource extends FlinkSource {
 
     public ContinuousFileStoreSource(
             ReadBuilder readBuilder, Map<String, String> options, @Nullable Long limit) {
-        this(readBuilder, options, limit, BucketMode.FIXED);
+        this(readBuilder, options, limit, BucketMode.HASH_FIXED, null);
     }
 
     public ContinuousFileStoreSource(
             ReadBuilder readBuilder,
             Map<String, String> options,
             @Nullable Long limit,
-            BucketMode bucketMode) {
-        super(readBuilder, limit);
+            BucketMode bucketMode,
+            @Nullable NestedProjectedRowData rowData) {
+        super(readBuilder, limit, rowData);
         this.options = options;
         this.bucketMode = bucketMode;
     }
@@ -73,8 +80,22 @@ public class ContinuousFileStoreSource extends FlinkSource {
             splits = checkpoint.splits();
         }
         StreamTableScan scan = readBuilder.newStreamScan();
+        if (metricGroup(context) != null) {
+            ((StreamDataTableScan) scan)
+                    .withMetricsRegistry(new FlinkMetricRegistry(context.metricGroup()));
+        }
         scan.restore(nextSnapshotId);
         return buildEnumerator(context, splits, nextSnapshotId, scan);
+    }
+
+    @Nullable
+    private SplitEnumeratorMetricGroup metricGroup(SplitEnumeratorContext<?> context) {
+        try {
+            return context.metricGroup();
+        } catch (NullPointerException ignore) {
+            // ignore NPE for some Flink versions
+            return null;
+        }
     }
 
     protected SplitEnumerator<FileStoreSourceSplit, PendingSplitsCheckpoint> buildEnumerator(
@@ -82,12 +103,15 @@ public class ContinuousFileStoreSource extends FlinkSource {
             Collection<FileStoreSourceSplit> splits,
             @Nullable Long nextSnapshotId,
             StreamTableScan scan) {
+        Options options = Options.fromMap(this.options);
         return new ContinuousFileSplitEnumerator(
                 context,
                 splits,
                 nextSnapshotId,
-                CoreOptions.fromMap(options).continuousDiscoveryInterval().toMillis(),
+                options.get(CoreOptions.CONTINUOUS_DISCOVERY_INTERVAL).toMillis(),
                 scan,
-                bucketMode);
+                bucketMode,
+                options.get(CoreOptions.SCAN_MAX_SPLITS_PER_TASK),
+                options.get(FlinkConnectorOptions.STREAMING_READ_SHUFFLE_BUCKET_WITH_PARTITION));
     }
 }

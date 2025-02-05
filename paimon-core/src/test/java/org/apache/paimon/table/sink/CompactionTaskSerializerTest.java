@@ -18,7 +18,9 @@
 
 package org.apache.paimon.table.sink;
 
-import org.apache.paimon.append.AppendOnlyCompactionTask;
+import org.apache.paimon.append.MultiTableUnawareAppendCompactionTask;
+import org.apache.paimon.append.UnawareAppendCompactionTask;
+import org.apache.paimon.catalog.Identifier;
 
 import org.junit.jupiter.api.Test;
 
@@ -28,17 +30,32 @@ import static org.apache.paimon.manifest.ManifestCommittableSerializerTest.rando
 import static org.apache.paimon.mergetree.compact.MergeTreeCompactManagerTest.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Tests for {@link CompactionTaskSerializer}. */
+/** Tests for {@link CompactionTaskSerializer} and {@link MultiTableCompactionTaskSerializer}. */
 public class CompactionTaskSerializerTest {
 
     @Test
     public void testCompactionTaskSerializer() throws IOException {
         CompactionTaskSerializer serializer = new CompactionTaskSerializer();
-        AppendOnlyCompactionTask task =
-                new AppendOnlyCompactionTask(row(0), randomNewFilesIncrement().newFiles());
+        UnawareAppendCompactionTask task =
+                new UnawareAppendCompactionTask(row(0), randomNewFilesIncrement().newFiles());
 
         byte[] bytes = serializer.serialize(task);
-        AppendOnlyCompactionTask task1 = serializer.deserialize(serializer.getVersion(), bytes);
+        UnawareAppendCompactionTask task1 = serializer.deserialize(serializer.getVersion(), bytes);
+        assertThat(task).isEqualTo(task1);
+    }
+
+    @Test
+    public void testMultiTableCompactionTaskSerializer() throws IOException {
+        MultiTableCompactionTaskSerializer serializer = new MultiTableCompactionTaskSerializer();
+        MultiTableUnawareAppendCompactionTask task =
+                new MultiTableUnawareAppendCompactionTask(
+                        row(0),
+                        randomNewFilesIncrement().newFiles(),
+                        Identifier.create("db", "table"));
+
+        byte[] bytes = serializer.serialize(task);
+        MultiTableUnawareAppendCompactionTask task1 =
+                serializer.deserialize(serializer.getVersion(), bytes);
         assertThat(task).isEqualTo(task1);
     }
 }

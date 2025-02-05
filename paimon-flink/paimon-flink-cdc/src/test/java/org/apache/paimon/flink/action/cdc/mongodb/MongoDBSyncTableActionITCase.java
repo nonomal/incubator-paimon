@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.action.cdc.mongodb;
 
+import org.apache.paimon.options.CatalogOptions;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
@@ -33,9 +34,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.paimon.testutils.assertj.PaimonAssertions.anyCauseMatches;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** IT cases for {@link MongoDBSyncTableActionITCase}. */
+/** IT cases for {@link MongoDBSyncTableAction}. */
 public class MongoDBSyncTableActionITCase extends MongoDBActionITCaseBase {
 
     @Test
@@ -198,8 +201,9 @@ public class MongoDBSyncTableActionITCase extends MongoDBActionITCaseBase {
         MongoDBSyncTableAction action2 =
                 syncTableActionBuilder(mongodbConfig).withTableConfig(tableConfig).build();
         runActionWithDefaultEnv(action2);
-        Map<String, String> dynamicOptions = action2.fileStoreTable().options();
-        assertThat(dynamicOptions).containsAllEntriesOf(tableConfig);
+
+        FileStoreTable table = getFileStoreTable(tableName);
+        assertThat(table.options()).containsAllEntriesOf(tableConfig);
     }
 
     @Test
@@ -301,8 +305,43 @@ public class MongoDBSyncTableActionITCase extends MongoDBActionITCaseBase {
 
         Map<String, String> mongodbConfig = getBasicMongoDBConfig();
         mongodbConfig.put("database", database);
-        mongodbConfig.put("collection", "defaultId");
+        mongodbConfig.put("collection", "defaultId1");
         mongodbConfig.put("default.id.generation", "false");
+
+        MongoDBSyncTableAction action =
+                syncTableActionBuilder(mongodbConfig)
+                        .withTableConfig(getBasicTableConfig())
+                        .build();
+        runActionWithDefaultEnv(action);
+
+        FileStoreTable table = getFileStoreTable(tableName);
+        List<String> primaryKeys = Collections.singletonList("_id");
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.STRING().notNull(),
+                            DataTypes.STRING(),
+                            DataTypes.STRING(),
+                            DataTypes.STRING()
+                        },
+                        new String[] {"_id", "name", "description", "weight"});
+
+        List<String> expectedInsert =
+                Arrays.asList(
+                        "+I[{\"$oid\":\"100000000000000000000101\"}, scooter, Small 2-wheel scooter, 3.14]",
+                        "+I[{\"$oid\":\"100000000000000000000102\"}, car battery, 12V car battery, 8.1]",
+                        "+I[{\"$oid\":\"100000000000000000000103\"}, 12-pack drill bits, 12-pack of drill bits with sizes ranging from #40 to #3, 0.8]");
+        waitForResult(expectedInsert, table, rowType, primaryKeys);
+    }
+
+    @Test
+    @Timeout(60)
+    public void testPrimaryKeyNotObjectIdType() throws Exception {
+        writeRecordsToMongoDB("defaultId-2", database, "table/defaultid");
+
+        Map<String, String> mongodbConfig = getBasicMongoDBConfig();
+        mongodbConfig.put("database", database);
+        mongodbConfig.put("collection", "defaultId2");
 
         MongoDBSyncTableAction action =
                 syncTableActionBuilder(mongodbConfig)
@@ -328,5 +367,59 @@ public class MongoDBSyncTableActionITCase extends MongoDBActionITCaseBase {
                         "+I[100000000000000000000102, car battery, 12V car battery, 8.1]",
                         "+I[100000000000000000000103, 12-pack drill bits, 12-pack of drill bits with sizes ranging from #40 to #3, 0.8]");
         waitForResult(expectedInsert, table, rowType, primaryKeys);
+    }
+
+    @Test
+    @Timeout(60)
+    public void testComputedColumnWithCaseInsensitive() throws Exception {
+        writeRecordsToMongoDB("test-table-2", database, "table/computedcolumn");
+        Map<String, String> mongodbConfig = getBasicMongoDBConfig();
+        mongodbConfig.put("database", database);
+        mongodbConfig.put("collection", "computed_column_with_case_insensitive");
+
+        MongoDBSyncTableAction action =
+                syncTableActionBuilder(mongodbConfig)
+                        .withTableConfig(getBasicTableConfig())
+                        .withCatalogConfig(
+                                Collections.singletonMap(
+                                        CatalogOptions.CASE_SENSITIVE.key(), "false"))
+                        .withComputedColumnArgs("_YEAR=year(_DATE)")
+                        .build();
+        runActionWithDefaultEnv(action);
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.STRING().notNull(), DataTypes.STRING(), DataTypes.INT()
+                        },
+                        new String[] {"_id", "_date", "_year"});
+        waitForResult(
+                Arrays.asList(
+                        "+I[100000000000000000000101, 2023-12-11, 2023]",
+                        "+I[100000000000000000000102, NULL, NULL]"),
+                getFileStoreTable(tableName),
+                rowType,
+                Collections.singletonList("_id"));
+    }
+
+    @Test
+    @Timeout(60)
+    public void testRuntimeExecutionModeCheckForCdcSync() {
+        Map<String, String> mongodbConfig = getBasicMongoDBConfig();
+        mongodbConfig.put("database", database);
+        mongodbConfig.put("collection", "products");
+        mongodbConfig.put("field.name", "_id,name,description");
+        mongodbConfig.put("parser.path", "$._id,$.name,$.description");
+        mongodbConfig.put("schema.start.mode", "specified");
+
+        MongoDBSyncTableAction action =
+                syncTableActionBuilder(mongodbConfig)
+                        .withTableConfig(getBasicTableConfig())
+                        .build();
+
+        assertThatThrownBy(() -> runActionWithBatchEnv(action))
+                .satisfies(
+                        anyCauseMatches(
+                                IllegalArgumentException.class,
+                                "It's only support STREAMING mode for flink-cdc sync table action"));
     }
 }

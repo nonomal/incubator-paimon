@@ -20,69 +20,131 @@ package org.apache.paimon.flink.lookup;
 
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.serializer.InternalSerializers;
+import org.apache.paimon.lookup.BulkLoader;
+import org.apache.paimon.lookup.RocksDBValueState;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.RowKind;
-import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.KeyProjectedRow;
+import org.apache.paimon.utils.ProjectedRow;
 import org.apache.paimon.utils.TypeUtils;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
-import java.util.function.Predicate;
 
 /** A {@link LookupTable} for primary key table. */
-public class PrimaryKeyLookupTable implements LookupTable {
+public class PrimaryKeyLookupTable extends FullCacheLookupTable {
 
-    protected final RocksDBValueState<InternalRow, InternalRow> tableState;
+    protected final long lruCacheSize;
 
-    protected final Predicate<InternalRow> recordFilter;
+    protected final KeyProjectedRow primaryKeyRow;
 
-    protected int[] primaryKeyMapping;
+    @Nullable private final ProjectedRow keyRearrange;
 
-    protected final KeyProjectedRow primaryKey;
+    protected RocksDBValueState<InternalRow, InternalRow> tableState;
 
-    public PrimaryKeyLookupTable(
-            RocksDBStateFactory stateFactory,
-            RowType rowType,
-            List<String> primaryKey,
-            Predicate<InternalRow> recordFilter,
-            long lruCacheSize)
-            throws IOException {
-        List<String> fieldNames = rowType.getFieldNames();
-        this.primaryKeyMapping = primaryKey.stream().mapToInt(fieldNames::indexOf).toArray();
-        this.primaryKey = new KeyProjectedRow(primaryKeyMapping);
-        this.tableState =
-                stateFactory.valueState(
-                        "table",
-                        InternalSerializers.create(TypeUtils.project(rowType, primaryKeyMapping)),
-                        InternalSerializers.create(rowType),
-                        lruCacheSize);
-        this.recordFilter = recordFilter;
+    public PrimaryKeyLookupTable(Context context, long lruCacheSize, List<String> joinKey) {
+        super(context);
+        this.lruCacheSize = lruCacheSize;
+        List<String> fieldNames = projectedType.getFieldNames();
+        FileStoreTable table = context.table;
+        int[] primaryKeyMapping =
+                table.primaryKeys().stream().mapToInt(fieldNames::indexOf).toArray();
+        this.primaryKeyRow = new KeyProjectedRow(primaryKeyMapping);
+
+        ProjectedRow keyRearrange = null;
+        if (!table.primaryKeys().equals(joinKey)) {
+            keyRearrange =
+                    ProjectedRow.from(
+                            table.primaryKeys().stream()
+                                    .map(joinKey::indexOf)
+                                    .mapToInt(value -> value)
+                                    .toArray());
+        }
+        this.keyRearrange = keyRearrange;
     }
 
     @Override
-    public List<InternalRow> get(InternalRow key) throws IOException {
+    public void open() throws Exception {
+        init();
+        createTableState();
+        bootstrap();
+    }
+
+    protected void createTableState() throws IOException {
+        this.tableState =
+                stateFactory.valueState(
+                        "table",
+                        InternalSerializers.create(
+                                TypeUtils.project(projectedType, primaryKeyRow.indexMapping())),
+                        InternalSerializers.create(projectedType),
+                        lruCacheSize);
+    }
+
+    @Override
+    public List<InternalRow> innerGet(InternalRow key) throws IOException {
+        if (keyRearrange != null) {
+            key = keyRearrange.replaceRow(key);
+        }
         InternalRow value = tableState.get(key);
         return value == null ? Collections.emptyList() : Collections.singletonList(value);
     }
 
     @Override
-    public void refresh(Iterator<InternalRow> incremental) throws IOException {
-        while (incremental.hasNext()) {
-            InternalRow row = incremental.next();
-            primaryKey.replaceRow(row);
-            if (row.getRowKind() == RowKind.INSERT || row.getRowKind() == RowKind.UPDATE_AFTER) {
-                if (recordFilter.test(row)) {
-                    tableState.put(primaryKey, row);
-                } else {
-                    // The new record under primary key is filtered
-                    // We need to delete this primary key as it no longer exists.
-                    tableState.delete(primaryKey);
-                }
-            } else {
-                tableState.delete(primaryKey);
+    protected void refreshRow(InternalRow row, Predicate predicate) throws IOException {
+        primaryKeyRow.replaceRow(row);
+        if (userDefinedSeqComparator != null) {
+            InternalRow previous = tableState.get(primaryKeyRow);
+            if (previous != null && userDefinedSeqComparator.compare(previous, row) > 0) {
+                return;
             }
         }
+
+        if (row.getRowKind() == RowKind.INSERT || row.getRowKind() == RowKind.UPDATE_AFTER) {
+            if (predicate == null || predicate.test(row)) {
+                tableState.put(primaryKeyRow, row);
+            } else {
+                // The new record under primary key is filtered
+                // We need to delete this primary key as it no longer exists.
+                tableState.delete(primaryKeyRow);
+            }
+        } else {
+            tableState.delete(primaryKeyRow);
+        }
     }
+
+    @Override
+    public byte[] toKeyBytes(InternalRow row) throws IOException {
+        primaryKeyRow.replaceRow(row);
+        return tableState.serializeKey(primaryKeyRow);
+    }
+
+    @Override
+    public byte[] toValueBytes(InternalRow row) throws IOException {
+        return tableState.serializeValue(row);
+    }
+
+    @Override
+    public TableBulkLoader createBulkLoader() {
+        BulkLoader bulkLoader = tableState.createBulkLoader();
+        return new TableBulkLoader() {
+
+            @Override
+            public void write(byte[] key, byte[] value)
+                    throws BulkLoader.WriteException, IOException {
+                bulkLoader.write(key, value);
+                bulkLoadWritePlus(key, value);
+            }
+
+            @Override
+            public void finish() {
+                bulkLoader.finish();
+            }
+        };
+    }
+
+    public void bulkLoadWritePlus(byte[] key, byte[] value) throws IOException {}
 }

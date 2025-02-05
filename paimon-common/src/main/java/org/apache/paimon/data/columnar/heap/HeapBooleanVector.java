@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -45,6 +45,13 @@ public class HeapBooleanVector extends AbstractHeapVector implements WritableBoo
     }
 
     @Override
+    void reserveForHeapVector(int newCapacity) {
+        if (vector.length < newCapacity) {
+            vector = Arrays.copyOf(vector, newCapacity);
+        }
+    }
+
+    @Override
     public boolean getBoolean(int i) {
         return vector[i];
     }
@@ -55,7 +62,37 @@ public class HeapBooleanVector extends AbstractHeapVector implements WritableBoo
     }
 
     @Override
+    public void setBooleans(int rowId, int count, boolean value) {
+        for (int i = 0; i < count; ++i) {
+            vector[i + rowId] = value;
+        }
+    }
+
+    @Override
+    public void setBooleans(int rowId, int count, byte src, int srcIndex) {
+        assert (count + srcIndex <= 8);
+        for (int i = 0; i < count; i++) {
+            vector[i + rowId] = (byte) (src >>> (i + srcIndex) & 1) == 1;
+        }
+    }
+
+    @Override
+    public void setBooleans(int rowId, byte src) {
+        setBooleans(rowId, 8, src, 0);
+    }
+
+    @Override
     public void fill(boolean value) {
         Arrays.fill(vector, value);
+    }
+
+    @Override
+    public void reset() {
+        super.reset();
+        if (vector.length != capacity) {
+            vector = new boolean[capacity];
+        } else {
+            Arrays.fill(vector, false);
+        }
     }
 }

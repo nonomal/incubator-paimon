@@ -19,21 +19,28 @@
 package org.apache.paimon.catalog;
 
 import org.apache.paimon.fs.FileIO;
-import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.operation.Lock;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
 
-import java.util.ArrayList;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Callable;
 
+import static org.apache.paimon.options.CatalogOptions.CASE_SENSITIVE;
+
 /** A catalog implementation for {@link FileIO}. */
 public class FileSystemCatalog extends AbstractCatalog {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FileSystemCatalog.class);
 
     private final Path warehouse;
 
@@ -42,115 +49,130 @@ public class FileSystemCatalog extends AbstractCatalog {
         this.warehouse = warehouse;
     }
 
-    public FileSystemCatalog(FileIO fileIO, Path warehouse, Map<String, String> options) {
+    public FileSystemCatalog(FileIO fileIO, Path warehouse, Options options) {
         super(fileIO, options);
         this.warehouse = warehouse;
     }
 
     @Override
-    public Optional<CatalogLock.Factory> lockFactory() {
-        return Optional.empty();
-    }
-
-    @Override
     public List<String> listDatabases() {
-        List<String> databases = new ArrayList<>();
-        for (FileStatus status : uncheck(() -> fileIO.listStatus(warehouse))) {
-            Path path = status.getPath();
-            if (status.isDir() && isDatabase(path)) {
-                databases.add(database(path));
-            }
+        return uncheck(() -> listDatabasesInFileSystem(warehouse));
+    }
+
+    @Override
+    protected void createDatabaseImpl(String name, Map<String, String> properties) {
+        if (properties.containsKey(Catalog.DB_LOCATION_PROP)) {
+            throw new IllegalArgumentException(
+                    "Cannot specify location for a database when using fileSystem catalog.");
         }
-        return databases;
+        if (!properties.isEmpty()) {
+            LOG.warn(
+                    "Currently filesystem catalog can't store database properties, discard properties: {}",
+                    properties);
+        }
+
+        Path databasePath = newDatabasePath(name);
+        if (!uncheck(() -> fileIO.mkdirs(databasePath))) {
+            throw new RuntimeException(
+                    String.format(
+                            "Create database location failed, " + "database: %s, location: %s",
+                            name, databasePath));
+        }
     }
 
     @Override
-    protected boolean databaseExistsImpl(String databaseName) {
-        return uncheck(() -> fileIO.exists(databasePath(databaseName)));
-    }
-
-    @Override
-    protected void createDatabaseImpl(String name) {
-        uncheck(() -> fileIO.mkdirs(databasePath(name)));
+    public Database getDatabaseImpl(String name) throws DatabaseNotExistException {
+        if (!uncheck(() -> fileIO.exists(newDatabasePath(name)))) {
+            throw new DatabaseNotExistException(name);
+        }
+        return Database.of(name);
     }
 
     @Override
     protected void dropDatabaseImpl(String name) {
-        uncheck(() -> fileIO.delete(databasePath(name), true));
+        uncheck(() -> fileIO.delete(newDatabasePath(name), true));
+    }
+
+    @Override
+    protected void alterDatabaseImpl(String name, List<PropertyChange> changes) {
+        throw new UnsupportedOperationException("Alter database is not supported.");
     }
 
     @Override
     protected List<String> listTablesImpl(String databaseName) {
-        List<String> tables = new ArrayList<>();
-        for (FileStatus status : uncheck(() -> fileIO.listStatus(databasePath(databaseName)))) {
-            if (status.isDir() && tableExists(status.getPath())) {
-                tables.add(status.getPath().getName());
-            }
-        }
-        return tables;
+        return uncheck(() -> listTablesInFileSystem(newDatabasePath(databaseName)));
     }
 
     @Override
-    public boolean tableExists(Identifier identifier) {
-        if (isSystemTable(identifier)) {
-            return super.tableExists(identifier);
-        }
-
-        return tableExists(getDataTableLocation(identifier));
-    }
-
-    private boolean tableExists(Path tablePath) {
-        return new SchemaManager(fileIO, tablePath).listAllIds().size() > 0;
-    }
-
-    @Override
-    public TableSchema getDataTableSchema(Identifier identifier) throws TableNotExistException {
-        Path path = getDataTableLocation(identifier);
-        return new SchemaManager(fileIO, path)
-                .latest()
+    public TableSchema loadTableSchema(Identifier identifier) throws TableNotExistException {
+        return tableSchemaInFileSystem(
+                        getTableLocation(identifier), identifier.getBranchNameOrDefault())
                 .orElseThrow(() -> new TableNotExistException(identifier));
     }
 
     @Override
     protected void dropTableImpl(Identifier identifier) {
-        Path path = getDataTableLocation(identifier);
+        Path path = getTableLocation(identifier);
         uncheck(() -> fileIO.delete(path, true));
     }
 
     @Override
     public void createTableImpl(Identifier identifier, Schema schema) {
-        Path path = getDataTableLocation(identifier);
-        uncheck(() -> new SchemaManager(fileIO, path).createTable(schema));
+        SchemaManager schemaManager = schemaManager(identifier);
+        try {
+            runWithLock(identifier, () -> uncheck(() -> schemaManager.createTable(schema)));
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public <T> T runWithLock(Identifier identifier, Callable<T> callable) throws Exception {
+        Optional<CatalogLockFactory> lockFactory = lockFactory();
+        try (Lock lock =
+                lockFactory
+                        .map(factory -> factory.createLock(lockContext().orElse(null)))
+                        .map(l -> Lock.fromCatalog(l, identifier))
+                        .orElseGet(Lock::empty)) {
+            return lock.runWithLock(callable);
+        }
+    }
+
+    private SchemaManager schemaManager(Identifier identifier) {
+        Path path = getTableLocation(identifier);
+        return new SchemaManager(fileIO, path, identifier.getBranchNameOrDefault());
     }
 
     @Override
     public void renameTableImpl(Identifier fromTable, Identifier toTable) {
-        Path fromPath = getDataTableLocation(fromTable);
-        Path toPath = getDataTableLocation(toTable);
+        Path fromPath = getTableLocation(fromTable);
+        Path toPath = getTableLocation(toTable);
         uncheck(() -> fileIO.rename(fromPath, toPath));
     }
 
     @Override
     protected void alterTableImpl(Identifier identifier, List<SchemaChange> changes)
             throws TableNotExistException, ColumnAlreadyExistException, ColumnNotExistException {
-        new SchemaManager(fileIO, getDataTableLocation(identifier)).commitChanges(changes);
-    }
-
-    private static <T> T uncheck(Callable<T> callable) {
+        SchemaManager schemaManager = schemaManager(identifier);
         try {
-            return callable.call();
+            runWithLock(identifier, () -> schemaManager.commitChanges(changes));
+        } catch (TableNotExistException
+                | ColumnAlreadyExistException
+                | ColumnNotExistException
+                | RuntimeException e) {
+            throw e;
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
 
-    private static boolean isDatabase(Path path) {
-        return path.getName().endsWith(DB_SUFFIX);
-    }
-
-    private static String database(Path path) {
-        String name = path.getName();
-        return name.substring(0, name.length() - DB_SUFFIX.length());
+    protected static <T> T uncheck(Callable<T> callable) {
+        try {
+            return callable.call();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
@@ -159,5 +181,15 @@ public class FileSystemCatalog extends AbstractCatalog {
     @Override
     public String warehouse() {
         return warehouse.toString();
+    }
+
+    @Override
+    public CatalogLoader catalogLoader() {
+        return new FileSystemCatalogLoader(fileIO, warehouse, catalogOptions);
+    }
+
+    @Override
+    public boolean caseSensitive() {
+        return catalogOptions.getOptional(CASE_SENSITIVE).orElse(true);
     }
 }

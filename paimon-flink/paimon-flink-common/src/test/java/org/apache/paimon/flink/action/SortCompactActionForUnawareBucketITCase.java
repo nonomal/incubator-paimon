@@ -26,16 +26,20 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.operation.AppendOnlyFileStoreScan;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.schema.Schema;
-import org.apache.paimon.table.AppendOnlyFileStoreTable;
+import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.types.DataTypes;
+
+import org.apache.paimon.shade.guava30.com.google.common.collect.Lists;
 
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -61,6 +65,17 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
         commit(commitMessages);
     }
 
+    private void prepareSameData(int size) throws Exception {
+        createTable();
+        BatchWriteBuilder builder = getTable().newBatchWriteBuilder();
+        try (BatchTableWrite batchTableWrite = builder.newWrite()) {
+            for (int i = 0; i < size; i++) {
+                batchTableWrite.write(data(0, 0, 0));
+            }
+            commit(batchTableWrite.prepareCommit());
+        }
+    }
+
     @Test
     public void testOrderBy() throws Exception {
         prepareData(300, 1);
@@ -80,8 +95,7 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
         Assertions.assertThatCode(() -> order(Arrays.asList("f1", "f2")))
                 .doesNotThrowAnyException();
 
-        List<ManifestEntry> files =
-                ((AppendOnlyFileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
 
         ManifestEntry entry = files.get(0);
         DataSplit dataSplit =
@@ -89,6 +103,7 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
                         .withPartition(entry.partition())
                         .withBucket(entry.bucket())
                         .withDataFiles(Collections.singletonList(entry.file()))
+                        .withBucketPath("not used")
                         .build();
 
         final AtomicInteger i = new AtomicInteger(Integer.MIN_VALUE);
@@ -106,7 +121,7 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
         Assertions.assertThatCode(() -> order(Arrays.asList("f2", "f1")))
                 .doesNotThrowAnyException();
 
-        files = ((AppendOnlyFileStoreTable) getTable()).store().newScan().plan().files();
+        files = getTable().store().newScan().plan().files();
 
         entry = files.get(0);
         dataSplit =
@@ -114,6 +129,7 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
                         .withPartition(entry.partition())
                         .withBucket(entry.bucket())
                         .withDataFiles(Collections.singletonList(entry.file()))
+                        .withBucketPath("not used")
                         .build();
 
         i.set(Integer.MIN_VALUE);
@@ -123,7 +139,7 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
                 .createReader(dataSplit)
                 .forEachRemaining(
                         a -> {
-                            Integer current = a.getInt(2);
+                            int current = a.getShort(2);
                             Assertions.assertThat(current).isGreaterThanOrEqualTo(i.get());
                             i.set(current);
                         });
@@ -144,17 +160,28 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
     }
 
     @Test
+    public void testAllBasicTypeWorksWithHilbert() throws Exception {
+        prepareData(300, 1);
+        // All the basic types should support hilbert
+        Assertions.assertThatCode(
+                        () ->
+                                hilbert(
+                                        Arrays.asList(
+                                                "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+                                                "f8", "f9", "f10", "f11", "f12", "f13", "f14",
+                                                "f15")))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     public void testZorderActionWorks() throws Exception {
         prepareData(300, 2);
         PredicateBuilder predicateBuilder = new PredicateBuilder(getTable().rowType());
         Predicate predicate = predicateBuilder.between(1, 100, 200);
 
-        List<ManifestEntry> files =
-                ((AppendOnlyFileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilter =
-                ((AppendOnlyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
                         .withFilter(predicate)
                         .plan()
                         .files();
@@ -163,11 +190,36 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
 
         zorder(Arrays.asList("f2", "f1"));
 
-        files = ((AppendOnlyFileStoreTable) getTable()).store().newScan().plan().files();
+        files = getTable().store().newScan().plan().files();
         filesFilter =
-                ((AppendOnlyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
+                        .withFilter(predicate)
+                        .plan()
+                        .files();
+        Assertions.assertThat(files.size()).isGreaterThan(filesFilter.size());
+    }
+
+    @Test
+    public void testHilbertActionWorks() throws Exception {
+        prepareData(300, 2);
+        PredicateBuilder predicateBuilder = new PredicateBuilder(getTable().rowType());
+        Predicate predicate = predicateBuilder.between(1, 100, 200);
+
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
+        List<ManifestEntry> filesFilter =
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
+                        .withFilter(predicate)
+                        .plan()
+                        .files();
+
+        // before hilbert, we don't filter any file
+        Assertions.assertThat(files.size()).isEqualTo(filesFilter.size());
+
+        hilbert(Arrays.asList("f2", "f1"));
+
+        files = getTable().store().newScan().plan().files();
+        filesFilter =
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
                         .withFilter(predicate)
                         .plan()
                         .files();
@@ -182,23 +234,17 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
         PredicateBuilder predicateBuilder = new PredicateBuilder(getTable().rowType());
         Predicate predicate = predicateBuilder.between(1, 10, 20);
 
-        List<ManifestEntry> filesZorder =
-                ((AppendOnlyFileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> filesZorder = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilterZorder =
-                ((AppendOnlyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
                         .withFilter(predicate)
                         .plan()
                         .files();
 
         order(Arrays.asList("f2", "f1"));
-        List<ManifestEntry> filesOrder =
-                ((AppendOnlyFileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> filesOrder = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilterOrder =
-                ((AppendOnlyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
                         .withFilter(predicate)
                         .plan()
                         .files();
@@ -208,14 +254,40 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
     }
 
     @Test
+    public void testCompareHilbertAndOrder() throws Exception {
+        prepareData(300, 10);
+
+        hilbert(Arrays.asList("f2", "f1"));
+        PredicateBuilder predicateBuilder = new PredicateBuilder(getTable().rowType());
+        Predicate predicate = predicateBuilder.between(1, 10, 20);
+
+        List<ManifestEntry> filesHilbert = getTable().store().newScan().plan().files();
+        List<ManifestEntry> filesFilterHilbert =
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
+                        .withFilter(predicate)
+                        .plan()
+                        .files();
+
+        order(Arrays.asList("f2", "f1"));
+        List<ManifestEntry> filesOrder = getTable().store().newScan().plan().files();
+        List<ManifestEntry> filesFilterOrder =
+                ((AppendOnlyFileStoreScan) getTable().store().newScan())
+                        .withFilter(predicate)
+                        .plan()
+                        .files();
+
+        Assertions.assertThat(filesFilterHilbert.size() / (double) filesHilbert.size())
+                .isLessThan(filesFilterOrder.size() / (double) filesOrder.size());
+    }
+
+    @Test
     public void testTableConf() throws Exception {
         createTable();
         SortCompactAction sortCompactAction =
                 new SortCompactAction(
-                                warehouse,
                                 database,
                                 tableName,
-                                Collections.emptyMap(),
+                                Collections.singletonMap("warehouse", warehouse),
                                 Collections.singletonMap(
                                         FlinkConnectorOptions.SINK_PARALLELISM.key(), "20"))
                         .withOrderStrategy("zorder")
@@ -229,45 +301,103 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
                 .isEqualTo("20");
     }
 
+    @Test
+    public void testRandomSuffixWorks() throws Exception {
+        prepareSameData(200);
+        Assertions.assertThatCode(() -> order(Collections.singletonList("f1")))
+                .doesNotThrowAnyException();
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
+        Assertions.assertThat(files.size()).isEqualTo(3);
+
+        dropTable();
+        prepareSameData(200);
+        Assertions.assertThatCode(() -> zorder(Arrays.asList("f1", "f2")))
+                .doesNotThrowAnyException();
+        files = getTable().store().newScan().plan().files();
+        Assertions.assertThat(files.size()).isEqualTo(3);
+    }
+
+    @Test
+    public void testSortCompactionOnEmptyData() throws Exception {
+        createTable();
+        SortCompactAction sortCompactAction =
+                new SortCompactAction(
+                                database,
+                                tableName,
+                                Collections.singletonMap("warehouse", warehouse),
+                                Collections.emptyMap())
+                        .withOrderStrategy("zorder")
+                        .withOrderColumns(Collections.singletonList("f0"));
+
+        sortCompactAction.run();
+    }
+
     private void zorder(List<String> columns) throws Exception {
-        if (RANDOM.nextBoolean()) {
-            new SortCompactAction(
-                            warehouse,
-                            database,
-                            tableName,
-                            Collections.emptyMap(),
-                            Collections.emptyMap())
-                    .withOrderStrategy("zorder")
-                    .withOrderColumns(columns)
-                    .run();
-        } else {
-            callProcedure("zorder", columns);
-        }
+        String rangeStrategy = RANDOM.nextBoolean() ? "size" : "quantity";
+        createAction("zorder", rangeStrategy, columns).run();
+    }
+
+    private void hilbert(List<String> columns) throws Exception {
+        String rangeStrategy = RANDOM.nextBoolean() ? "size" : "quantity";
+        createAction("hilbert", rangeStrategy, columns).run();
     }
 
     private void order(List<String> columns) throws Exception {
-        if (RANDOM.nextBoolean()) {
-            new SortCompactAction(
-                            warehouse,
-                            database,
-                            tableName,
-                            Collections.emptyMap(),
-                            Collections.emptyMap())
-                    .withOrderStrategy("order")
-                    .withOrderColumns(columns)
-                    .run();
-        } else {
-            callProcedure("order", columns);
-        }
+        String rangeStrategy = RANDOM.nextBoolean() ? "size" : "quantity";
+        createAction("order", rangeStrategy, columns).run();
     }
 
-    private void callProcedure(String orderStrategy, List<String> orderByColumns) {
-        callProcedure(
-                String.format(
-                        "CALL compact('%s.%s', 'ALL', '%s', '%s')",
-                        database, tableName, orderStrategy, String.join(",", orderByColumns)),
-                false,
-                true);
+    private SortCompactAction createAction(
+            String orderStrategy, String rangeStrategy, List<String> columns) {
+        return createAction(orderStrategy, rangeStrategy, columns, Lists.newArrayList());
+    }
+
+    private SortCompactAction createAction(
+            String orderStrategy,
+            String rangeStrategy,
+            List<String> columns,
+            List<String> extraConfigs) {
+        ArrayList<String> args =
+                Lists.newArrayList(
+                        "compact",
+                        "--warehouse",
+                        warehouse,
+                        "--database",
+                        database,
+                        "--table",
+                        tableName,
+                        "--order_strategy",
+                        orderStrategy,
+                        "--order_by",
+                        String.join(",", columns),
+                        "--table_conf",
+                        "sort-compaction.range-strategy=" + rangeStrategy);
+        args.addAll(extraConfigs);
+        return createAction(SortCompactAction.class, args.toArray(new String[0]));
+    }
+
+    @Test
+    public void testvalidSampleConfig() throws Exception {
+        prepareData(300, 1);
+        {
+            ArrayList<String> extraCompactionConfig =
+                    Lists.newArrayList(
+                            "--table_conf", "sort-compaction.local-sample.magnification=1");
+            Assertions.assertThatCode(
+                            () -> {
+                                createAction(
+                                                "order",
+                                                "size",
+                                                Arrays.asList(
+                                                        "f0", "f1", "f2", "f3", "f4", "f5", "f6",
+                                                        "f7", "f8", "f9", "f10", "f11", "f12",
+                                                        "f13", "f14", "f15"),
+                                                extraCompactionConfig)
+                                        .run();
+                            })
+                    .hasMessage(
+                            "the config 'sort-compaction.local-sample.magnification=1' should not be set too small,greater than or equal to 20 is needed.");
+        }
     }
 
     private void createTable() throws Exception {
@@ -275,12 +405,18 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
         catalog.createTable(identifier(), schema(), true);
     }
 
+    private void dropTable() throws Exception {
+        catalog.dropTable(identifier(), true);
+    }
+
     private Identifier identifier() {
         return Identifier.create(database, tableName);
     }
 
     private void commit(List<CommitMessage> messages) throws Exception {
-        getTable().newBatchWriteBuilder().newCommit().commit(messages);
+        BatchTableCommit commit = getTable().newBatchWriteBuilder().newCommit();
+        commit.commit(messages);
+        commit.close();
     }
 
     // schema with all the basic types.
@@ -319,8 +455,8 @@ public class SortCompactActionForUnawareBucketITCase extends ActionITCaseBase {
         return messages;
     }
 
-    private Table getTable() throws Exception {
-        return catalog.getTable(identifier());
+    private FileStoreTable getTable() throws Exception {
+        return (FileStoreTable) catalog.getTable(identifier());
     }
 
     private static List<CommitMessage> writeOnce(Table table, int p, int size) throws Exception {

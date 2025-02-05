@@ -22,41 +22,33 @@ import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.action.Action;
-import org.apache.paimon.flink.action.ActionBase;
-import org.apache.paimon.flink.action.MultiTablesSinkMode;
 import org.apache.paimon.flink.action.cdc.CdcActionCommonUtils;
-import org.apache.paimon.flink.action.cdc.CdcMetadataConverter;
+import org.apache.paimon.flink.action.cdc.CdcSourceRecord;
+import org.apache.paimon.flink.action.cdc.SyncDatabaseActionBase;
+import org.apache.paimon.flink.action.cdc.SyncJobHandler;
 import org.apache.paimon.flink.action.cdc.TableNameConverter;
-import org.apache.paimon.flink.action.cdc.TypeMapping;
-import org.apache.paimon.flink.action.cdc.mysql.schema.MySqlSchemasInfo;
-import org.apache.paimon.flink.action.cdc.mysql.schema.MySqlTableInfo;
-import org.apache.paimon.flink.sink.cdc.EventParser;
-import org.apache.paimon.flink.sink.cdc.FlinkCdcSyncDatabaseSinkBuilder;
+import org.apache.paimon.flink.action.cdc.schema.JdbcSchemasInfo;
+import org.apache.paimon.flink.action.cdc.schema.JdbcTableInfo;
+import org.apache.paimon.flink.action.cdc.watermark.CdcTimestampExtractor;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.Preconditions;
 
-import com.ververica.cdc.connectors.mysql.source.MySqlSource;
-import com.ververica.cdc.connectors.mysql.source.config.MySqlSourceOptions;
-import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.cdc.connectors.mysql.source.MySqlSource;
+import org.apache.flink.cdc.connectors.mysql.source.config.MySqlSourceOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static org.apache.paimon.flink.action.MultiTablesSinkMode.DIVIDED;
 import static org.apache.paimon.flink.action.cdc.CdcActionCommonUtils.schemaCompatible;
@@ -67,7 +59,7 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
  * An {@link Action} which synchronize the whole MySQL database into one Paimon database.
  *
  * <p>You should specify MySQL source database in {@code mySqlConfig}. See <a
- * href="https://ververica.github.io/flink-cdc-connectors/master/content/connectors/mysql-cdc.html#connector-options">document
+ * href="https://nightlies.apache.org/flink/flink-cdc-docs-release-3.1/docs/connectors/flink-sources/mysql-cdc/#connector-options">document
  * of flink-cdc-connectors</a> for detailed keys and values.
  *
  * <p>For each MySQL table to be synchronized, if the corresponding Paimon table does not exist,
@@ -99,41 +91,20 @@ import static org.apache.paimon.utils.Preconditions.checkArgument;
  * not very efficient in resource saving. We may optimize this action by merging all sinks into one
  * instance in the future.
  */
-public class MySqlSyncDatabaseAction extends ActionBase {
+public class MySqlSyncDatabaseAction extends SyncDatabaseActionBase {
 
     private static final Logger LOG = LoggerFactory.getLogger(MySqlSyncDatabaseAction.class);
 
-    private final String database;
-    private final Configuration mySqlConfig;
-
-    private Map<String, String> tableConfig = new HashMap<>();
     private boolean ignoreIncompatible = false;
-    private boolean mergeShards = true;
-    private String tablePrefix = "";
-    private String tableSuffix = "";
-    private String includingTables = ".*";
-    @Nullable String excludingTables;
-    private MultiTablesSinkMode mode = DIVIDED;
-    private TypeMapping typeMapping = TypeMapping.defaultMapping();
 
     // for test purpose
     private final List<Identifier> monitoredTables = new ArrayList<>();
     private final List<Identifier> excludedTables = new ArrayList<>();
-    private List<String> metadataColumn = new ArrayList<>();
 
     public MySqlSyncDatabaseAction(
-            String warehouse,
-            String database,
-            Map<String, String> catalogConfig,
-            Map<String, String> mySqlConfig) {
-        super(warehouse, catalogConfig);
-        this.database = database;
-        this.mySqlConfig = Configuration.fromMap(mySqlConfig);
-    }
-
-    public MySqlSyncDatabaseAction withTableConfig(Map<String, String> tableConfig) {
-        this.tableConfig = tableConfig;
-        return this;
+            String database, Map<String, String> catalogConfig, Map<String, String> mySqlConfig) {
+        super(database, catalogConfig, mySqlConfig, SyncJobHandler.SourceType.MYSQL);
+        this.mode = DIVIDED;
     }
 
     public MySqlSyncDatabaseAction ignoreIncompatible(boolean ignoreIncompatible) {
@@ -141,123 +112,56 @@ public class MySqlSyncDatabaseAction extends ActionBase {
         return this;
     }
 
-    public MySqlSyncDatabaseAction mergeShards(boolean mergeShards) {
-        this.mergeShards = mergeShards;
-        return this;
-    }
-
-    public MySqlSyncDatabaseAction withTablePrefix(@Nullable String tablePrefix) {
-        if (tablePrefix != null) {
-            this.tablePrefix = tablePrefix;
-        }
-        return this;
-    }
-
-    public MySqlSyncDatabaseAction withTableSuffix(@Nullable String tableSuffix) {
-        if (tableSuffix != null) {
-            this.tableSuffix = tableSuffix;
-        }
-        return this;
-    }
-
-    public MySqlSyncDatabaseAction includingTables(@Nullable String includingTables) {
-        if (includingTables != null) {
-            this.includingTables = includingTables;
-        }
-        return this;
-    }
-
-    public MySqlSyncDatabaseAction excludingTables(@Nullable String excludingTables) {
-        this.excludingTables = excludingTables;
-        return this;
-    }
-
-    public MySqlSyncDatabaseAction withMode(MultiTablesSinkMode mode) {
-        this.mode = mode;
-        return this;
-    }
-
-    public MySqlSyncDatabaseAction withTypeMapping(TypeMapping typeMapping) {
-        this.typeMapping = typeMapping;
-        return this;
-    }
-
-    public MySqlSyncDatabaseAction withMetadataKeys(List<String> metadataKeys) {
-        this.metadataColumn = metadataKeys;
-        return this;
-    }
-
     @Override
-    public void build(StreamExecutionEnvironment env) throws Exception {
-        checkArgument(
-                !mySqlConfig.contains(MySqlSourceOptions.TABLE_NAME),
-                MySqlSourceOptions.TABLE_NAME.key()
-                        + " cannot be set for mysql-sync-database. "
-                        + "If you want to sync several MySQL tables into one Paimon table, "
-                        + "use mysql-sync-table instead.");
-        boolean caseSensitive = catalog.caseSensitive();
-
-        if (!caseSensitive) {
-            validateCaseInsensitive();
-        }
-
+    protected void beforeBuildingSourceSink() throws Exception {
         Pattern includingPattern = Pattern.compile(includingTables);
         Pattern excludingPattern =
                 excludingTables == null ? null : Pattern.compile(excludingTables);
-        MySqlSchemasInfo mySqlSchemasInfo =
+        JdbcSchemasInfo mySqlSchemasInfo =
                 MySqlActionUtils.getMySqlTableInfos(
-                        mySqlConfig,
+                        cdcSourceConfig,
                         tableName ->
                                 shouldMonitorTable(tableName, includingPattern, excludingPattern),
                         excludedTables,
-                        typeMapping,
-                        caseSensitive);
+                        typeMapping);
 
         logNonPkTables(mySqlSchemasInfo.nonPkTables());
-        List<MySqlTableInfo> mySqlTableInfos = mySqlSchemasInfo.toMySqlTableInfos(mergeShards);
+        List<JdbcTableInfo> jdbcTableInfos = mySqlSchemasInfo.toMySqlTableInfos(mergeShards);
 
         checkArgument(
-                mySqlTableInfos.size() > 0,
+                !jdbcTableInfos.isEmpty(),
                 "No tables found in MySQL database "
-                        + mySqlConfig.get(MySqlSourceOptions.DATABASE_NAME)
+                        + cdcSourceConfig.get(MySqlSourceOptions.DATABASE_NAME)
                         + ", or MySQL database does not exist.");
 
-        catalog.createDatabase(database, true);
         TableNameConverter tableNameConverter =
-                new TableNameConverter(caseSensitive, mergeShards, tablePrefix, tableSuffix);
-
-        CdcMetadataConverter[] metadataConverters =
-                metadataColumn.stream()
-                        .map(
-                                key ->
-                                        Stream.of(MySqlMetadataProcessor.values())
-                                                .filter(m -> m.getKey().equals(key))
-                                                .findFirst()
-                                                .orElseThrow(IllegalStateException::new))
-                        .map(MySqlMetadataProcessor::getConverter)
-                        .toArray(CdcMetadataConverter[]::new);
-
-        List<FileStoreTable> fileStoreTables = new ArrayList<>();
-        for (MySqlTableInfo tableInfo : mySqlTableInfos) {
+                new TableNameConverter(
+                        caseSensitive, mergeShards, tablePrefix, tableSuffix, tableMapping);
+        for (JdbcTableInfo tableInfo : jdbcTableInfos) {
             Identifier identifier =
                     Identifier.create(
-                            database, tableNameConverter.convert(tableInfo.toPaimonTableName()));
+                            database,
+                            tableNameConverter.convert("", tableInfo.toPaimonTableName()));
             FileStoreTable table;
             Schema fromMySql =
                     CdcActionCommonUtils.buildPaimonSchema(
-                            Collections.emptyList(),
-                            Collections.emptyList(),
+                            identifier.getFullName(),
+                            partitionKeys,
+                            primaryKeys,
                             Collections.emptyList(),
                             tableConfig,
                             tableInfo.schema(),
-                            metadataConverters);
+                            metadataConverters,
+                            caseSensitive,
+                            false,
+                            true);
             try {
                 table = (FileStoreTable) catalog.getTable(identifier);
-                table = table.copy(tableConfig);
                 Supplier<String> errMsg =
                         incompatibleMessage(table.schema(), tableInfo, identifier);
                 if (shouldMonitorTable(table.schema(), fromMySql, errMsg)) {
-                    fileStoreTables.add(table);
+                    table = alterTableOptions(identifier, table);
+                    tables.add(table);
                     monitoredTables.addAll(tableInfo.identifiers());
                 } else {
                     excludedTables.addAll(tableInfo.identifiers());
@@ -265,7 +169,7 @@ public class MySqlSyncDatabaseAction extends ActionBase {
             } catch (Catalog.TableNotExistException e) {
                 catalog.createTable(identifier, fromMySql, false);
                 table = (FileStoreTable) catalog.getTable(identifier);
-                fileStoreTables.add(table);
+                tables.add(table);
                 monitoredTables.addAll(tableInfo.identifiers());
             }
         }
@@ -274,64 +178,25 @@ public class MySqlSyncDatabaseAction extends ActionBase {
                 !monitoredTables.isEmpty(),
                 "No tables to be synchronized. Possible cause is the schemas of all tables in specified "
                         + "MySQL database are not compatible with those of existed Paimon tables. Please check the log.");
-
-        MySqlSource<String> source =
-                MySqlActionUtils.buildMySqlSource(
-                        mySqlConfig,
-                        tableList(
-                                mode,
-                                mySqlConfig.get(MySqlSourceOptions.DATABASE_NAME),
-                                includingTables,
-                                monitoredTables,
-                                excludedTables));
-
-        String serverTimeZone = mySqlConfig.get(MySqlSourceOptions.SERVER_TIME_ZONE);
-        ZoneId zoneId = serverTimeZone == null ? ZoneId.systemDefault() : ZoneId.of(serverTimeZone);
-        TypeMapping typeMapping = this.typeMapping;
-        MySqlTableSchemaBuilder schemaBuilder =
-                new MySqlTableSchemaBuilder(tableConfig, caseSensitive, typeMapping);
-
-        EventParser.Factory<String> parserFactory =
-                () ->
-                        new MySqlDebeziumJsonEventParser(
-                                zoneId,
-                                caseSensitive,
-                                tableNameConverter,
-                                schemaBuilder,
-                                includingPattern,
-                                excludingPattern,
-                                typeMapping,
-                                metadataConverters);
-
-        String database = this.database;
-        MultiTablesSinkMode mode = this.mode;
-        new FlinkCdcSyncDatabaseSinkBuilder<String>()
-                .withInput(env.fromSource(source, WatermarkStrategy.noWatermarks(), "MySQL Source"))
-                .withParserFactory(parserFactory)
-                .withDatabase(database)
-                .withCatalogLoader(catalogLoader())
-                .withTables(fileStoreTables)
-                .withMode(mode)
-                .withTableOptions(tableConfig)
-                .build();
     }
 
-    private void validateCaseInsensitive() {
-        checkArgument(
-                database.equals(database.toLowerCase()),
-                String.format(
-                        "Database name [%s] cannot contain upper case in case-insensitive catalog.",
-                        database));
-        checkArgument(
-                tablePrefix.equals(tablePrefix.toLowerCase()),
-                String.format(
-                        "Table prefix [%s] cannot contain upper case in case-insensitive catalog.",
-                        tablePrefix));
-        checkArgument(
-                tableSuffix.equals(tableSuffix.toLowerCase()),
-                String.format(
-                        "Table suffix [%s] cannot contain upper case in case-insensitive catalog.",
-                        tableSuffix));
+    @Override
+    protected CdcTimestampExtractor createCdcTimestampExtractor() {
+        return MySqlActionUtils.createCdcTimestampExtractor();
+    }
+
+    @Override
+    protected MySqlSource<CdcSourceRecord> buildSource() {
+        validateRuntimeExecutionMode();
+        return MySqlActionUtils.buildMySqlSource(
+                cdcSourceConfig,
+                tableList(
+                        mode,
+                        cdcSourceConfig.get(MySqlSourceOptions.DATABASE_NAME),
+                        includingTables,
+                        monitoredTables,
+                        excludedTables),
+                typeMapping);
     }
 
     private void logNonPkTables(List<Identifier> nonPkTables) {
@@ -373,7 +238,7 @@ public class MySqlSyncDatabaseAction extends ActionBase {
     }
 
     private Supplier<String> incompatibleMessage(
-            TableSchema paimonSchema, MySqlTableInfo mySqlTableInfo, Identifier identifier) {
+            TableSchema paimonSchema, JdbcTableInfo jdbcTableInfo, Identifier identifier) {
         return () ->
                 String.format(
                         "Incompatible schema found.\n"
@@ -381,8 +246,8 @@ public class MySqlSyncDatabaseAction extends ActionBase {
                                 + "MySQL table is: %s, fields are: %s.\n",
                         identifier.getFullName(),
                         paimonSchema.fields(),
-                        mySqlTableInfo.location(),
-                        mySqlTableInfo.schema().fields());
+                        jdbcTableInfo.location(),
+                        jdbcTableInfo.schema().fields());
     }
 
     @VisibleForTesting
@@ -395,19 +260,8 @@ public class MySqlSyncDatabaseAction extends ActionBase {
         return excludedTables;
     }
 
-    @VisibleForTesting
-    public Map<String, String> tableConfig() {
-        return tableConfig;
-    }
-
-    // ------------------------------------------------------------------------
-    //  Flink run methods
-    // ------------------------------------------------------------------------
-
     @Override
-    public void run() throws Exception {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        build(env);
-        execute(env, String.format("MySQL-Paimon Database Sync: %s", database));
+    protected boolean requirePrimaryKeys() {
+        return true;
     }
 }

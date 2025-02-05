@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -77,7 +77,7 @@ public class HiveLocationTest {
 
     private IMetaStoreClient hmsClient;
 
-    private String objectStorepath;
+    private String objectStorePath;
 
     private FileIO fileIO;
 
@@ -85,31 +85,32 @@ public class HiveLocationTest {
 
     @Before
     public void before() throws IOException {
-        objectStorepath = minioTestContainer.getS3UriForDefaultBucket() + "/" + UUID.randomUUID();
+        objectStorePath = minioTestContainer.getS3UriForDefaultBucket() + "/" + UUID.randomUUID();
 
-        Options conf = new Options();
-        conf.set(CatalogOptions.WAREHOUSE, objectStorepath);
-        conf.set(CatalogOptions.METASTORE, "hive");
-        conf.set(CatalogOptions.URI, "");
-        conf.set(
+        Options options = new Options();
+        options.set(CatalogOptions.WAREHOUSE, objectStorePath);
+        options.set(CatalogOptions.METASTORE, "hive");
+        options.set(CatalogOptions.URI, "");
+        options.set(CatalogOptions.LOCK_ENABLED, false);
+        options.set(
                 HiveCatalogOptions.HIVE_CONF_DIR,
                 hiveShell.getBaseDir().getRoot().getPath() + HIVE_CONF);
-        conf.set(HiveCatalogOptions.LOCATION_IN_PROPERTIES, true);
+        options.set(HiveCatalogOptions.LOCATION_IN_PROPERTIES, true);
 
         for (Map.Entry<String, String> stringStringEntry :
                 minioTestContainer.getS3ConfigOptions().entrySet()) {
-            conf.set(stringStringEntry.getKey(), stringStringEntry.getValue());
+            options.set(stringStringEntry.getKey(), stringStringEntry.getValue());
         }
 
         // create CatalogContext using the options
-        catalogContext = CatalogContext.create(conf);
+        catalogContext = CatalogContext.create(options);
 
-        Path warehouse = new Path(objectStorepath);
+        Path warehouse = new Path(objectStorePath);
         fileIO = getFileIO(catalogContext, warehouse);
         fileIO.mkdirs(warehouse);
 
         HiveCatalogFactory hiveCatalogFactory = new HiveCatalogFactory();
-        catalog = (HiveCatalog) hiveCatalogFactory.create(fileIO, warehouse, catalogContext);
+        catalog = (HiveCatalog) hiveCatalogFactory.create(catalogContext);
 
         hmsClient = catalog.getHmsClient();
 
@@ -147,8 +148,8 @@ public class HiveLocationTest {
             catalog.createDatabase(db, true);
             assertThat(hmsClient.getDatabase(db)).isNotNull();
 
-            Path actual = catalog.databasePath(db);
-            Path expected = new Path(this.objectStorepath + "/" + db + ".db");
+            Path actual = catalog.newDatabasePath(db);
+            Path expected = new Path(this.objectStorePath + "/" + db + ".db");
             assertThat(fileIO.exists(expected)).isTrue();
             assertThat(actual).isEqualTo(expected);
 
@@ -196,7 +197,7 @@ public class HiveLocationTest {
                         tableIdentifier.getDatabaseName(), tableIdentifier.getObjectName());
         String location =
                 hmsClientTablea.getParameters().get(LocationKeyExtractor.TBPROPERTIES_LOCATION_KEY);
-        String expected = this.objectStorepath + "/" + db + ".db" + "/" + table;
+        String expected = this.objectStorePath + "/" + db + ".db" + "/" + table;
         assertThat(fileIO.exists(new Path(expected))).isTrue();
         assertThat(location).isEqualTo(expected);
     }
@@ -246,7 +247,7 @@ public class HiveLocationTest {
 
         String[][] params =
                 new String[][] {
-                    {"table1", objectStorepath},
+                    {"table1", objectStorePath},
                     {"table2", hiveShell.getBaseDir().getRoot().getAbsolutePath()},
                 };
         for (String[] param : params) {
@@ -256,7 +257,7 @@ public class HiveLocationTest {
 
             Identifier identifier = Identifier.create(dbName, tableName);
             String location =
-                    AbstractCatalog.dataTableLocation(warehouse, identifier).toUri().toString();
+                    AbstractCatalog.newTableLocation(warehouse, identifier).toUri().toString();
 
             String createTableSqlStr =
                     getCreateTableSqlStr(tableName, location, locationInProperties);

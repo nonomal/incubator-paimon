@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -28,7 +28,6 @@ import org.apache.paimon.table.sink.CommitMessage;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
 
-import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.JobContext;
 import org.apache.hadoop.mapred.OutputCommitter;
@@ -72,8 +71,9 @@ public class PaimonOutputCommitter extends OutputCommitter {
     }
 
     @Override
-    public void commitTask(TaskAttemptContext taskAttemptContext) throws IOException {
-
+    public void commitTask(TaskAttemptContext originalContext) throws IOException {
+        TaskAttemptContext taskAttemptContext =
+                TezUtil.enrichContextWithAttemptWrapper(originalContext);
         TaskAttemptID attemptID = taskAttemptContext.getTaskAttemptID();
         JobConf jobConf = taskAttemptContext.getJobConf();
         FileStoreTable table = createFileStoreTable(jobConf);
@@ -96,7 +96,7 @@ public class PaimonOutputCommitter extends OutputCommitter {
                 createPreCommitFile(
                         commitTables,
                         generatePreCommitFileLocation(
-                                table.location().getPath(),
+                                table.location(),
                                 attemptID.getJobID(),
                                 attemptID.getTaskID().getId()),
                         table.fileIO());
@@ -118,7 +118,9 @@ public class PaimonOutputCommitter extends OutputCommitter {
     }
 
     @Override
-    public void abortTask(TaskAttemptContext taskAttemptContext) throws IOException {
+    public void abortTask(TaskAttemptContext originalContext) throws IOException {
+        TaskAttemptContext taskAttemptContext =
+                TezUtil.enrichContextWithAttemptWrapper(originalContext);
         Map<String, PaimonRecordWriter> writers =
                 PaimonRecordWriter.removeWriters(taskAttemptContext.getTaskAttemptID());
 
@@ -131,7 +133,8 @@ public class PaimonOutputCommitter extends OutputCommitter {
     }
 
     @Override
-    public void commitJob(JobContext jobContext) throws IOException {
+    public void commitJob(JobContext originalContext) throws IOException {
+        JobContext jobContext = TezUtil.enrichContextWithVertexId(originalContext);
         JobConf jobConf = jobContext.getJobConf();
 
         long startTime = System.currentTimeMillis();
@@ -141,7 +144,7 @@ public class PaimonOutputCommitter extends OutputCommitter {
         if (table != null) {
             BatchWriteBuilder batchWriteBuilder = table.newBatchWriteBuilder();
             List<CommitMessage> commitMessagesList =
-                    getAllPreCommitMessage(table.location().getPath(), jobContext, table.fileIO());
+                    getAllPreCommitMessage(table.location(), jobContext, table.fileIO());
             try (BatchTableCommit batchTableCommit = batchWriteBuilder.newCommit()) {
                 batchTableCommit.commit(commitMessagesList);
             } catch (Exception e) {
@@ -149,7 +152,8 @@ public class PaimonOutputCommitter extends OutputCommitter {
             }
             deleteTemporaryFile(
                     jobContext,
-                    generateJobLocation(table.location().getPath(), jobContext.getJobID()));
+                    generateJobLocation(table.location(), jobContext.getJobID()),
+                    table.fileIO());
         } else {
             LOG.info("CommitJob not found table, Skipping job commit.");
         }
@@ -161,13 +165,14 @@ public class PaimonOutputCommitter extends OutputCommitter {
     }
 
     @Override
-    public void abortJob(JobContext jobContext, int status) throws IOException {
+    public void abortJob(JobContext originalContext, int status) throws IOException {
+        JobContext jobContext = TezUtil.enrichContextWithVertexId(originalContext);
         FileStoreTable table = createFileStoreTable(jobContext.getJobConf());
         if (table != null) {
 
             LOG.info("AbortJob {} has started", jobContext.getJobID());
             List<CommitMessage> commitMessagesList =
-                    getAllPreCommitMessage(table.location().getPath(), jobContext, table.fileIO());
+                    getAllPreCommitMessage(table.location(), jobContext, table.fileIO());
             BatchWriteBuilder batchWriteBuilder = table.newBatchWriteBuilder();
             try (BatchTableCommit batchTableCommit = batchWriteBuilder.newCommit()) {
                 batchTableCommit.abort(commitMessagesList);
@@ -176,7 +181,8 @@ public class PaimonOutputCommitter extends OutputCommitter {
             }
             deleteTemporaryFile(
                     jobContext,
-                    generateJobLocation(table.location().getPath(), jobContext.getJobID()));
+                    generateJobLocation(table.location(), jobContext.getJobID()),
+                    table.fileIO());
             LOG.info("Job {} is aborted. preCommit file has deleted", jobContext.getJobID());
         }
     }
@@ -186,18 +192,13 @@ public class PaimonOutputCommitter extends OutputCommitter {
      *
      * @param jobContext The job context
      * @param location The locations to clean up
-     * @throws IOException if there is a failure deleting the files
      */
-    private void deleteTemporaryFile(JobContext jobContext, String location) throws IOException {
-        JobConf jobConf = jobContext.getJobConf();
-
+    private void deleteTemporaryFile(JobContext jobContext, Path location, FileIO fileIO) {
         LOG.info("Deleting temporary file for job {} started", jobContext.getJobID());
 
         LOG.info("The deleted file is located in : {}", location);
         try {
-            org.apache.hadoop.fs.Path deleteFilePath = new org.apache.hadoop.fs.Path(location);
-            FileSystem fs = deleteFilePath.getFileSystem(jobConf);
-            fs.delete(deleteFilePath, true);
+            fileIO.delete(location, true);
         } catch (IOException e) {
             LOG.debug("Failed to delete directory {} ", location, e);
         }
@@ -213,7 +214,7 @@ public class PaimonOutputCommitter extends OutputCommitter {
      * @return The list of the committed data files
      */
     private static List<CommitMessage> getAllPreCommitMessage(
-            String location, JobContext jobContext, FileIO io) {
+            Path location, JobContext jobContext, FileIO io) {
         JobConf conf = jobContext.getJobConf();
 
         int totalCommitMessagesSize =
@@ -222,7 +223,7 @@ public class PaimonOutputCommitter extends OutputCommitter {
         List<CommitMessage> commitMessagesList = Collections.synchronizedList(new ArrayList<>());
 
         for (int i = 0; i < totalCommitMessagesSize; i++) {
-            String commitFileLocation =
+            Path commitFileLocation =
                     generatePreCommitFileLocation(location, jobContext.getJobID(), i);
             commitMessagesList.addAll(readPreCommitFile(commitFileLocation, io));
         }
@@ -237,8 +238,8 @@ public class PaimonOutputCommitter extends OutputCommitter {
      * @param jobId The JobID for the task
      * @return The file to store the results
      */
-    static String generateJobLocation(String location, JobID jobId) {
-        return location + "/temp/" + jobId;
+    static Path generateJobLocation(Path location, JobID jobId) {
+        return new Path(new Path(location, "temp"), jobId.toString());
     }
 
     /**
@@ -252,8 +253,8 @@ public class PaimonOutputCommitter extends OutputCommitter {
      * @param taskId taskId
      * @return The location of preCommit file path
      */
-    private static String generatePreCommitFileLocation(String location, JobID jobId, int taskId) {
-        return generateJobLocation(location, jobId) + "/task_" + taskId + PRE_COMMIT;
+    private static Path generatePreCommitFileLocation(Path location, JobID jobId, int taskId) {
+        return new Path(generateJobLocation(location, jobId), "task_" + taskId + PRE_COMMIT);
     }
 
     /**
@@ -262,16 +263,16 @@ public class PaimonOutputCommitter extends OutputCommitter {
      * file's location @Param io The FileIO of the table.
      */
     private static void createPreCommitFile(
-            List<CommitMessage> commitTables, String location, FileIO io) throws IOException {
+            List<CommitMessage> commitTables, Path location, FileIO io) throws IOException {
         try (ObjectOutputStream objectOutputStream =
-                new ObjectOutputStream(io.newOutputStream(new Path(location), true))) {
+                new ObjectOutputStream(io.newOutputStream(location, true))) {
             objectOutputStream.writeObject(commitTables);
         }
     }
 
-    private static List<CommitMessage> readPreCommitFile(String location, FileIO io) {
+    private static List<CommitMessage> readPreCommitFile(Path location, FileIO io) {
         try (ObjectInputStream objectInputStream =
-                new ObjectInputStream(io.newInputStream(new Path(location)))) {
+                new ObjectInputStream(io.newInputStream(location))) {
             return (List<CommitMessage>) objectInputStream.readObject();
         } catch (ClassNotFoundException | IOException e) {
             throw new RuntimeException(

@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -43,6 +43,13 @@ public class HeapDoubleVector extends AbstractHeapVector implements WritableDoub
     public HeapDoubleVector(int len) {
         super(len);
         vector = new double[len];
+    }
+
+    @Override
+    void reserveForHeapVector(int newCapacity) {
+        if (vector.length < newCapacity) {
+            vector = Arrays.copyOf(vector, newCapacity);
+        }
     }
 
     @Override
@@ -86,5 +93,15 @@ public class HeapDoubleVector extends AbstractHeapVector implements WritableDoub
     @Override
     public void fill(double value) {
         Arrays.fill(vector, value);
+    }
+
+    @Override
+    public void reset() {
+        super.reset();
+        if (vector.length != capacity) {
+            vector = new double[capacity];
+        } else {
+            Arrays.fill(vector, 0);
+        }
     }
 }

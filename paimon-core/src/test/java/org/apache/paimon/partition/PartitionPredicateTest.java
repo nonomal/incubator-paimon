@@ -18,9 +18,11 @@
 
 package org.apache.paimon.partition;
 
+import org.apache.paimon.data.BinaryArray;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryRowWriter;
-import org.apache.paimon.format.FieldStats;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.format.SimpleColStats;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.types.DataTypes;
@@ -43,9 +45,7 @@ public class PartitionPredicateTest {
     public void testNoPartition() {
         PartitionPredicate predicate =
                 PartitionPredicate.fromMultiple(RowType.of(), Collections.singletonList(EMPTY_ROW));
-
-        assertThat(predicate.test(EMPTY_ROW)).isTrue();
-        assertThat(predicate.test(1, new FieldStats[] {})).isTrue();
+        assertThat(predicate).isNull();
     }
 
     @Test
@@ -62,73 +62,104 @@ public class PartitionPredicateTest {
                 PartitionPredicate.fromMultiple(
                         type, Arrays.asList(createPart(3, 5), createPart(4, 6)));
 
-        assertThat(vailidate(p1, p2, createPart(3, 4))).isFalse();
-        assertThat(vailidate(p1, p2, createPart(3, 5))).isTrue();
-        assertThat(vailidate(p1, p2, createPart(4, 6))).isTrue();
-        assertThat(vailidate(p1, p2, createPart(4, 5))).isFalse();
+        assertThat(validate(p1, p2, createPart(3, 4))).isFalse();
+        assertThat(validate(p1, p2, createPart(3, 5))).isTrue();
+        assertThat(validate(p1, p2, createPart(4, 6))).isTrue();
+        assertThat(validate(p1, p2, createPart(4, 5))).isFalse();
 
         assertThat(
-                        vailidate(
+                        validate(
                                 p1,
-                                new FieldStats[] {
-                                    new FieldStats(4, 8, 0L), new FieldStats(10, 12, 0L)
+                                new SimpleColStats[] {
+                                    new SimpleColStats(4, 8, 0L), new SimpleColStats(10, 12, 0L)
                                 }))
                 .isFalse();
         assertThat(
-                        vailidate(
+                        validate(
                                 p2,
-                                new FieldStats[] {
-                                    new FieldStats(4, 8, 0L), new FieldStats(10, 12, 0L)
+                                new SimpleColStats[] {
+                                    new SimpleColStats(4, 8, 0L), new SimpleColStats(10, 12, 0L)
                                 }))
-                .isTrue();
+                .isFalse();
         assertThat(
-                        vailidate(
+                        validate(
                                 p2,
-                                new FieldStats[] {
-                                    new FieldStats(6, 8, 0L), new FieldStats(10, 12, 0L)
+                                new SimpleColStats[] {
+                                    new SimpleColStats(6, 8, 0L), new SimpleColStats(10, 12, 0L)
                                 }))
                 .isFalse();
 
         assertThat(
-                        vailidate(
+                        validate(
                                 p1,
-                                new FieldStats[] {
-                                    new FieldStats(4, 8, 0L), new FieldStats(5, 12, 0L)
+                                new SimpleColStats[] {
+                                    new SimpleColStats(4, 8, 0L), new SimpleColStats(5, 12, 0L)
                                 }))
                 .isTrue();
         assertThat(
-                        vailidate(
+                        validate(
                                 p2,
-                                new FieldStats[] {
-                                    new FieldStats(4, 8, 0L), new FieldStats(5, 12, 0L)
+                                new SimpleColStats[] {
+                                    new SimpleColStats(4, 8, 0L), new SimpleColStats(5, 12, 0L)
                                 }))
                 .isTrue();
 
         assertThat(
-                        vailidate(
+                        validate(
                                 p1,
-                                new FieldStats[] {
-                                    new FieldStats(1, 2, 0L), new FieldStats(2, 3, 0L)
+                                new SimpleColStats[] {
+                                    new SimpleColStats(1, 2, 0L), new SimpleColStats(2, 3, 0L)
                                 }))
                 .isFalse();
         assertThat(
-                        vailidate(
+                        validate(
                                 p2,
-                                new FieldStats[] {
-                                    new FieldStats(1, 2, 0L), new FieldStats(2, 3, 0L)
+                                new SimpleColStats[] {
+                                    new SimpleColStats(1, 2, 0L), new SimpleColStats(2, 3, 0L)
                                 }))
                 .isFalse();
     }
 
-    private boolean vailidate(
+    @Test
+    public void testPartitionWithMultiFields() {
+        RowType type = DataTypes.ROW(DataTypes.INT(), DataTypes.INT());
+        PartitionPredicate predicate =
+                PartitionPredicate.fromMultiple(type, Collections.singletonList(createPart(3, 4)));
+
+        assertThat(
+                        validate(
+                                predicate,
+                                new SimpleColStats[] {
+                                    new SimpleColStats(2, 2, 0L), new SimpleColStats(4, 4, 0L)
+                                }))
+                .isFalse();
+        assertThat(
+                        validate(
+                                predicate,
+                                new SimpleColStats[] {
+                                    new SimpleColStats(2, 4, 0L), new SimpleColStats(4, 4, 0L)
+                                }))
+                .isTrue();
+    }
+
+    private boolean validate(
             PartitionPredicate predicate1, PartitionPredicate predicate2, BinaryRow part) {
         boolean ret = predicate1.test(part);
         assertThat(predicate2.test(part)).isEqualTo(ret);
         return ret;
     }
 
-    private boolean vailidate(PartitionPredicate predicate, FieldStats[] fieldStats) {
-        return predicate.test(3, fieldStats);
+    private boolean validate(PartitionPredicate predicate, SimpleColStats[] fieldStats) {
+        Object[] min = new Object[fieldStats.length];
+        Object[] max = new Object[fieldStats.length];
+        Long[] nullCounts = new Long[fieldStats.length];
+        for (int i = 0; i < fieldStats.length; i++) {
+            min[i] = fieldStats[i].min();
+            max[i] = fieldStats[i].max();
+            nullCounts[i] = fieldStats[i].nullCount();
+        }
+        return predicate.test(
+                3, GenericRow.of(min), GenericRow.of(max), BinaryArray.fromLongArray(nullCounts));
     }
 
     private static BinaryRow createPart(int i, int j) {

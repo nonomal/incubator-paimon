@@ -23,19 +23,19 @@ import org.apache.paimon.types.DataType;
 /** last value aggregate a field of a row. */
 public class FieldLastValueAgg extends FieldAggregator {
 
-    public static final String NAME = "last_value";
+    private static final long serialVersionUID = 1L;
 
-    public FieldLastValueAgg(DataType dataType) {
-        super(dataType);
+    public FieldLastValueAgg(String name, DataType dataType) {
+        super(name, dataType);
     }
 
     @Override
-    String name() {
-        return NAME;
-    }
-
-    @Override
-    Object agg(Object accumulator, Object inputField) {
+    public Object agg(Object accumulator, Object inputField) {
         return inputField;
+    }
+
+    @Override
+    public Object retract(Object accumulator, Object retractField) {
+        return null;
     }
 }

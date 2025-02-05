@@ -18,40 +18,38 @@
 
 package org.apache.paimon.flink.sink;
 
-import org.apache.paimon.append.AppendOnlyCompactionTask;
+import org.apache.paimon.append.UnawareAppendCompactionTask;
 import org.apache.paimon.manifest.ManifestCommittable;
-import org.apache.paimon.table.AppendOnlyFileStoreTable;
+import org.apache.paimon.table.FileStoreTable;
 
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 
 /** Compaction Sink for unaware-bucket table. */
-public class UnawareBucketCompactionSink extends FlinkSink<AppendOnlyCompactionTask> {
+public class UnawareBucketCompactionSink extends FlinkSink<UnawareAppendCompactionTask> {
 
-    private final AppendOnlyFileStoreTable table;
+    private final FileStoreTable table;
 
-    public UnawareBucketCompactionSink(AppendOnlyFileStoreTable table) {
+    public UnawareBucketCompactionSink(FileStoreTable table) {
         super(table, true);
         this.table = table;
     }
 
     public static DataStreamSink<?> sink(
-            AppendOnlyFileStoreTable table, DataStream<AppendOnlyCompactionTask> input) {
+            FileStoreTable table, DataStream<UnawareAppendCompactionTask> input) {
         return new UnawareBucketCompactionSink(table).sinkFrom(input);
     }
 
     @Override
-    protected OneInputStreamOperator<AppendOnlyCompactionTask, Committable> createWriteOperator(
-            StoreSinkWrite.Provider writeProvider, String commitUser) {
-        return new AppendOnlyTableCompactionWorkerOperator(table, commitUser);
+    protected OneInputStreamOperatorFactory<UnawareAppendCompactionTask, Committable>
+            createWriteOperatorFactory(StoreSinkWrite.Provider writeProvider, String commitUser) {
+        return new AppendOnlySingleTableCompactionWorkerOperator.Factory(table, commitUser);
     }
 
     @Override
-    protected Committer.Factory<Committable, ManifestCommittable> createCommitterFactory(
-            boolean streamingCheckpointEnabled) {
-        return (s, metricGroup) ->
-                new StoreCommitter(table.newCommit(s), new CommitterMetrics(metricGroup));
+    protected Committer.Factory<Committable, ManifestCommittable> createCommitterFactory() {
+        return context -> new StoreCommitter(table, table.newCommit(context.commitUser()), context);
     }
 
     @Override

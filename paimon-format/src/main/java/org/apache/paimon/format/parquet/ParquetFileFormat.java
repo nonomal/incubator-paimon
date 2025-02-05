@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,13 +23,16 @@ import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.FileFormatFactory.FormatContext;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriterFactory;
-import org.apache.paimon.format.TableStatsExtractor;
+import org.apache.paimon.format.SimpleStatsExtractor;
 import org.apache.paimon.format.parquet.writer.RowDataParquetBuilder;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
-import org.apache.paimon.statistics.FieldStatsCollector;
+import org.apache.paimon.statistics.SimpleColStatsCollector;
 import org.apache.paimon.types.RowType;
-import org.apache.paimon.utils.Projection;
+
+import org.apache.parquet.filter2.predicate.ParquetFilters;
+import org.apache.parquet.hadoop.ParquetOutputFormat;
 
 import java.util.List;
 import java.util.Optional;
@@ -39,48 +42,58 @@ import static org.apache.paimon.format.parquet.ParquetFileFormatFactory.IDENTIFI
 /** Parquet {@link FileFormat}. */
 public class ParquetFileFormat extends FileFormat {
 
-    private final FormatContext formatContext;
+    private final Options options;
+    private final int readBatchSize;
 
     public ParquetFileFormat(FormatContext formatContext) {
         super(IDENTIFIER);
-        this.formatContext = formatContext;
+
+        this.options = getParquetConfiguration(formatContext);
+        this.readBatchSize = formatContext.readBatchSize();
     }
 
     @VisibleForTesting
-    Options formatOptions() {
-        return formatContext.formatOptions();
+    Options getOptions() {
+        return options;
     }
 
     @Override
     public FormatReaderFactory createReaderFactory(
-            RowType type, int[][] projection, List<Predicate> filters) {
+            RowType projectedRowType, List<Predicate> filters) {
         return new ParquetReaderFactory(
-                getParquetConfiguration(formatContext.formatOptions()),
-                Projection.of(projection).project(type),
-                formatContext.readBatchSize());
+                options, projectedRowType, readBatchSize, ParquetFilters.convert(filters));
     }
 
     @Override
     public FormatWriterFactory createWriterFactory(RowType type) {
-        return new ParquetWriterFactory(
-                new RowDataParquetBuilder(
-                        type, getParquetConfiguration(formatContext.formatOptions())));
+        return new ParquetWriterFactory(new RowDataParquetBuilder(type, options));
     }
 
     @Override
     public void validateDataFields(RowType rowType) {
-        ParquetSchemaConverter.convertToParquetMessageType("paimon_schema", rowType);
+        ParquetSchemaConverter.convertToParquetMessageType(rowType);
     }
 
     @Override
-    public Optional<TableStatsExtractor> createStatsExtractor(
-            RowType type, FieldStatsCollector.Factory[] statsCollectors) {
-        return Optional.of(new ParquetTableStatsExtractor(type, statsCollectors));
+    public Optional<SimpleStatsExtractor> createStatsExtractor(
+            RowType type, SimpleColStatsCollector.Factory[] statsCollectors) {
+        return Optional.of(new ParquetSimpleStatsExtractor(type, statsCollectors));
     }
 
-    public static Options getParquetConfiguration(Options options) {
-        Options conf = new Options();
-        options.toMap().forEach((key, value) -> conf.setString(IDENTIFIER + "." + key, value));
-        return conf;
+    private Options getParquetConfiguration(FormatContext context) {
+        Options parquetOptions = getIdentifierPrefixOptions(context.options());
+
+        if (!parquetOptions.containsKey("parquet.compression.codec.zstd.level")) {
+            parquetOptions.set(
+                    "parquet.compression.codec.zstd.level", String.valueOf(context.zstdLevel()));
+        }
+
+        MemorySize blockSize = context.blockSize();
+        if (blockSize != null) {
+            parquetOptions.set(
+                    ParquetOutputFormat.BLOCK_SIZE, String.valueOf(blockSize.getBytes()));
+        }
+
+        return parquetOptions;
     }
 }

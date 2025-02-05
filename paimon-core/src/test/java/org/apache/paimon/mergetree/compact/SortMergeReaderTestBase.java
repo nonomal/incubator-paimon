@@ -48,6 +48,7 @@ public abstract class SortMergeReaderTestBase extends CombiningRecordReaderTestB
         return SortMergeReader.createSortMergeReader(
                 new ArrayList<>(readers),
                 KEY_COMPARATOR,
+                null,
                 new ReducerMergeFunctionWrapper(createMergeFunction()),
                 sortEngine);
     }
@@ -107,41 +108,7 @@ public abstract class SortMergeReaderTestBase extends CombiningRecordReaderTestB
 
         @Override
         protected MergeFunction<KeyValue> createMergeFunction() {
-            return new DeduplicateMergeFunction();
-        }
-    }
-
-    /** Tests for {@link SortMergeReader} with {@link ValueCountMergeFunction}. */
-    public static class WithValueCountMergeFunctionTest extends SortMergeReaderTestBase {
-
-        @Override
-        protected boolean addOnly() {
-            return true;
-        }
-
-        @Override
-        protected List<ReusingTestData> getExpected(List<ReusingTestData> input) {
-            return MergeFunctionTestUtils.getExpectedForValueCount(input);
-        }
-
-        @Override
-        protected MergeFunction<KeyValue> createMergeFunction() {
-            return new ValueCountMergeFunction();
-        }
-
-        @ParameterizedTest
-        @EnumSource(SortEngine.class)
-        public void testCancelingRecords(SortEngine sortEngine) throws IOException {
-            runTest(
-                    parseData(
-                            "1, 1, +, 100 | 3, 5, +, -300 | 5, 300, +, 300",
-                            "",
-                            "1, 4, +, -200 | 3, 3, +, 300",
-                            "5, 100, +, -200 | 7, 123, +, -500",
-                            "7, 321, +, 200",
-                            "7, 456, +, 300"),
-                    sortEngine);
-            runTest(parseData("1, 2, +, 100", "1, 1, +, -100"), sortEngine);
+            return DeduplicateMergeFunction.factory().create();
         }
     }
 
@@ -163,7 +130,7 @@ public abstract class SortMergeReaderTestBase extends CombiningRecordReaderTestB
             RowType keyType = new RowType(Lists.list(new DataField(0, "f0", new IntType())));
             RowType valueType = new RowType(Lists.list(new DataField(1, "f1", new BigIntType())));
             return new LookupMergeFunction(
-                    new FirstRowMergeFunction(keyType, valueType), keyType, valueType);
+                    new FirstRowMergeFunction(keyType, valueType, false), keyType, valueType);
         }
     }
 }

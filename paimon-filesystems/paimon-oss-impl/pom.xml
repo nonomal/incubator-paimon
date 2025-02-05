@@ -24,7 +24,7 @@
     <parent>
         <artifactId>paimon-filesystems</artifactId>
         <groupId>org.apache.paimon</groupId>
-        <version>0.6-SNAPSHOT</version>
+        <version>1.1-SNAPSHOT</version>
     </parent>
 
     <artifactId>paimon-oss-impl</artifactId>
@@ -99,6 +99,69 @@
     <build>
         <plugins>
 
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <!-- jaxb-api is packaged as an optional dependency that is only accessible on Java 11 -->
+                            <Multi-Release>true</Multi-Release>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-javax-jars</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>copy</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <artifactItems>
+                        <artifactItem>
+                            <groupId>javax.xml.bind</groupId>
+                            <artifactId>jaxb-api</artifactId>
+                            <version>${jaxb.api.version}</version>
+                            <type>jar</type>
+                            <overWrite>true</overWrite>
+                        </artifactItem>
+                    </artifactItems>
+                    <outputDirectory>${project.build.directory}/temporary</outputDirectory>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>unpack-javax-libraries</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <echo message="unpacking javax jars"/>
+                                <unzip dest="${project.build.directory}/classes/META-INF/versions/11">
+                                    <fileset dir="${project.build.directory}/temporary">
+                                        <include name="*"/>
+                                    </fileset>
+                                </unzip>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
             <!-- Relocate all OSS related classes -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -116,17 +179,6 @@
                                     <include>*:*</include>
                                 </includes>
                             </artifactSet>
-                            <relocations>
-                                <!-- relocate the OSS dependencies -->
-                                <relocation>
-                                    <pattern>com.aliyun</pattern>
-                                    <shadedPattern>org.apache.paimon.oss.shade.com.aliyun</shadedPattern>
-                                </relocation>
-                                <relocation>
-                                    <pattern>com.aliyuncs</pattern>
-                                    <shadedPattern>org.apache.paimon.oss.shade.com.aliyuncs</shadedPattern>
-                                </relocation>
-                            </relocations>
                             <filters>
                                 <filter>
                                     <artifact>*</artifact>
@@ -134,6 +186,9 @@
                                         <exclude>.gitkeep</exclude>
                                         <exclude>mime.types</exclude>
                                         <exclude>mozilla/**</exclude>
+                                        <exclude>META-INF/maven/**</exclude>
+                                        <exclude>META-INF/versions/11/META-INF/maven/**</exclude>
+                                        <exclude>META-INF/LICENSE.txt</exclude>
                                     </excludes>
                                 </filter>
                             </filters>

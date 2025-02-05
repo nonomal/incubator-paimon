@@ -33,7 +33,7 @@ flink-sql-connector-kafka-*.jar
 ```
 
 ## Supported Formats
-Flink provides several Kafka CDC formats: Canal, Debezium, Ogg and Maxwell JSON.
+Flink provides several Kafka CDC formats: Canal Json, Debezium Json, Debezium Avro, Ogg Json, Maxwell Json and Normal Json.
 If a message in a Kafka topic is a change event captured from another database using the Change Data Capture (CDC) tool, then you can use the Paimon Kafka CDC. Write the INSERT, UPDATE, DELETE messages parsed into the paimon table.
 <table class="table table-bordered">
     <thead>
@@ -49,21 +49,37 @@ If a message in a Kafka topic is a change event captured from another database u
         </tr>
         <tr>
          <td><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/table/formats/debezium/">Debezium CDC</a></td>
-         <td>False</td>
+         <td>True</td>
         </tr>
         <tr>
-         <td><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/table/formats/maxwell/ >}}">Maxwell CDC</a></td>
+         <td><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/table/formats/maxwell/">Maxwell CDC</a></td>
         <td>True</td>
         </tr>
         <tr>
          <td><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/table/formats/ogg/">OGG CDC</a></td>
         <td>True</td>
         </tr>
+        <tr>
+         <td><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/connectors/table/formats/json/">JSON</a></td>
+        <td>True</td>
+        </tr>
+        <tr>
+         <td><a href="https://docs.aws.amazon.com/dms/latest/userguide/Welcome.html">aws-dms-json</a></td>
+        <td>True</td>
+        </tr>
     </tbody>
 </table>
 
 {{< hint info >}}
-In Oracle GoldenGate and Maxwell, the data format synchronized to Kafka does not include field data type information. As a result, Paimon sets the data type for all fields to "String" by default.
+The JSON sources possibly missing some information. For example, Ogg and Maxwell format standards don't contain field 
+types; When you write JSON sources into Flink Kafka sink, it will only reserve data and row type and drop other information. 
+The synchronization job will try best to handle the problem as follows:
+1. Usually, debezium-json contains 'schema' field, from which Paimon will retrieve data types. Make sure your debezium 
+json has this field, or Paimon will use 'STRING' type.
+2. If missing field types, Paimon will use 'STRING' type as default. 
+3. If missing database name or table name, you cannot do database synchronization, but you can still do table synchronization.
+4. If missing primary keys, the job might create non primary key table. You can set primary keys when submit job in table 
+synchronization.
 {{< /hint >}}
 
 ## Synchronizing Tables
@@ -75,17 +91,17 @@ To use this feature through `flink run`, run the following shell command.
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-{{< version >}}.jar \
-    kafka-sync-table
+    kafka_sync_table \
     --warehouse <warehouse-path> \
     --database <database-name> \
     --table <table-name> \
-    [--partition-keys <partition-keys>] \
-    [--primary-keys <primary-keys>] \
-    [--type-mapping to-string] \
-    [--computed-column <'column-name=expr-name(args[, ...])'> [--computed-column ...]] \
-    [--kafka-conf <kafka-source-conf> [--kafka-conf <kafka-source-conf> ...]] \
-    [--catalog-conf <paimon-catalog-conf> [--catalog-conf <paimon-catalog-conf> ...]] \
-    [--table-conf <paimon-table-sink-conf> [--table-conf <paimon-table-sink-conf> ...]]
+    [--partition_keys <partition_keys>] \
+    [--primary_keys <primary-keys>] \
+    [--type_mapping to-string] \
+    [--computed_column <'column-name=expr-name(args[, ...])'> [--computed_column ...]] \
+    [--kafka_conf <kafka-source-conf> [--kafka_conf <kafka-source-conf> ...]] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+    [--table_conf <paimon-table-sink-conf> [--table_conf <paimon-table-sink-conf> ...]]
 ```
 
 {{< generated/kafka_sync_table >}}
@@ -97,29 +113,29 @@ Example 1:
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-{{< version >}}.jar \
-    kafka-sync-table \
+    kafka_sync_table \
     --warehouse hdfs:///path/to/warehouse \
     --database test_db \
     --table test_table \
-    --partition-keys pt \
-    --primary-keys pt,uid \
-    --computed-column '_year=year(age)' \
-    --kafka-conf properties.bootstrap.servers=127.0.0.1:9020 \
-    --kafka-conf topic=order \
-    --kafka-conf properties.group.id=123456 \
-    --kafka-conf value.format=canal-json \
-    --catalog-conf metastore=hive \
-    --catalog-conf uri=thrift://hive-metastore:9083 \
-    --table-conf bucket=4 \
-    --table-conf changelog-producer=input \
-    --table-conf sink.parallelism=4
+    --partition_keys pt \
+    --primary_keys pt,uid \
+    --computed_column '_year=year(age)' \
+    --kafka_conf properties.bootstrap.servers=127.0.0.1:9020 \
+    --kafka_conf topic=order \
+    --kafka_conf properties.group.id=123456 \
+    --kafka_conf value.format=canal-json \
+    --catalog_conf metastore=hive \
+    --catalog_conf uri=thrift://hive-metastore:9083 \
+    --table_conf bucket=4 \
+    --table_conf changelog-producer=input \
+    --table_conf sink.parallelism=4
 ```
 
 If the kafka topic doesn't contain message when you start the synchronization job, you must manually create the table
 before submitting the job. You can define the partition keys and primary keys only, and the left columns will be added
 by the synchronization job.
 
-NOTE: In this case you shouldn't use --partition-keys or --primary-keys, because those keys are defined when creating
+NOTE: In this case you shouldn't use --partition_keys or --primary_keys, because those keys are defined when creating
 the table and can not be modified. Additionally, if you specified computed columns, you should also define all the argument
 columns used for computed columns.
 
@@ -141,12 +157,33 @@ Then you can submit synchronization job:
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-{{< version >}}.jar \
-    kafka-sync-table \
+    kafka_sync_table \
     --warehouse hdfs:///path/to/warehouse \
     --database test_db \
     --table test_table \
-    --computed-column 'part=date_format(create_time,yyyy-MM-dd)' \
+    --computed_column 'part=date_format(create_time,yyyy-MM-dd)' \
     ... (other conf)
+```
+
+Example 3: 
+For some append data (such as log data), it can be treated as special CDC data with only INSERT operation type, so you can use 'format=json' to synchronize such data to the Paimon table.
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-{{< version >}}.jar \
+    kafka_sync_table \
+    --warehouse hdfs:///path/to/warehouse \
+    --database test_db \
+    --table test_table \
+    --partition_keys pt \
+    --computed_column 'pt=date_format(event_tm, yyyyMMdd)' \
+    --kafka_conf properties.bootstrap.servers=127.0.0.1:9020 \
+    --kafka_conf topic=test_log \
+    --kafka_conf properties.group.id=123456 \
+    --kafka_conf value.format=json \
+    --catalog_conf metastore=hive \
+    --catalog_conf uri=thrift://hive-metastore:9083 \
+    --table_conf sink.parallelism=4
 ```
 
 ## Synchronizing Databases
@@ -158,22 +195,27 @@ To use this feature through `flink run`, run the following shell command.
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-{{< version >}}.jar \
-    kafka-sync-database
+    kafka_sync_database \
     --warehouse <warehouse-path> \
     --database <database-name> \
-    [--table-prefix <paimon-table-prefix>] \
-    [--table-suffix <paimon-table-suffix>] \
-    [--including-tables <table-name|name-regular-expr>] \
-    [--excluding-tables <table-name|name-regular-expr>] \
-    [--type-mapping to-string] \
-    [--kafka-conf <kafka-source-conf> [--kafka-conf <kafka-source-conf> ...]] \
-    [--catalog-conf <paimon-catalog-conf> [--catalog-conf <paimon-catalog-conf> ...]] \
-    [--table-conf <paimon-table-sink-conf> [--table-conf <paimon-table-sink-conf> ...]]
+    [--table_mapping <table-name>=<paimon-table-name>] \
+    [--table_prefix <paimon-table-prefix>] \
+    [--table_suffix <paimon-table-suffix>] \
+    [--table_prefix_db <paimon-table-prefix-by-db>] \
+    [--table_suffix_db <paimon-table-suffix-by-db>] \
+    [--including_tables <table-name|name-regular-expr>] \
+    [--excluding_tables <table-name|name-regular-expr>] \
+    [--including_dbs <database-name|name-regular-expr>] \
+    [--excluding_dbs <database-name|name-regular-expr>] \
+    [--type_mapping to-string] \
+    [--partition_keys <partition_keys>] \
+    [--primary_keys <primary-keys>] \
+    [--kafka_conf <kafka-source-conf> [--kafka_conf <kafka-source-conf> ...]] \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]] \
+    [--table_conf <paimon-table-sink-conf> [--table_conf <paimon-table-sink-conf> ...]]
 ```
 
 {{< generated/kafka_sync_database >}}
-
-Only tables with primary keys will be synchronized.
 
 This action will build a single combined sink for all tables. For each Kafka topic's table to be synchronized, if the
 corresponding Paimon table does not exist, this action will automatically create the table, and its schema will be derived
@@ -187,18 +229,18 @@ Synchronization from one Kafka topic to Paimon database.
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-{{< version >}}.jar \
-    kafka-sync-database \
+    kafka_sync_database \
     --warehouse hdfs:///path/to/warehouse \
     --database test_db \
-    --kafka-conf properties.bootstrap.servers=127.0.0.1:9020 \
-    --kafka-conf topic=order \
-    --kafka-conf properties.group.id=123456 \
-    --kafka-conf value.format=canal-json \
-    --catalog-conf metastore=hive \
-    --catalog-conf uri=thrift://hive-metastore:9083 \
-    --table-conf bucket=4 \
-    --table-conf changelog-producer=input \
-    --table-conf sink.parallelism=4
+    --kafka_conf properties.bootstrap.servers=127.0.0.1:9020 \
+    --kafka_conf topic=order \
+    --kafka_conf properties.group.id=123456 \
+    --kafka_conf value.format=canal-json \
+    --catalog_conf metastore=hive \
+    --catalog_conf uri=thrift://hive-metastore:9083 \
+    --table_conf bucket=4 \
+    --table_conf changelog-producer=input \
+    --table_conf sink.parallelism=4
 ```
 
 Synchronization from multiple Kafka topics to Paimon database.
@@ -206,16 +248,39 @@ Synchronization from multiple Kafka topics to Paimon database.
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-{{< version >}}.jar \
-    kafka-sync-database \
+    kafka_sync_database \
     --warehouse hdfs:///path/to/warehouse \
     --database test_db \
-    --kafka-conf properties.bootstrap.servers=127.0.0.1:9020 \
-    --kafka-conf topic=order\;logistic_order\;user \
-    --kafka-conf properties.group.id=123456 \
-    --kafka-conf value.format=canal-json \
-    --catalog-conf metastore=hive \
-    --catalog-conf uri=thrift://hive-metastore:9083 \
-    --table-conf bucket=4 \
-    --table-conf changelog-producer=input \
-    --table-conf sink.parallelism=4
+    --kafka_conf properties.bootstrap.servers=127.0.0.1:9020 \
+    --kafka_conf topic=order\;logistic_order\;user \
+    --kafka_conf properties.group.id=123456 \
+    --kafka_conf value.format=canal-json \
+    --catalog_conf metastore=hive \
+    --catalog_conf uri=thrift://hive-metastore:9083 \
+    --table_conf bucket=4 \
+    --table_conf changelog-producer=input \
+    --table_conf sink.parallelism=4
 ```
+
+## Additional kafka_config
+
+There are some useful options to build Flink Kafka Source, but they are not provided by flink-kafka-connector document. They are:
+
+<table class="table table-bordered">
+    <thead>
+      <tr>
+        <th class="text-left">Key</th>
+        <th class="text-left">Default</th>
+        <th class="text-left">Type</th>
+        <th class="text-left">Description</th>
+      </tr>
+    </thead>
+    <tbody>
+        <tr>
+          <td>schema.registry.url</td>
+          <td>(none)</td>
+          <td>String</td>
+          <td>When configuring "value.format=debezium-avro" which requires using the Confluence schema registry model for Apache Avro serialization, you need to provide the schema registry URL.</td>
+        </tr>
+    </tbody>
+</table>

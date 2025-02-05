@@ -24,14 +24,27 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
+import org.apache.paimon.fs.RemoteIterator;
 import org.apache.paimon.fs.SeekableInputStream;
 import org.apache.paimon.hadoop.SerializableConfiguration;
+import org.apache.paimon.utils.FunctionWithException;
+import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.ReflectionUtils;
 
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Options;
 
 import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Hadoop {@link FileIO}. */
 public class HadoopFileIO implements FileIO {
@@ -40,11 +53,12 @@ public class HadoopFileIO implements FileIO {
 
     protected SerializableConfiguration hadoopConf;
 
-    protected transient volatile FileSystem fs;
+    protected transient volatile Map<Pair<String, String>, FileSystem> fsMap;
 
     @VisibleForTesting
-    public void setFileSystem(FileSystem fs) {
-        this.fs = fs;
+    public void setFileSystem(Path path, FileSystem fs) throws IOException {
+        org.apache.hadoop.fs.Path hadoopPath = path(path);
+        getFileSystem(hadoopPath, p -> fs);
     }
 
     @Override
@@ -92,6 +106,29 @@ public class HadoopFileIO implements FileIO {
     }
 
     @Override
+    public RemoteIterator<FileStatus> listFilesIterative(Path path, boolean recursive)
+            throws IOException {
+        org.apache.hadoop.fs.Path hadoopPath = path(path);
+        org.apache.hadoop.fs.RemoteIterator<org.apache.hadoop.fs.LocatedFileStatus> hadoopIter =
+                getFileSystem(hadoopPath).listFiles(hadoopPath, recursive);
+        return new RemoteIterator<FileStatus>() {
+            @Override
+            public boolean hasNext() throws IOException {
+                return hadoopIter.hasNext();
+            }
+
+            @Override
+            public FileStatus next() throws IOException {
+                org.apache.hadoop.fs.FileStatus hadoopStatus = hadoopIter.next();
+                return new HadoopFileStatus(hadoopStatus);
+            }
+
+            @Override
+            public void close() throws IOException {}
+        };
+    }
+
+    @Override
     public boolean exists(Path path) throws IOException {
         org.apache.hadoop.fs.Path hadoopPath = path(path);
         return getFileSystem(hadoopPath).exists(hadoopPath);
@@ -116,17 +153,44 @@ public class HadoopFileIO implements FileIO {
         return getFileSystem(hadoopSrc).rename(hadoopSrc, hadoopDst);
     }
 
+    @Override
+    public void overwriteFileUtf8(Path path, String content) throws IOException {
+        boolean success = tryAtomicOverwriteViaRename(path, content);
+        if (!success) {
+            FileIO.super.overwriteFileUtf8(path, content);
+        }
+    }
+
     private org.apache.hadoop.fs.Path path(Path path) {
         return new org.apache.hadoop.fs.Path(path.toUri());
     }
 
     private FileSystem getFileSystem(org.apache.hadoop.fs.Path path) throws IOException {
-        if (fs == null) {
+        return getFileSystem(path, this::createFileSystem);
+    }
+
+    private FileSystem getFileSystem(
+            org.apache.hadoop.fs.Path path,
+            FunctionWithException<org.apache.hadoop.fs.Path, FileSystem, IOException> creator)
+            throws IOException {
+        if (fsMap == null) {
             synchronized (this) {
-                if (fs == null) {
-                    fs = createFileSystem(path);
+                if (fsMap == null) {
+                    fsMap = new ConcurrentHashMap<>();
                 }
             }
+        }
+
+        Map<Pair<String, String>, FileSystem> map = fsMap;
+
+        URI uri = path.toUri();
+        String scheme = uri.getScheme();
+        String authority = uri.getAuthority();
+        Pair<String, String> key = Pair.of(scheme, authority);
+        FileSystem fs = map.get(key);
+        if (fs == null) {
+            fs = creator.apply(path);
+            map.put(key, fs);
         }
         return fs;
     }
@@ -288,6 +352,98 @@ public class HadoopFileIO implements FileIO {
         @Override
         public long getModificationTime() {
             return status.getModificationTime();
+        }
+
+        @Override
+        public long getAccessTime() {
+            return status.getAccessTime();
+        }
+
+        @Override
+        public String getOwner() {
+            return status.getOwner();
+        }
+    }
+
+    // ============================== extra methods ===================================
+
+    private transient volatile AtomicReference<Method> renameMethodRef;
+
+    public boolean tryAtomicOverwriteViaRename(Path dst, String content) throws IOException {
+        org.apache.hadoop.fs.Path hadoopDst = path(dst);
+        FileSystem fs = getFileSystem(hadoopDst);
+
+        if (renameMethodRef == null) {
+            synchronized (this) {
+                if (renameMethodRef == null) {
+                    Method method;
+                    // Implementation in FileSystem is incorrect, not atomic, Object Storage like S3
+                    // and OSS not override it
+                    // DistributedFileSystem and ViewFileSystem override the rename method to public
+                    // and implement correct renaming
+                    try {
+                        method = ReflectionUtils.getMethod(fs.getClass(), "rename", 3);
+                    } catch (NoSuchMethodException e) {
+                        method = null;
+                    }
+                    renameMethodRef = new AtomicReference<>(method);
+                }
+            }
+        }
+
+        Method renameMethod = renameMethodRef.get();
+        if (renameMethod == null) {
+            return false;
+        }
+
+        boolean renameDone = false;
+
+        // write tempPath
+        Path tempPath = dst.createTempPath();
+        org.apache.hadoop.fs.Path hadoopTemp = path(tempPath);
+        try {
+            try (PositionOutputStream out = newOutputStream(tempPath, false)) {
+                OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8);
+                writer.write(content);
+                writer.flush();
+            }
+
+            renameMethod.invoke(
+                    fs, hadoopTemp, hadoopDst, new Options.Rename[] {Options.Rename.OVERWRITE});
+            renameDone = true;
+            // TODO: this is a workaround of HADOOP-16255 - remove this when HADOOP-16255 is
+            // resolved
+            tryRemoveCrcFile(hadoopTemp);
+            return true;
+        } catch (InvocationTargetException | IllegalAccessException e) {
+            throw new IOException(e);
+        } finally {
+            if (!renameDone) {
+                deleteQuietly(tempPath);
+            }
+        }
+    }
+
+    /** @throws IOException if a fatal exception occurs. Will try to ignore most exceptions. */
+    @SuppressWarnings("CatchMayIgnoreException")
+    private void tryRemoveCrcFile(org.apache.hadoop.fs.Path path) throws IOException {
+        try {
+            final org.apache.hadoop.fs.Path checksumFile =
+                    new org.apache.hadoop.fs.Path(
+                            path.getParent(), String.format(".%s.crc", path.getName()));
+
+            FileSystem fs = getFileSystem(checksumFile);
+            if (fs.exists(checksumFile)) {
+                // checksum file exists, deleting it
+                fs.delete(checksumFile, true); // recursive=true
+            }
+        } catch (Throwable t) {
+            if (t instanceof VirtualMachineError
+                    || t instanceof ThreadDeath
+                    || t instanceof LinkageError) {
+                throw t;
+            }
+            // else, ignore - we are removing crc file as "best-effort"
         }
     }
 }

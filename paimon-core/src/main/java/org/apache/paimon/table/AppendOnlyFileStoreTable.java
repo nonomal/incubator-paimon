@@ -20,42 +20,45 @@ package org.apache.paimon.table;
 
 import org.apache.paimon.AppendOnlyFileStore;
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.iceberg.AppendOnlyIcebergCommitCallback;
+import org.apache.paimon.iceberg.IcebergOptions;
 import org.apache.paimon.manifest.ManifestCacheFilter;
-import org.apache.paimon.operation.AppendOnlyFileStoreRead;
 import org.apache.paimon.operation.AppendOnlyFileStoreScan;
 import org.apache.paimon.operation.AppendOnlyFileStoreWrite;
 import org.apache.paimon.operation.FileStoreScan;
-import org.apache.paimon.operation.Lock;
+import org.apache.paimon.operation.RawFileSplitRead;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.query.LocalTableQuery;
+import org.apache.paimon.table.sink.CommitCallback;
 import org.apache.paimon.table.sink.TableWriteImpl;
+import org.apache.paimon.table.source.AbstractDataTableRead;
 import org.apache.paimon.table.source.AppendOnlySplitGenerator;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.InnerTableRead;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.SplitGenerator;
-import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Preconditions;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.function.BiConsumer;
 
-/** {@link FileStoreTable} for {@link WriteMode#APPEND_ONLY} write mode. */
-public class AppendOnlyFileStoreTable extends AbstractFileStoreTable {
+/** {@link FileStoreTable} for append table. */
+class AppendOnlyFileStoreTable extends AbstractFileStoreTable {
 
     private static final long serialVersionUID = 1L;
 
     private transient AppendOnlyFileStore lazyStore;
 
     AppendOnlyFileStoreTable(FileIO fileIO, Path path, TableSchema tableSchema) {
-        this(fileIO, path, tableSchema, new CatalogEnvironment(Lock.emptyFactory(), null, null));
+        this(fileIO, path, tableSchema, CatalogEnvironment.empty());
     }
 
     AppendOnlyFileStoreTable(
@@ -67,28 +70,25 @@ public class AppendOnlyFileStoreTable extends AbstractFileStoreTable {
     }
 
     @Override
-    protected FileStoreTable copy(TableSchema newTableSchema) {
-        return new AppendOnlyFileStoreTable(fileIO, path, newTableSchema, catalogEnvironment);
-    }
-
-    @Override
     public AppendOnlyFileStore store() {
         if (lazyStore == null) {
             lazyStore =
                     new AppendOnlyFileStore(
                             fileIO,
                             schemaManager(),
-                            tableSchema.id(),
+                            tableSchema,
                             new CoreOptions(tableSchema.options()),
                             tableSchema.logicalPartitionType(),
                             tableSchema.logicalBucketKeyType(),
-                            tableSchema.logicalRowType());
+                            tableSchema.logicalRowType(),
+                            name(),
+                            catalogEnvironment);
         }
         return lazyStore;
     }
 
     @Override
-    public SplitGenerator splitGenerator() {
+    protected SplitGenerator splitGenerator() {
         return new AppendOnlySplitGenerator(
                 store().options().splitTargetSize(),
                 store().options().splitOpenFileCost(),
@@ -105,33 +105,28 @@ public class AppendOnlyFileStoreTable extends AbstractFileStoreTable {
     }
 
     @Override
-    public BiConsumer<FileStoreScan, Predicate> nonPartitionFilterConsumer() {
+    protected BiConsumer<FileStoreScan, Predicate> nonPartitionFilterConsumer() {
         return (scan, predicate) -> ((AppendOnlyFileStoreScan) scan).withFilter(predicate);
     }
 
     @Override
-    public InnerTableRead innerRead() {
-        AppendOnlyFileStoreRead read = store().newRead();
-        return new InnerTableRead() {
+    public InnerTableRead newRead() {
+        RawFileSplitRead read = store().newRead();
+        return new AbstractDataTableRead<InternalRow>(schema()) {
+
             @Override
-            public InnerTableRead withFilter(Predicate predicate) {
+            protected InnerTableRead innerWithFilter(Predicate predicate) {
                 read.withFilter(predicate);
                 return this;
             }
 
             @Override
-            public InnerTableRead withProjection(int[][] projection) {
-                read.withProjection(projection);
-                return this;
+            public void applyReadType(RowType readType) {
+                read.withReadType(readType);
             }
 
             @Override
-            public TableRead withIOManager(IOManager ioManager) {
-                return this;
-            }
-
-            @Override
-            public RecordReader<InternalRow> createReader(Split split) throws IOException {
+            public RecordReader<InternalRow> reader(Split split) throws IOException {
                 return read.createReader((DataSplit) split);
             }
         };
@@ -145,18 +140,37 @@ public class AppendOnlyFileStoreTable extends AbstractFileStoreTable {
     @Override
     public TableWriteImpl<InternalRow> newWrite(
             String commitUser, ManifestCacheFilter manifestFilter) {
-        // if this table is unaware-bucket table, we skip compaction and restored files searching
-        AppendOnlyFileStoreWrite writer =
-                store().newWrite(commitUser, manifestFilter).withBucketMode(bucketMode());
+        AppendOnlyFileStoreWrite writer = store().newWrite(commitUser, manifestFilter);
         return new TableWriteImpl<>(
+                rowType(),
                 writer,
                 createRowKeyExtractor(),
-                record -> {
+                (record, rowKind) -> {
                     Preconditions.checkState(
-                            record.row().getRowKind() == RowKind.INSERT,
+                            rowKind.isAdd(),
                             "Append only writer can not accept row with RowKind %s",
-                            record.row().getRowKind());
+                            rowKind);
                     return record.row();
-                });
+                },
+                rowKindGenerator(),
+                CoreOptions.fromMap(tableSchema.options()).ignoreDelete());
+    }
+
+    @Override
+    public LocalTableQuery newLocalTableQuery() {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    protected List<CommitCallback> createCommitCallbacks(String commitUser) {
+        List<CommitCallback> callbacks = super.createCommitCallbacks(commitUser);
+        CoreOptions options = coreOptions();
+
+        if (options.toConfiguration().get(IcebergOptions.METADATA_ICEBERG_STORAGE)
+                != IcebergOptions.StorageType.DISABLED) {
+            callbacks.add(new AppendOnlyIcebergCommitCallback(this, commitUser));
+        }
+
+        return callbacks;
     }
 }

@@ -40,9 +40,6 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
     private final InternalRowSerializer keySerializer;
     private final InternalRowSerializer valueSerializer;
 
-    KeyValue highLevel;
-    boolean containLevel0;
-
     public LookupMergeFunction(
             MergeFunction<KeyValue> mergeFunction, RowType keyType, RowType valueType) {
         this.mergeFunction = mergeFunction;
@@ -53,8 +50,6 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
     @Override
     public void reset() {
         candidates.clear();
-        highLevel = null;
-        containLevel0 = false;
     }
 
     @Override
@@ -66,6 +61,7 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
     public KeyValue getResult() {
         // 1. Find the latest high level record
         Iterator<KeyValue> descending = candidates.descendingIterator();
+        KeyValue highLevel = null;
         while (descending.hasNext()) {
             KeyValue kv = descending.next();
             if (kv.level() > 0) {
@@ -74,8 +70,6 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
                 } else {
                     highLevel = kv;
                 }
-            } else {
-                containLevel0 = true;
             }
         }
 
@@ -83,6 +77,10 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
         mergeFunction.reset();
         candidates.forEach(mergeFunction::add);
         return mergeFunction.getResult();
+    }
+
+    LinkedList<KeyValue> candidates() {
+        return candidates;
     }
 
     public static MergeFunctionFactory<KeyValue> wrap(
@@ -114,6 +112,11 @@ public class LookupMergeFunction implements MergeFunction<KeyValue> {
             RowType valueType =
                     projection == null ? rowType : Projection.of(projection).project(rowType);
             return new LookupMergeFunction(wrapped.create(projection), keyType, valueType);
+        }
+
+        @Override
+        public AdjustedProjection adjustProjection(@Nullable int[][] projection) {
+            return wrapped.adjustProjection(projection);
         }
     }
 }

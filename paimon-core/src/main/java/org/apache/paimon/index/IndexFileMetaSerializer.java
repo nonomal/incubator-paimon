@@ -19,16 +19,21 @@
 package org.apache.paimon.index;
 
 import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericArray;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.utils.ObjectSerializer;
 import org.apache.paimon.utils.VersionedObjectSerializer;
+
+import java.util.Collection;
+import java.util.LinkedHashMap;
 
 /** A {@link VersionedObjectSerializer} for {@link IndexFileMeta}. */
 public class IndexFileMetaSerializer extends ObjectSerializer<IndexFileMeta> {
 
     public IndexFileMetaSerializer() {
-        super(IndexFileMeta.schema());
+        super(IndexFileMeta.SCHEMA);
     }
 
     @Override
@@ -37,7 +42,10 @@ public class IndexFileMetaSerializer extends ObjectSerializer<IndexFileMeta> {
                 BinaryString.fromString(record.indexType()),
                 BinaryString.fromString(record.fileName()),
                 record.fileSize(),
-                record.rowCount());
+                record.rowCount(),
+                record.deletionVectorMetas() == null
+                        ? null
+                        : dvMetasToRowArrayData(record.deletionVectorMetas().values()));
     }
 
     @Override
@@ -46,6 +54,36 @@ public class IndexFileMetaSerializer extends ObjectSerializer<IndexFileMeta> {
                 row.getString(0).toString(),
                 row.getString(1).toString(),
                 row.getLong(2),
-                row.getLong(3));
+                row.getLong(3),
+                row.isNullAt(4) ? null : rowArrayDataToDvMetas(row.getArray(4)));
+    }
+
+    public static InternalArray dvMetasToRowArrayData(Collection<DeletionVectorMeta> dvMetas) {
+        return new GenericArray(
+                dvMetas.stream()
+                        .map(
+                                dvMeta ->
+                                        GenericRow.of(
+                                                BinaryString.fromString(dvMeta.dataFileName()),
+                                                dvMeta.offset(),
+                                                dvMeta.length(),
+                                                dvMeta.cardinality()))
+                        .toArray(GenericRow[]::new));
+    }
+
+    public static LinkedHashMap<String, DeletionVectorMeta> rowArrayDataToDvMetas(
+            InternalArray arrayData) {
+        LinkedHashMap<String, DeletionVectorMeta> dvMetas = new LinkedHashMap<>(arrayData.size());
+        for (int i = 0; i < arrayData.size(); i++) {
+            InternalRow row = arrayData.getRow(i, DeletionVectorMeta.SCHEMA.getFieldCount());
+            dvMetas.put(
+                    row.getString(0).toString(),
+                    new DeletionVectorMeta(
+                            row.getString(0).toString(),
+                            row.getInt(1),
+                            row.getInt(2),
+                            row.isNullAt(3) ? null : row.getLong(3)));
+        }
+        return dvMetas;
     }
 }

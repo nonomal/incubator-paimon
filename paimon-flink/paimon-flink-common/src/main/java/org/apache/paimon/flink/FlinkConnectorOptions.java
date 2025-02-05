@@ -19,6 +19,7 @@
 package org.apache.paimon.flink;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.CoreOptions.ChangelogProducer;
 import org.apache.paimon.CoreOptions.StreamingReadMode;
 import org.apache.paimon.annotation.Documentation.ExcludeFromDocumentation;
 import org.apache.paimon.options.ConfigOption;
@@ -43,6 +44,11 @@ public class FlinkConnectorOptions {
 
     public static final String NONE = "none";
 
+    public static final String TABLE_DYNAMIC_OPTION_PREFIX = "paimon.";
+
+    public static final int MIN_CLUSTERING_SAMPLE_FACTOR = 20;
+
+    @ExcludeFromDocumentation("Confused without log system")
     public static final ConfigOption<String> LOG_SYSTEM =
             ConfigOptions.key("log.system")
                     .stringType()
@@ -68,6 +74,7 @@ public class FlinkConnectorOptions {
                                                             + "."))
                                     .build());
 
+    @ExcludeFromDocumentation("Confused without log system")
     public static final ConfigOption<Integer> LOG_SYSTEM_PARTITIONS =
             ConfigOptions.key("log.system.partitions")
                     .intType()
@@ -75,6 +82,7 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "The number of partitions of the log system. If log system is kafka, this is kafka partitions.");
 
+    @ExcludeFromDocumentation("Confused without log system")
     public static final ConfigOption<Integer> LOG_SYSTEM_REPLICATION =
             ConfigOptions.key("log.system.replication")
                     .intType()
@@ -118,6 +126,13 @@ public class FlinkConnectorOptions {
                             "If it is false, parallelism of source are set by global parallelism."
                                     + " Otherwise, source parallelism is inferred from splits number (batch mode) or bucket number(streaming mode).");
 
+    public static final ConfigOption<Integer> INFER_SCAN_MAX_PARALLELISM =
+            ConfigOptions.key("scan.infer-parallelism.max")
+                    .intType()
+                    .defaultValue(1024)
+                    .withDescription(
+                            "If scan.infer-parallelism is true, limit the parallelism of source through this option.");
+
     @Deprecated
     @ExcludeFromDocumentation("Deprecated")
     public static final ConfigOption<Duration> CHANGELOG_PRODUCER_FULL_COMPACTION_TRIGGER_INTERVAL =
@@ -128,19 +143,8 @@ public class FlinkConnectorOptions {
                             "When "
                                     + CoreOptions.CHANGELOG_PRODUCER.key()
                                     + " is set to "
-                                    + CoreOptions.ChangelogProducer.FULL_COMPACTION.name()
+                                    + ChangelogProducer.FULL_COMPACTION.name()
                                     + ", full compaction will be constantly triggered after this interval.");
-
-    public static final ConfigOption<Boolean> CHANGELOG_PRODUCER_LOOKUP_WAIT =
-            key("changelog-producer.lookup-wait")
-                    .booleanType()
-                    .defaultValue(true)
-                    .withDescription(
-                            "When "
-                                    + CoreOptions.CHANGELOG_PRODUCER.key()
-                                    + " is set to "
-                                    + CoreOptions.ChangelogProducer.LOOKUP.name()
-                                    + ", commit will wait for changelog generation by lookup.");
 
     public static final ConfigOption<WatermarkEmitStrategy> SCAN_WATERMARK_EMIT_STRATEGY =
             key("scan.watermark.emit.strategy")
@@ -207,11 +211,18 @@ public class FlinkConnectorOptions {
             key("scan.remove-normalize")
                     .booleanType()
                     .defaultValue(false)
-                    .withDeprecatedKeys("log.scan.remove-normalize")
+                    .withFallbackKeys("log.scan.remove-normalize")
                     .withDescription(
                             "Whether to force the removal of the normalize node when streaming read."
                                     + " Note: This is dangerous and is likely to cause data errors if downstream"
                                     + " is used to calculate aggregation and the input is not complete changelog.");
+
+    public static final ConfigOption<Boolean> STREAMING_READ_SHUFFLE_BUCKET_WITH_PARTITION =
+            key("streaming-read.shuffle-bucket-with-partition")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether shuffle by partition and bucket when streaming read.");
 
     /**
      * Weight of writer buffer in managed memory, Flink will compute the memory size for writer
@@ -225,14 +236,13 @@ public class FlinkConnectorOptions {
                             "Weight of writer buffer in managed memory, Flink will compute the memory size "
                                     + "for writer according to the weight, the actual memory used depends on the running environment.");
 
-    public static final ConfigOption<Boolean> SCAN_PUSH_DOWN =
-            ConfigOptions.key("scan.push-down")
-                    .booleanType()
-                    .defaultValue(true)
+    public static final ConfigOption<MemorySize> SINK_CROSS_PARTITION_MANAGED_MEMORY =
+            ConfigOptions.key("sink.cross-partition.managed-memory")
+                    .memoryType()
+                    .defaultValue(MemorySize.ofMebiBytes(256))
                     .withDescription(
-                            "If true, flink will push down projection, filters, limit to the source. The cost is that it "
-                                    + "is difficult to reuse the source in a job. With flink 1.18 or higher version, it "
-                                    + "is possible to reuse the source even with projection push down.");
+                            "Weight of managed memory for RocksDB in cross-partition update, Flink will compute the memory size "
+                                    + "according to the weight, the actual memory used depends on the running environment.");
 
     public static final ConfigOption<Boolean> SOURCE_CHECKPOINT_ALIGN_ENABLED =
             ConfigOptions.key("source.checkpoint-align.enabled")
@@ -254,11 +264,61 @@ public class FlinkConnectorOptions {
                     .defaultValue(false)
                     .withDescription("Whether to enable async lookup join.");
 
+    public static final ConfigOption<Integer> LOOKUP_BOOTSTRAP_PARALLELISM =
+            ConfigOptions.key("lookup.bootstrap-parallelism")
+                    .intType()
+                    .defaultValue(4)
+                    .withDescription(
+                            "The parallelism for bootstrap in a single task for lookup join.");
+
     public static final ConfigOption<Integer> LOOKUP_ASYNC_THREAD_NUMBER =
             ConfigOptions.key("lookup.async-thread-number")
                     .intType()
                     .defaultValue(16)
                     .withDescription("The thread number for lookup async.");
+
+    public static final ConfigOption<LookupCacheMode> LOOKUP_CACHE_MODE =
+            ConfigOptions.key("lookup.cache")
+                    .enumType(LookupCacheMode.class)
+                    .defaultValue(LookupCacheMode.AUTO)
+                    .withDescription("The cache mode of lookup join.");
+
+    public static final ConfigOption<String> LOOKUP_DYNAMIC_PARTITION =
+            ConfigOptions.key("lookup.dynamic-partition")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Specific dynamic partition for lookup, supports 'max_pt()' and 'max_two_pt()' currently.");
+
+    public static final ConfigOption<Duration> LOOKUP_DYNAMIC_PARTITION_REFRESH_INTERVAL =
+            ConfigOptions.key("lookup.dynamic-partition.refresh-interval")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(1))
+                    .withDescription(
+                            "Specific dynamic partition refresh interval for lookup, "
+                                    + "scan all partitions and obtain corresponding partition.");
+
+    public static final ConfigOption<Boolean> LOOKUP_REFRESH_ASYNC =
+            ConfigOptions.key("lookup.refresh.async")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription("Whether to refresh lookup table in an async thread.");
+
+    public static final ConfigOption<Integer> LOOKUP_REFRESH_ASYNC_PENDING_SNAPSHOT_COUNT =
+            ConfigOptions.key("lookup.refresh.async.pending-snapshot-count")
+                    .intType()
+                    .defaultValue(5)
+                    .withDescription(
+                            "If the pending snapshot count exceeds the threshold, lookup operator will refresh the table in sync.");
+
+    public static final ConfigOption<String> LOOKUP_REFRESH_TIME_PERIODS_BLACKLIST =
+            ConfigOptions.key("lookup.refresh.time-periods-blacklist")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The blacklist contains several time periods. During these time periods, the lookup table's "
+                                    + "cache refreshing is forbidden. Blacklist format is start1->end1,start2->end2,... , "
+                                    + "and the time format is yyyy-MM-dd HH:mm. Only used when lookup table is FULL cache mode.");
 
     public static final ConfigOption<Boolean> SINK_AUTO_TAG_FOR_SAVEPOINT =
             ConfigOptions.key("sink.savepoint.auto-tag")
@@ -281,6 +341,117 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "Sink committer memory to control heap memory of global committer.");
 
+    public static final ConfigOption<Boolean> SINK_COMMITTER_OPERATOR_CHAINING =
+            ConfigOptions.key("sink.committer-operator-chaining")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Allow sink committer and writer operator to be chained together");
+
+    public static final ConfigOption<Duration> PARTITION_IDLE_TIME_TO_DONE =
+            key("partition.idle-time-to-done")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Set a time duration when a partition has no new data after this time duration, "
+                                    + "mark the done status to indicate that the data is ready.");
+
+    public static final ConfigOption<Duration> PARTITION_TIME_INTERVAL =
+            key("partition.time-interval")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "You can specify time interval for partition, for example, "
+                                    + "daily partition is '1 d', hourly partition is '1 h'.");
+
+    public static final ConfigOption<Duration> PARTITION_IDLE_TIME_TO_REPORT_STATISTIC =
+            key("partition.idle-time-to-report-statistic")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(1))
+                    .withDescription(
+                            "Set a time duration when a partition has no new data after this time duration, "
+                                    + "start to report the partition statistics to hms.");
+
+    public static final ConfigOption<String> CLUSTERING_COLUMNS =
+            key("sink.clustering.by-columns")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Specifies the column name(s) used for comparison during range partitioning, in the format 'columnName1,columnName2'. "
+                                    + "If not set or set to an empty string, it indicates that the range partitioning feature is not enabled. "
+                                    + "This option will be effective only for bucket unaware table without primary keys and batch execution mode.");
+
+    public static final ConfigOption<String> CLUSTERING_STRATEGY =
+            key("sink.clustering.strategy")
+                    .stringType()
+                    .defaultValue("auto")
+                    .withDescription(
+                            "Specifies the comparison algorithm used for range partitioning, including 'zorder', 'hilbert', and 'order', "
+                                    + "corresponding to the z-order curve algorithm, hilbert curve algorithm, and basic type comparison algorithm, "
+                                    + "respectively. When not configured, it will automatically determine the algorithm based on the number of columns "
+                                    + "in 'sink.clustering.by-columns'. 'order' is used for 1 column, 'zorder' for less than 5 columns, "
+                                    + "and 'hilbert' for 5 or more columns.");
+
+    public static final ConfigOption<Boolean> CLUSTERING_SORT_IN_CLUSTER =
+            key("sink.clustering.sort-in-cluster")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Indicates whether to further sort data belonged to each sink task after range partitioning.");
+
+    public static final ConfigOption<Integer> CLUSTERING_SAMPLE_FACTOR =
+            key("sink.clustering.sample-factor")
+                    .intType()
+                    .defaultValue(100)
+                    .withDescription(
+                            "Specifies the sample factor. Let S represent the total number of samples, F represent the sample factor, "
+                                    + "and P represent the sink parallelism, then S=F×P. The minimum allowed sample factor is 20.");
+
+    public static final ConfigOption<Long> END_INPUT_WATERMARK =
+            key("end-input.watermark")
+                    .longType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Optional endInput watermark used in case of batch mode or bounded stream.");
+
+    public static final ConfigOption<Boolean> PRECOMMIT_COMPACT =
+            key("precommit-compact")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withFallbackKeys("changelog.precommit-compact")
+                    .withDescription(
+                            "If true, it will add a compact coordinator and worker operator after the writer operator,"
+                                    + "in order to compact several changelog files (for primary key tables) "
+                                    + "or newly created data files (for unaware bucket tables) "
+                                    + "from the same partition into large ones, "
+                                    + "which can decrease the number of small files. ");
+
+    public static final ConfigOption<String> SOURCE_OPERATOR_UID_SUFFIX =
+            key("source.operator-uid.suffix")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Set the uid suffix for the source operators. After setting, the uid format is "
+                                    + "${UID_PREFIX}_${TABLE_NAME}_${USER_UID_SUFFIX}. If the uid suffix is not set, flink will "
+                                    + "automatically generate the operator uid, which may be incompatible when the topology changes.");
+
+    public static final ConfigOption<String> SINK_OPERATOR_UID_SUFFIX =
+            key("sink.operator-uid.suffix")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Set the uid suffix for the writer, dynamic bucket assigner and committer operators. The uid format is "
+                                    + "${UID_PREFIX}_${TABLE_NAME}_${USER_UID_SUFFIX}. If the uid suffix is not set, flink will "
+                                    + "automatically generate the operator uid, which may be incompatible when the topology changes.");
+
+    public static final ConfigOption<Boolean> SCAN_BOUNDED =
+            key("scan.bounded")
+                    .booleanType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Bounded mode for Paimon consumer. "
+                                    + "By default, Paimon automatically selects bounded mode based on the mode of the Flink job.");
+
     public static List<ConfigOption<?>> getOptions() {
         final Field[] fields = FlinkConnectorOptions.class.getFields();
         final List<ConfigOption<?>> list = new ArrayList<>(fields.length);
@@ -294,6 +465,20 @@ public class FlinkConnectorOptions {
             }
         }
         return list;
+    }
+
+    public static String generateCustomUid(
+            String uidPrefix, String tableName, String userDefinedSuffix) {
+        return String.format("%s_%s_%s", uidPrefix, tableName, userDefinedSuffix);
+    }
+
+    /** The mode of lookup cache. */
+    public enum LookupCacheMode {
+        /** Auto mode, try to use partial mode. */
+        AUTO,
+
+        /** Use full caching mode. */
+        FULL
     }
 
     /** Watermark emit strategy for scan. */

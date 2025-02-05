@@ -23,15 +23,17 @@ import org.apache.paimon.flink.memory.MemorySegmentAllocator;
 import org.apache.paimon.memory.MemorySegmentPool;
 import org.apache.paimon.options.Options;
 
-import org.apache.flink.core.memory.ManagedMemoryUseCase;
-import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.memory.MemoryManager;
 import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
+import org.apache.flink.streaming.api.operators.AbstractStreamOperatorFactory;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 import org.apache.flink.streaming.api.operators.Output;
+import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
+import org.apache.flink.streaming.api.operators.StreamOperatorParameters;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
 
@@ -41,19 +43,22 @@ import java.io.IOException;
 import java.util.List;
 
 import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_USE_MANAGED_MEMORY;
+import static org.apache.paimon.flink.utils.ManagedMemoryUtils.computeManagedMemory;
 
 /** Prepare commit operator to emit {@link Committable}s. */
 public abstract class PrepareCommitOperator<IN, OUT> extends AbstractStreamOperator<OUT>
         implements OneInputStreamOperator<IN, OUT>, BoundedOneInput {
+
+    private static final long serialVersionUID = 1L;
 
     @Nullable protected transient MemorySegmentPool memoryPool;
     @Nullable private transient MemorySegmentAllocator memoryAllocator;
     private final Options options;
     private boolean endOfInput = false;
 
-    public PrepareCommitOperator(Options options) {
+    public PrepareCommitOperator(StreamOperatorParameters<OUT> parameters, Options options) {
         this.options = options;
-        setChainingStrategy(ChainingStrategy.ALWAYS);
+        setup(parameters.getContainingTask(), parameters.getStreamConfig(), parameters.getOutput());
     }
 
     @Override
@@ -67,21 +72,10 @@ public abstract class PrepareCommitOperator<IN, OUT> extends AbstractStreamOpera
             memoryAllocator = new MemorySegmentAllocator(containingTask, memoryManager);
             memoryPool =
                     new FlinkMemorySegmentPool(
-                            computeMemorySize(), memoryManager.getPageSize(), memoryAllocator);
+                            computeManagedMemory(this),
+                            memoryManager.getPageSize(),
+                            memoryAllocator);
         }
-    }
-
-    /** Compute memory size from memory faction. */
-    private long computeMemorySize() {
-        final Environment environment = getContainingTask().getEnvironment();
-        return environment
-                .getMemoryManager()
-                .computeMemorySize(
-                        getOperatorConfig()
-                                .getManagedMemoryFractionOperatorUseCaseOfSlot(
-                                        ManagedMemoryUseCase.OPERATOR,
-                                        environment.getTaskManagerInfo().getConfiguration(),
-                                        environment.getUserCodeClassLoader().asClassLoader()));
     }
 
     @Override
@@ -113,4 +107,15 @@ public abstract class PrepareCommitOperator<IN, OUT> extends AbstractStreamOpera
 
     protected abstract List<OUT> prepareCommit(boolean waitCompaction, long checkpointId)
             throws IOException;
+
+    /** {@link StreamOperatorFactory} of {@link PrepareCommitOperator}. */
+    protected abstract static class Factory<IN, OUT> extends AbstractStreamOperatorFactory<OUT>
+            implements OneInputStreamOperatorFactory<IN, OUT> {
+        protected final Options options;
+
+        protected Factory(Options options) {
+            this.options = options;
+            this.chainingStrategy = ChainingStrategy.ALWAYS;
+        }
+    }
 }

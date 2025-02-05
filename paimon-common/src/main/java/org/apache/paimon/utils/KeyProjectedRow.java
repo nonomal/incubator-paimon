@@ -24,6 +24,7 @@ import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.data.variant.Variant;
 import org.apache.paimon.types.RowKind;
 
 import java.util.Arrays;
@@ -42,6 +43,10 @@ public class KeyProjectedRow implements InternalRow {
     public KeyProjectedRow replaceRow(InternalRow row) {
         this.row = row;
         return this;
+    }
+
+    public int[] indexMapping() {
+        return indexMapping;
     }
 
     @Override
@@ -117,6 +122,11 @@ public class KeyProjectedRow implements InternalRow {
     @Override
     public byte[] getBinary(int pos) {
         return row.getBinary(indexMapping[pos]);
+    }
+
+    @Override
+    public Variant getVariant(int pos) {
+        return row.getVariant(indexMapping[pos]);
     }
 
     @Override

@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,14 +21,10 @@ package org.apache.paimon.spark.catalog;
 import org.apache.paimon.spark.analysis.NoSuchProcedureException;
 import org.apache.paimon.spark.procedure.Procedure;
 
-import org.apache.spark.sql.connector.catalog.CatalogPlugin;
 import org.apache.spark.sql.connector.catalog.Identifier;
 
-/**
- * A {@link CatalogPlugin catalog} interface that loads stored procedures called via CALL
- * statements.
- */
-public interface ProcedureCatalog extends CatalogPlugin {
+/** An interface that loads stored procedures called via CALL statements. */
+public interface ProcedureCatalog {
 
     /**
      * Loads a {@link Procedure stored procedure} by {@link Identifier identifier}.

@@ -26,12 +26,11 @@ import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.index.IndexFileHandler;
 import org.apache.paimon.manifest.IndexManifestEntry;
-import org.apache.paimon.operation.FileStoreExpireImpl;
 import org.apache.paimon.options.Options;
-import org.apache.paimon.table.sink.DynamicBucketRow;
 import org.apache.paimon.table.sink.StreamTableCommit;
 import org.apache.paimon.table.sink.StreamTableWrite;
 import org.apache.paimon.table.sink.StreamWriteBuilder;
+import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.TagManager;
 
 import org.junit.jupiter.api.Test;
@@ -53,14 +52,14 @@ public class IndexFileExpireTableTest extends PrimaryKeyTableTestBase {
         return options;
     }
 
-    private DynamicBucketRow createRow(int partition, int bucket, int key, int value) {
-        return new DynamicBucketRow(GenericRow.of(partition, key, value), bucket);
+    private Pair<GenericRow, Integer> createRow(int partition, int bucket, int key, int value) {
+        return Pair.of(GenericRow.of(partition, key, value), bucket);
     }
 
     @Test
     public void testIndexFileExpiration() throws Exception {
         prepareExpireTable();
-        FileStoreExpireImpl expire = (FileStoreExpireImpl) table.store().newExpire();
+        ExpireSnapshotsImpl expire = (ExpireSnapshotsImpl) table.newExpireSnapshots();
 
         long indexFileSize = indexFileSize();
         long indexManifestSize = indexManifestSize();
@@ -89,7 +88,7 @@ public class IndexFileExpireTableTest extends PrimaryKeyTableTestBase {
     @Test
     public void testIndexFileExpirationWithTag() throws Exception {
         prepareExpireTable();
-        FileStoreExpireImpl expire = (FileStoreExpireImpl) table.store().newExpire();
+        ExpireSnapshotsImpl expire = (ExpireSnapshotsImpl) table.newExpireSnapshots();
 
         table.createTag("tag3", 3);
         table.createTag("tag5", 5);
@@ -107,15 +106,15 @@ public class IndexFileExpireTableTest extends PrimaryKeyTableTestBase {
         assertThat(indexFileSize()).isEqualTo(5);
         assertThat(indexManifestSize()).isEqualTo(3);
 
-        TagManager tagManager = new TagManager(LocalFileIO.create(), table.path);
-        checkIndexFiles(tagManager.taggedSnapshot("tag3"));
-        checkIndexFiles(tagManager.taggedSnapshot("tag5"));
+        TagManager tagManager = new TagManager(LocalFileIO.create(), table.location());
+        checkIndexFiles(tagManager.getOrThrow("tag3"));
+        checkIndexFiles(tagManager.getOrThrow("tag5"));
     }
 
     @Test
     public void testIndexFileExpirationWhenDeletingTag() throws Exception {
         prepareExpireTable();
-        FileStoreExpireImpl expire = (FileStoreExpireImpl) table.store().newExpire();
+        ExpireSnapshotsImpl expire = (ExpireSnapshotsImpl) table.newExpireSnapshots();
 
         table.createTag("tag3", 3);
         table.createTag("tag5", 5);
@@ -134,9 +133,9 @@ public class IndexFileExpireTableTest extends PrimaryKeyTableTestBase {
         expire.expireUntil(1, 7);
         table.deleteTag("tag3");
 
-        TagManager tagManager = new TagManager(LocalFileIO.create(), table.path);
+        TagManager tagManager = new TagManager(LocalFileIO.create(), table.location());
         checkIndexFiles(7);
-        checkIndexFiles(tagManager.taggedSnapshot("tag5"));
+        checkIndexFiles(tagManager.getOrThrow("tag5"));
         assertThat(indexFileSize()).isEqualTo(4);
         assertThat(indexManifestSize()).isEqualTo(2);
     }
@@ -191,19 +190,19 @@ public class IndexFileExpireTableTest extends PrimaryKeyTableTestBase {
         assertThat(indexManifestSize()).isEqualTo(1);
     }
 
-    private void prepareExpireTable() throws Exception {
+    protected void prepareExpireTable() throws Exception {
         StreamWriteBuilder writeBuilder = table.newStreamWriteBuilder();
         StreamTableWrite write = writeBuilder.newWrite();
         StreamTableCommit commit = writeBuilder.newCommit();
 
         // commit bucket 1,2,3
-        write.write(createRow(1, 1, 1, 1));
-        write.write(createRow(2, 2, 2, 2));
-        write.write(createRow(3, 3, 3, 3));
+        write(write, createRow(1, 1, 1, 1));
+        write(write, createRow(2, 2, 2, 2));
+        write(write, createRow(3, 3, 3, 3));
         commit.commit(0, write.prepareCommit(true, 0));
 
         // commit bucket 1 only
-        write.write(createRow(1, 1, 2, 2));
+        write(write, createRow(1, 1, 2, 2));
         commit.commit(1, write.prepareCommit(true, 1));
 
         // compact only
@@ -211,16 +210,19 @@ public class IndexFileExpireTableTest extends PrimaryKeyTableTestBase {
         commit.commit(2, write.prepareCommit(true, 2));
 
         // commit bucket 2 only
-        write.write(createRow(2, 2, 3, 3));
+        write(write, createRow(2, 2, 3, 3));
         commit.commit(3, write.prepareCommit(true, 3));
 
         // commit bucket 2 only
-        write.write(createRow(2, 2, 4, 4));
+        write(write, createRow(2, 2, 4, 4));
         commit.commit(4, write.prepareCommit(true, 4));
 
         // commit bucket 2 only
-        write.write(createRow(2, 2, 5, 5));
+        write(write, createRow(2, 2, 5, 5));
         commit.commit(5, write.prepareCommit(true, 5));
+
+        write.close();
+        commit.close();
     }
 
     private void checkIndexFiles(long snapshotId) {
@@ -239,12 +241,18 @@ public class IndexFileExpireTableTest extends PrimaryKeyTableTestBase {
     }
 
     private long indexFileSize() throws IOException {
-        return LocalFileIO.create().listStatus(new Path(table.path, "index")).length;
+        return LocalFileIO.create().listStatus(new Path(table.location(), "index")).length;
     }
 
     private long indexManifestSize() throws IOException {
-        return Arrays.stream(LocalFileIO.create().listStatus(new Path(table.path, "manifest")))
+        return Arrays.stream(
+                        LocalFileIO.create().listStatus(new Path(table.location(), "manifest")))
                 .filter(s -> s.getPath().getName().startsWith("index-"))
                 .count();
+    }
+
+    private void write(StreamTableWrite write, Pair<GenericRow, Integer> rowWithBucket)
+            throws Exception {
+        write.write(rowWithBucket.getKey(), rowWithBucket.getValue());
     }
 }

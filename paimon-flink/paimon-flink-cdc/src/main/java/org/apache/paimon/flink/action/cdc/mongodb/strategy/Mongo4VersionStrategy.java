@@ -21,8 +21,9 @@ package org.apache.paimon.flink.action.cdc.mongodb.strategy;
 import org.apache.paimon.flink.action.cdc.ComputedColumn;
 import org.apache.paimon.flink.sink.cdc.CdcRecord;
 import org.apache.paimon.flink.sink.cdc.RichCdcMultiplexRecord;
-import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
@@ -30,7 +31,6 @@ import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.flink.configuration.Configuration;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -49,19 +49,16 @@ public class Mongo4VersionStrategy implements MongoVersionStrategy {
     private static final String OP_DELETE = "delete";
     private final String databaseName;
     private final String collection;
-    private final boolean caseSensitive;
     private final Configuration mongodbConfig;
     private final List<ComputedColumn> computedColumns;
 
     public Mongo4VersionStrategy(
             String databaseName,
             String collection,
-            boolean caseSensitive,
             List<ComputedColumn> computedColumns,
             Configuration mongodbConfig) {
         this.databaseName = databaseName;
         this.collection = collection;
-        this.caseSensitive = caseSensitive;
         this.mongodbConfig = mongodbConfig;
         this.computedColumns = computedColumns;
     }
@@ -93,22 +90,21 @@ public class Mongo4VersionStrategy implements MongoVersionStrategy {
     private List<RichCdcMultiplexRecord> handleOperation(
             String op, JsonNode fullDocument, JsonNode documentKey) throws JsonProcessingException {
         List<RichCdcMultiplexRecord> records = new ArrayList<>();
-        LinkedHashMap<String, DataType> paimonFieldTypes = new LinkedHashMap<>();
 
         switch (op) {
             case OP_INSERT:
-                records.add(processRecord(fullDocument, paimonFieldTypes, RowKind.INSERT));
+                records.add(processRecord(fullDocument, RowKind.INSERT));
                 break;
             case OP_REPLACE:
             case OP_UPDATE:
                 // Before version 6.0 of MongoDB, it was not possible to obtain 'Update Before'
                 // information. Therefore, data is first deleted using the primary key '_id', and
                 // then inserted.
-                records.add(processRecord(documentKey, paimonFieldTypes, RowKind.DELETE));
-                records.add(processRecord(fullDocument, paimonFieldTypes, RowKind.INSERT));
+                records.add(processRecord(documentKey, RowKind.DELETE));
+                records.add(processRecord(fullDocument, RowKind.INSERT));
                 break;
             case OP_DELETE:
-                records.add(processRecord(documentKey, paimonFieldTypes, RowKind.DELETE));
+                records.add(processRecord(documentKey, RowKind.DELETE));
                 break;
             default:
                 throw new UnsupportedOperationException("Unknown record type: " + op);
@@ -121,28 +117,21 @@ public class Mongo4VersionStrategy implements MongoVersionStrategy {
      * RichCdcMultiplexRecord object.
      *
      * @param fullDocument the JSON node containing the full document to be processed.
-     * @param paimonFieldTypes a LinkedHashMap containing the field types to be used in the
-     *     processing.
      * @param rowKind the kind of row to be processed (e.g., insert, update, delete).
      * @throws JsonProcessingException if there is an error in processing the JSON document.
      * @return a RichCdcMultiplexRecord object that contains the processed record information.
      */
-    private RichCdcMultiplexRecord processRecord(
-            JsonNode fullDocument,
-            LinkedHashMap<String, DataType> paimonFieldTypes,
-            RowKind rowKind)
+    private RichCdcMultiplexRecord processRecord(JsonNode fullDocument, RowKind rowKind)
             throws JsonProcessingException {
+        RowType.Builder rowTypeBuilder = RowType.builder();
         Map<String, String> record =
-                getExtractRow(
-                        fullDocument,
-                        paimonFieldTypes,
-                        caseSensitive,
-                        computedColumns,
-                        mongodbConfig);
+                getExtractRow(fullDocument, rowTypeBuilder, computedColumns, mongodbConfig);
+        List<DataField> fields = rowTypeBuilder.build().getFields();
+
         return new RichCdcMultiplexRecord(
                 databaseName,
                 collection,
-                paimonFieldTypes,
+                fields,
                 extractPrimaryKeys(),
                 new CdcRecord(rowKind, record));
     }

@@ -23,18 +23,20 @@ import org.apache.paimon.flink.ReadWriteTableITCase;
 import org.apache.paimon.utils.BlockingIterator;
 
 import org.apache.flink.api.common.RuntimeExecutionMode;
-import org.apache.flink.api.common.restartstrategy.RestartStrategies;
-import org.apache.flink.api.common.time.Time;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.RestartStrategyOptions;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
+import org.apache.flink.types.RowKind;
 import org.apache.flink.util.CloseableIterator;
 
 import javax.annotation.Nullable;
 
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -51,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** Test util for {@link ReadWriteTableITCase}. */
 public class ReadWriteTableTestUtil {
 
-    private static final Time TIME_OUT = Time.seconds(10);
+    private static final Duration TIME_OUT = Duration.ofSeconds(10);
 
     public static final int DEFAULT_PARALLELISM = 2;
 
@@ -74,12 +76,11 @@ public class ReadWriteTableTestUtil {
     }
 
     public static void init(String warehouse, int parallelism) {
-        StreamExecutionEnvironment sExeEnv = buildStreamEnv(parallelism);
-        sExeEnv.getConfig().setRestartStrategy(RestartStrategies.noRestart());
+        // Using `none` to avoid compatibility issues with Flink 1.18-.
+        StreamExecutionEnvironment sExeEnv = buildStreamEnv(parallelism, "none");
         sEnv = StreamTableEnvironment.create(sExeEnv);
 
-        bExeEnv = buildBatchEnv(parallelism);
-        bExeEnv.getConfig().setRestartStrategy(RestartStrategies.noRestart());
+        bExeEnv = buildBatchEnv(parallelism, "none");
         bEnv = StreamTableEnvironment.create(bExeEnv, EnvironmentSettings.inBatchMode());
 
         ReadWriteTableTestUtil.warehouse = warehouse;
@@ -94,34 +95,53 @@ public class ReadWriteTableTestUtil {
         bEnv.useCatalog(catalog);
     }
 
-    public static StreamExecutionEnvironment buildStreamEnv(int parallelism) {
-        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    public static StreamExecutionEnvironment buildStreamEnv(
+            int parallelism, String restartStrategy) {
+        Configuration configuration = new Configuration();
+        configuration.set(RestartStrategyOptions.RESTART_STRATEGY, restartStrategy);
+        final StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
         env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
         env.enableCheckpointing(100);
         env.setParallelism(parallelism);
         return env;
     }
 
-    public static StreamExecutionEnvironment buildBatchEnv(int parallelism) {
-        final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    public static StreamExecutionEnvironment buildBatchEnv(
+            int parallelism, String restartStrategy) {
+        Configuration configuration = new Configuration();
+        configuration.set(RestartStrategyOptions.RESTART_STRATEGY, restartStrategy);
+        final StreamExecutionEnvironment env =
+                StreamExecutionEnvironment.getExecutionEnvironment(configuration);
         env.setRuntimeMode(RuntimeExecutionMode.BATCH);
         env.setParallelism(parallelism);
         return env;
     }
 
     public static String createTable(
-            List<String> fieldsSpec, List<String> primaryKeys, List<String> partitionKeys) {
-        return createTable(fieldsSpec, primaryKeys, partitionKeys, new HashMap<>());
+            List<String> fieldsSpec,
+            List<String> primaryKeys,
+            List<String> bucketKeys,
+            List<String> partitionKeys) {
+        return createTable(fieldsSpec, primaryKeys, bucketKeys, partitionKeys, new HashMap<>());
     }
 
     public static String createTable(
             List<String> fieldsSpec,
             List<String> primaryKeys,
+            List<String> bucketKeys,
             List<String> partitionKeys,
             Map<String, String> options) {
         // "-" is not allowed in the table name.
         String table = ("MyTable_" + UUID.randomUUID()).replace("-", "_");
-        sEnv.executeSql(buildDdl(table, fieldsSpec, primaryKeys, partitionKeys, options));
+        Map<String, String> newOptions = new HashMap<>(options);
+        if (!newOptions.containsKey("bucket")) {
+            newOptions.put("bucket", "1");
+        }
+        if (!bucketKeys.isEmpty()) {
+            newOptions.put("bucket-key", String.join(",", bucketKeys));
+        }
+        sEnv.executeSql(buildDdl(table, fieldsSpec, primaryKeys, partitionKeys, newOptions));
         return table;
     }
 
@@ -253,17 +273,46 @@ public class ReadWriteTableTestUtil {
                         });
     }
 
+    public static void checkExternalFileStorePath(List<String> partitionSpec, String externalPath) {
+        // check data file path
+        if (partitionSpec.isEmpty()) {
+            partitionSpec = Collections.singletonList("");
+        }
+        partitionSpec.stream()
+                .map(str -> str.replaceAll(",", "/"))
+                .map(str -> str.replaceAll("null", "__DEFAULT_PARTITION__"))
+                .forEach(
+                        partition -> {
+                            assertThat(Paths.get(externalPath, partition)).exists();
+                            // at least exists bucket-0
+                            assertThat(Paths.get(externalPath, partition, "bucket-0")).exists();
+                        });
+    }
+
     public static void testBatchRead(String query, List<Row> expected) throws Exception {
         CloseableIterator<Row> resultItr = bEnv.executeSql(query).collect();
         try (BlockingIterator<Row, Row> iterator = BlockingIterator.of(resultItr)) {
             if (!expected.isEmpty()) {
-                assertThat(
-                                iterator.collect(
-                                        expected.size(), TIME_OUT.getSize(), TIME_OUT.getUnit()))
-                        .containsExactlyInAnyOrderElementsOf(expected);
+                List<Row> result =
+                        iterator.collect(expected.size(), TIME_OUT.getSeconds(), TimeUnit.SECONDS);
+                assertThat(toInsertOnlyRows(result))
+                        .containsExactlyInAnyOrderElementsOf(toInsertOnlyRows(expected));
             }
             assertThat(resultItr.hasNext()).isFalse();
         }
+    }
+
+    private static List<Row> toInsertOnlyRows(List<Row> rows) {
+        List<Row> result = new ArrayList<>();
+        for (Row row : rows) {
+            assertThat(row.getKind()).isIn(RowKind.INSERT, RowKind.UPDATE_AFTER);
+            Row newRow = new Row(row.getArity());
+            for (int i = 0; i < row.getArity(); i++) {
+                newRow.setField(i, row.getField(i));
+            }
+            result.add(newRow);
+        }
+        return result;
     }
 
     public static BlockingIterator<Row, Row> testStreamingRead(String query, List<Row> expected)

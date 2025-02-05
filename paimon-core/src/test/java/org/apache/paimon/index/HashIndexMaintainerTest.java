@@ -22,13 +22,14 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.PrimaryKeyTableTestBase;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.CommitMessageImpl;
-import org.apache.paimon.table.sink.DynamicBucketRow;
 import org.apache.paimon.table.sink.StreamTableCommit;
 import org.apache.paimon.table.sink.StreamTableWrite;
 import org.apache.paimon.table.sink.StreamWriteBuilder;
+import org.apache.paimon.utils.Pair;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -64,8 +65,8 @@ public class HashIndexMaintainerTest extends PrimaryKeyTableTestBase {
         return options;
     }
 
-    private DynamicBucketRow createRow(int partition, int bucket, int key, int value) {
-        return new DynamicBucketRow(GenericRow.of(partition, key, value), bucket);
+    private Pair<InternalRow, Integer> createRow(int partition, int bucket, int key, int value) {
+        return Pair.of(GenericRow.of(partition, key, value), bucket);
     }
 
     private Map<BinaryRow, Map<Integer, int[]>> readIndex(List<CommitMessage> messages) {
@@ -89,11 +90,13 @@ public class HashIndexMaintainerTest extends PrimaryKeyTableTestBase {
     @Test
     public void testAssignBucket() throws Exception {
         assertThatThrownBy(() -> write.write(GenericRow.of(1, 1, 1)))
-                .hasMessageContaining("Only supports DynamicBucketRow");
+                .hasMessageContaining(
+                        "Can't extract bucket from row in dynamic bucket mode, "
+                                + "you should use 'TableWrite.write(InternalRow row, int bucket)' method.");
 
         // commit two partitions
-        write.write(createRow(1, 1, 1, 1));
-        write.write(createRow(2, 2, 2, 2));
+        write(write, createRow(1, 1, 1, 1));
+        write(write, createRow(2, 2, 2, 2));
         List<CommitMessage> commitMessages = write.prepareCommit(true, 0);
         Map<BinaryRow, Map<Integer, int[]>> index = readIndex(commitMessages);
         assertThat(index).containsOnlyKeys(row(1), row(2));
@@ -103,7 +106,7 @@ public class HashIndexMaintainerTest extends PrimaryKeyTableTestBase {
         commit.commit(0, commitMessages);
 
         // only one partition
-        write.write(createRow(1, 1, 2, 2));
+        write(write, createRow(1, 1, 2, 2));
         commitMessages = write.prepareCommit(true, 1);
         index = readIndex(commitMessages);
         assertThat(index).containsOnlyKeys(row(1));
@@ -113,7 +116,7 @@ public class HashIndexMaintainerTest extends PrimaryKeyTableTestBase {
 
         // restore
         write = writeBuilder.newWrite();
-        write.write(createRow(1, 1, 3, 3));
+        write(write, createRow(1, 1, 3, 3));
         commitMessages = write.prepareCommit(true, 2);
         index = readIndex(commitMessages);
         assertThat(index).containsOnlyKeys(row(1));
@@ -122,20 +125,27 @@ public class HashIndexMaintainerTest extends PrimaryKeyTableTestBase {
                 .containsExactlyInAnyOrder(-771300025, 1340390384, 1465514398);
 
         write.close();
+        commit.close();
     }
 
     @Test
     public void testNotCreateNewFile() throws Exception {
         // commit two partitions
-        write.write(createRow(1, 1, 1, 1));
-        write.write(createRow(2, 2, 2, 2));
+        write(write, createRow(1, 1, 1, 1));
+        write(write, createRow(2, 2, 2, 2));
         commit.commit(0, write.prepareCommit(true, 0));
 
         // same record
-        write.write(createRow(1, 1, 1, 1));
+        write(write, createRow(1, 1, 1, 1));
         List<CommitMessage> commitMessages = write.prepareCommit(true, 1);
         assertThat(readIndex(commitMessages)).isEmpty();
 
         write.close();
+        commit.close();
+    }
+
+    private void write(StreamTableWrite write, Pair<InternalRow, Integer> rowWithBucket)
+            throws Exception {
+        write.write(rowWithBucket.getKey(), rowWithBucket.getValue());
     }
 }

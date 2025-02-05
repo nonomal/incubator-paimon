@@ -21,6 +21,8 @@ package org.apache.paimon.table.source;
 import org.apache.paimon.annotation.Public;
 
 import java.io.Serializable;
+import java.util.List;
+import java.util.Optional;
 
 /**
  * An input split for reading.
@@ -31,4 +33,32 @@ import java.io.Serializable;
 public interface Split extends Serializable {
 
     long rowCount();
+
+    /**
+     * If all files in this split can be read without merging, returns an {@link Optional} wrapping
+     * a list of {@link RawFile}s to be read without merging. Otherwise, returns {@link
+     * Optional#empty()}.
+     */
+    default Optional<List<RawFile>> convertToRawFiles() {
+        return Optional.empty();
+    }
+
+    /**
+     * Return the deletion file of the data file, indicating which row in the data file was deleted.
+     *
+     * <p>If there is no corresponding deletion file, the element will be null.
+     */
+    default Optional<List<DeletionFile>> deletionFiles() {
+        return Optional.empty();
+    }
+
+    /**
+     * * Return the index file of the data file, for example, bloom-filter index. All the type of
+     * indexes and columns will be stored in one single index file.
+     *
+     * <p>If there is no corresponding index file, the element will be null.
+     */
+    default Optional<List<IndexFile>> indexFiles() {
+        return Optional.empty();
+    }
 }

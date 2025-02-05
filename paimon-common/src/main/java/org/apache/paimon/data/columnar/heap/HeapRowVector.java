@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,38 +18,52 @@
 
 package org.apache.paimon.data.columnar.heap;
 
+import org.apache.paimon.data.columnar.ColumnVector;
 import org.apache.paimon.data.columnar.ColumnarRow;
 import org.apache.paimon.data.columnar.RowColumnVector;
 import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.data.columnar.writable.WritableColumnVector;
 
 /** This class represents a nullable heap row column vector. */
-public class HeapRowVector extends AbstractHeapVector
+public class HeapRowVector extends AbstractStructVector
         implements WritableColumnVector, RowColumnVector {
 
-    private final WritableColumnVector[] fields;
+    private VectorizedColumnBatch vectorizedColumnBatch;
 
-    public HeapRowVector(int len, WritableColumnVector... fields) {
-        super(len);
-        this.fields = fields;
-    }
-
-    public WritableColumnVector[] getFields() {
-        return fields;
+    public HeapRowVector(int len, ColumnVector... fields) {
+        super(len, fields);
+        vectorizedColumnBatch = new VectorizedColumnBatch(children);
     }
 
     @Override
     public ColumnarRow getRow(int i) {
-        ColumnarRow columnarRow = new ColumnarRow(new VectorizedColumnBatch(fields));
+        ColumnarRow columnarRow = new ColumnarRow(vectorizedColumnBatch);
         columnarRow.setRowId(i);
         return columnarRow;
     }
 
     @Override
+    public VectorizedColumnBatch getBatch() {
+        return vectorizedColumnBatch;
+    }
+
+    @Override
     public void reset() {
         super.reset();
-        for (WritableColumnVector field : fields) {
-            field.reset();
+        for (ColumnVector field : children) {
+            if (field instanceof WritableColumnVector) {
+                ((WritableColumnVector) field).reset();
+            }
         }
+    }
+
+    @Override
+    void reserveForHeapVector(int newCapacity) {
+        // Nothing to store.
+    }
+
+    public void setFields(WritableColumnVector[] fields) {
+        System.arraycopy(fields, 0, this.children, 0, fields.length);
+        this.vectorizedColumnBatch = new VectorizedColumnBatch(children);
     }
 }

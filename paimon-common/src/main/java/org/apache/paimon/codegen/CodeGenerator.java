@@ -26,35 +26,30 @@ import java.util.List;
 /** {@link GeneratedClass} generator. */
 public interface CodeGenerator {
 
-    GeneratedClass<Projection> generateProjection(
-            String name, RowType inputType, int[] inputMapping);
+    GeneratedClass<Projection> generateProjection(RowType inputType, int[] inputMapping);
 
     /**
      * Generate a {@link NormalizedKeyComputer}.
      *
-     * @param fieldTypes Both the input row field types and the sort key field types. Records are
-     *     compared by the first field, then the second field, then the third field and so on. All
-     *     fields are compared in ascending order.
+     * @param inputTypes input types.
+     * @param sortFields the sort key fields. Records are compared by the first field, then the
+     *     second field, then the third field and so on. All fields are compared in ascending order.
      */
     GeneratedClass<NormalizedKeyComputer> generateNormalizedKeyComputer(
-            List<DataType> fieldTypes, String name);
+            List<DataType> inputTypes, int[] sortFields);
 
     /**
      * Generate a {@link RecordComparator}.
      *
-     * @param fieldTypes Both the input row field types and the sort key field types. Records are *
-     *     compared by the first field, then the second field, then the third field and so on. All *
-     *     fields are compared in ascending order.
+     * @param inputTypes input types.
+     * @param sortFields the sort key fields. Records are compared by the first field, then the
+     *     second field, then the third field and so on. All fields are compared in ascending order.
+     * @param isAscendingOrder decide the sort key fields order whether is ascending
      */
     GeneratedClass<RecordComparator> generateRecordComparator(
-            List<DataType> fieldTypes, String name);
+            List<DataType> inputTypes, int[] sortFields, boolean isAscendingOrder);
 
-    /**
-     * Generate a {@link RecordEqualiser}.
-     *
-     * @param fieldTypes Both the input row field types and the sort key field types. Records are *
-     *     compared by the first field, then the second field, then the third field and so on. All *
-     *     fields are compared in ascending order.
-     */
-    GeneratedClass<RecordEqualiser> generateRecordEqualiser(List<DataType> fieldTypes, String name);
+    /** Generate a {@link RecordEqualiser} with fields. */
+    GeneratedClass<RecordEqualiser> generateRecordEqualiser(
+            List<DataType> fieldTypes, int[] fields);
 }

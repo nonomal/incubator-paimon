@@ -20,6 +20,7 @@ package org.apache.paimon.flink.sink;
 
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.operation.TagDeletion;
+import org.apache.paimon.table.sink.TagCallback;
 import org.apache.paimon.utils.SerializableSupplier;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.TagManager;
@@ -31,20 +32,16 @@ import org.apache.flink.metrics.groups.OperatorMetricGroup;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
-import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
-import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.OperatorSnapshotFutures;
-import org.apache.flink.streaming.api.operators.Output;
-import org.apache.flink.streaming.api.operators.SetupableStreamOperator;
 import org.apache.flink.streaming.api.operators.StreamTaskStateInitializer;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.LatencyMarker;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
-import org.apache.flink.streaming.runtime.tasks.StreamTask;
 import org.apache.flink.streaming.runtime.watermarkstatus.WatermarkStatus;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.NavigableSet;
@@ -56,9 +53,7 @@ import java.util.TreeSet;
  * time, tags are automatically created for each flink savepoint.
  */
 public class AutoTagForSavepointCommitterOperator<CommitT, GlobalCommitT>
-        implements OneInputStreamOperator<CommitT, CommitT>,
-                SetupableStreamOperator,
-                BoundedOneInput {
+        implements OneInputStreamOperator<CommitT, CommitT>, BoundedOneInput {
     public static final String SAVEPOINT_TAG_PREFIX = "savepoint-";
 
     private static final long serialVersionUID = 1L;
@@ -71,13 +66,19 @@ public class AutoTagForSavepointCommitterOperator<CommitT, GlobalCommitT>
 
     private final SerializableSupplier<TagDeletion> tagDeletionFactory;
 
+    private final SerializableSupplier<List<TagCallback>> callbacksSupplier;
+
     private final NavigableSet<Long> identifiersForTags;
 
-    protected SnapshotManager snapshotManager;
+    private final Duration tagTimeRetained;
 
-    protected TagManager tagManager;
+    private transient SnapshotManager snapshotManager;
 
-    protected TagDeletion tagDeletion;
+    private transient TagManager tagManager;
+
+    private transient TagDeletion tagDeletion;
+
+    private transient List<TagCallback> callbacks;
 
     private transient ListState<Long> identifiersForTagsState;
 
@@ -85,12 +86,16 @@ public class AutoTagForSavepointCommitterOperator<CommitT, GlobalCommitT>
             CommitterOperator<CommitT, GlobalCommitT> commitOperator,
             SerializableSupplier<SnapshotManager> snapshotManagerFactory,
             SerializableSupplier<TagManager> tagManagerFactory,
-            SerializableSupplier<TagDeletion> tagDeletionFactory) {
+            SerializableSupplier<TagDeletion> tagDeletionFactory,
+            SerializableSupplier<List<TagCallback>> callbacksSupplier,
+            Duration tagTimeRetained) {
         this.commitOperator = commitOperator;
         this.tagManagerFactory = tagManagerFactory;
         this.snapshotManagerFactory = snapshotManagerFactory;
         this.tagDeletionFactory = tagDeletionFactory;
+        this.callbacksSupplier = callbacksSupplier;
         this.identifiersForTags = new TreeSet<>();
+        this.tagTimeRetained = tagTimeRetained;
     }
 
     @Override
@@ -102,6 +107,7 @@ public class AutoTagForSavepointCommitterOperator<CommitT, GlobalCommitT>
             snapshotManager = snapshotManagerFactory.get();
             tagManager = tagManagerFactory.get();
             tagDeletion = tagDeletionFactory.get();
+            callbacks = callbacksSupplier.get();
 
             identifiersForTagsState =
                     commitOperator
@@ -148,7 +154,7 @@ public class AutoTagForSavepointCommitterOperator<CommitT, GlobalCommitT>
         identifiersForTags.remove(checkpointId);
         String tagName = SAVEPOINT_TAG_PREFIX + checkpointId;
         if (tagManager.tagExists(tagName)) {
-            tagManager.deleteTag(tagName, tagDeletion, snapshotManager);
+            tagManager.deleteTag(tagName, tagDeletion, snapshotManager, callbacks);
         }
     }
 
@@ -158,9 +164,8 @@ public class AutoTagForSavepointCommitterOperator<CommitT, GlobalCommitT>
                         commitOperator.getCommitUser(), identifiers);
         for (Snapshot snapshot : snapshotForTags) {
             String tagName = SAVEPOINT_TAG_PREFIX + snapshot.commitIdentifier();
-            if (!tagManager.tagExists(tagName)) {
-                tagManager.createTag(snapshot, tagName);
-            }
+            // shouldn't throw exception when tag exists
+            tagManager.createTag(snapshot, tagName, tagTimeRetained, callbacks, true);
         }
     }
 
@@ -242,20 +247,5 @@ public class AutoTagForSavepointCommitterOperator<CommitT, GlobalCommitT>
     @Override
     public void endInput() throws Exception {
         commitOperator.endInput();
-    }
-
-    @Override
-    public void setup(StreamTask containingTask, StreamConfig config, Output output) {
-        commitOperator.setup(containingTask, config, output);
-    }
-
-    @Override
-    public ChainingStrategy getChainingStrategy() {
-        return commitOperator.getChainingStrategy();
-    }
-
-    @Override
-    public void setChainingStrategy(ChainingStrategy strategy) {
-        commitOperator.setChainingStrategy(strategy);
     }
 }

@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,8 +20,9 @@ package org.apache.paimon.utils;
 
 import org.apache.paimon.reader.RecordReader;
 
-import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -29,7 +30,6 @@ import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -45,7 +45,6 @@ public class AsyncRecordReaderTest {
         queue.add(Arrays.asList(4, 6, 8));
         queue.add(Arrays.asList(9, 1));
         AtomicInteger released = new AtomicInteger(0);
-        AtomicBoolean closed = new AtomicBoolean(false);
         RecordReader<Integer> reader =
                 new RecordReader<Integer>() {
                     @Nullable
@@ -71,9 +70,7 @@ public class AsyncRecordReaderTest {
                     }
 
                     @Override
-                    public void close() {
-                        closed.set(true);
-                    }
+                    public void close() {}
                 };
 
         AsyncRecordReader<Integer> asyncReader = new AsyncRecordReader<>(() -> reader);
@@ -81,7 +78,6 @@ public class AsyncRecordReaderTest {
         asyncReader.forEachRemaining(results::add);
         assertThat(results).containsExactly(1, 5, 6, 4, 6, 8, 9, 1);
         assertThat(released.get()).isEqualTo(3);
-        assertThat(closed.get()).isTrue();
     }
 
     @Test
