@@ -23,15 +23,25 @@ import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.io.BundleRecords;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.memory.MemoryPoolFactory;
 import org.apache.paimon.memory.MemorySegmentPool;
-import org.apache.paimon.operation.AbstractFileStoreWrite;
+import org.apache.paimon.metrics.MetricRegistry;
+import org.apache.paimon.operation.BundleFileStoreWriter;
 import org.apache.paimon.operation.FileStoreWrite;
+import org.apache.paimon.operation.FileStoreWrite.State;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.Restorable;
+
+import javax.annotation.Nullable;
 
 import java.util.List;
 import java.util.concurrent.ExecutorService;
+import java.util.stream.Collectors;
 
 import static org.apache.paimon.utils.Preconditions.checkState;
 
@@ -40,22 +50,40 @@ import static org.apache.paimon.utils.Preconditions.checkState;
  *
  * @param <T> type of record to write into {@link FileStore}.
  */
-public class TableWriteImpl<T>
-        implements InnerTableWrite, Restorable<List<AbstractFileStoreWrite.State<T>>> {
+public class TableWriteImpl<T> implements InnerTableWrite, Restorable<List<State<T>>> {
 
-    private final AbstractFileStoreWrite<T> write;
+    private final RowType rowType;
+    private final FileStoreWrite<T> write;
     private final KeyAndBucketExtractor<InternalRow> keyAndBucketExtractor;
     private final RecordExtractor<T> recordExtractor;
+    @Nullable private final RowKindGenerator rowKindGenerator;
+    private final boolean ignoreDelete;
 
     private boolean batchCommitted = false;
+    private BucketMode bucketMode;
+
+    private final int[] notNullFieldIndex;
 
     public TableWriteImpl(
+            RowType rowType,
             FileStoreWrite<T> write,
             KeyAndBucketExtractor<InternalRow> keyAndBucketExtractor,
-            RecordExtractor<T> recordExtractor) {
-        this.write = (AbstractFileStoreWrite<T>) write;
+            RecordExtractor<T> recordExtractor,
+            @Nullable RowKindGenerator rowKindGenerator,
+            boolean ignoreDelete) {
+        this.rowType = rowType;
+        this.write = write;
         this.keyAndBucketExtractor = keyAndBucketExtractor;
         this.recordExtractor = recordExtractor;
+        this.rowKindGenerator = rowKindGenerator;
+        this.ignoreDelete = ignoreDelete;
+
+        List<String> notNullColumnNames =
+                rowType.getFields().stream()
+                        .filter(field -> !field.type().isNullable())
+                        .map(DataField::name)
+                        .collect(Collectors.toList());
+        this.notNullFieldIndex = rowType.getFieldIndices(notNullColumnNames);
     }
 
     @Override
@@ -65,8 +93,8 @@ public class TableWriteImpl<T>
     }
 
     @Override
-    public TableWriteImpl<T> isStreamingMode(boolean isStreamingMode) {
-        write.isStreamingMode(isStreamingMode);
+    public TableWriteImpl<T> withExecutionMode(boolean isStreamingMode) {
+        write.withExecutionMode(isStreamingMode);
         return this;
     }
 
@@ -92,6 +120,16 @@ public class TableWriteImpl<T>
         return this;
     }
 
+    public TableWriteImpl<T> withBucketMode(BucketMode bucketMode) {
+        this.bucketMode = bucketMode;
+        return this;
+    }
+
+    @Override
+    public void withInsertOnly(boolean insertOnly) {
+        write.withInsertOnly(insertOnly);
+    }
+
     @Override
     public BinaryRow getPartition(InternalRow row) {
         keyAndBucketExtractor.setRecord(row);
@@ -109,18 +147,55 @@ public class TableWriteImpl<T>
         writeAndReturn(row);
     }
 
+    @Override
+    public void write(InternalRow row, int bucket) throws Exception {
+        writeAndReturn(row, bucket);
+    }
+
+    @Override
+    public void writeBundle(BinaryRow partition, int bucket, BundleRecords bundle)
+            throws Exception {
+        if (write instanceof BundleFileStoreWriter) {
+            ((BundleFileStoreWriter) write).writeBundle(partition, bucket, bundle);
+        } else {
+            for (InternalRow row : bundle) {
+                write(row, bucket);
+            }
+        }
+    }
+
+    @Nullable
     public SinkRecord writeAndReturn(InternalRow row) throws Exception {
+        checkNullability(row);
+        RowKind rowKind = RowKindGenerator.getRowKind(rowKindGenerator, row);
+        if (ignoreDelete && rowKind.isRetract()) {
+            return null;
+        }
         SinkRecord record = toSinkRecord(row);
-        write.write(record.partition(), record.bucket(), recordExtractor.extract(record));
+        write.write(record.partition(), record.bucket(), recordExtractor.extract(record, rowKind));
         return record;
     }
 
-    @VisibleForTesting
-    public T writeAndReturnData(InternalRow row) throws Exception {
-        SinkRecord record = toSinkRecord(row);
-        T data = recordExtractor.extract(record);
-        write.write(record.partition(), record.bucket(), data);
-        return data;
+    @Nullable
+    public SinkRecord writeAndReturn(InternalRow row, int bucket) throws Exception {
+        checkNullability(row);
+        RowKind rowKind = RowKindGenerator.getRowKind(rowKindGenerator, row);
+        if (ignoreDelete && rowKind.isRetract()) {
+            return null;
+        }
+        SinkRecord record = toSinkRecord(row, bucket);
+        write.write(record.partition(), bucket, recordExtractor.extract(record, rowKind));
+        return record;
+    }
+
+    private void checkNullability(InternalRow row) {
+        for (int idx : notNullFieldIndex) {
+            if (row.isNullAt(idx)) {
+                String columnName = rowType.getFields().get(idx).name();
+                throw new RuntimeException(
+                        String.format("Cannot write null to non-null column(%s)", columnName));
+            }
+        }
     }
 
     private SinkRecord toSinkRecord(InternalRow row) {
@@ -132,11 +207,20 @@ public class TableWriteImpl<T>
                 row);
     }
 
+    private SinkRecord toSinkRecord(InternalRow row, int bucket) {
+        keyAndBucketExtractor.setRecord(row);
+        return new SinkRecord(
+                keyAndBucketExtractor.partition(),
+                bucket,
+                keyAndBucketExtractor.trimmedPrimaryKey(),
+                row);
+    }
+
     public SinkRecord toLogRecord(SinkRecord record) {
         keyAndBucketExtractor.setRecord(record.row());
         return new SinkRecord(
                 record.partition(),
-                record.bucket(),
+                bucketMode == BucketMode.BUCKET_UNAWARE ? -1 : record.bucket(),
                 keyAndBucketExtractor.logPrimaryKey(),
                 record.row());
     }
@@ -144,6 +228,12 @@ public class TableWriteImpl<T>
     @Override
     public void compact(BinaryRow partition, int bucket, boolean fullCompaction) throws Exception {
         write.compact(partition, bucket, fullCompaction);
+    }
+
+    @Override
+    public TableWriteImpl<T> withMetricRegistry(MetricRegistry metricRegistry) {
+        write.withMetricRegistry(metricRegistry);
+        return this;
     }
 
     /**
@@ -176,23 +266,23 @@ public class TableWriteImpl<T>
     }
 
     @Override
-    public List<AbstractFileStoreWrite.State<T>> checkpoint() {
+    public List<State<T>> checkpoint() {
         return write.checkpoint();
     }
 
     @Override
-    public void restore(List<AbstractFileStoreWrite.State<T>> state) {
+    public void restore(List<State<T>> state) {
         write.restore(state);
     }
 
     @VisibleForTesting
-    public AbstractFileStoreWrite<T> getWrite() {
+    public FileStoreWrite<T> getWrite() {
         return write;
     }
 
     /** Extractor to extract {@link T} from the {@link SinkRecord}. */
     public interface RecordExtractor<T> {
 
-        T extract(SinkRecord record);
+        T extract(SinkRecord record, RowKind rowKind);
     }
 }

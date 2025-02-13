@@ -53,6 +53,9 @@ public interface RecordWriter<T> {
     /** Get all data files maintained by this writer. */
     Collection<DataFileMeta> dataFiles();
 
+    /** Get max sequence number of records written by this writer. */
+    long maxSequenceNumber();
+
     /**
      * Prepare for a commit.
      *
@@ -61,11 +64,23 @@ public interface RecordWriter<T> {
      */
     CommitIncrement prepareCommit(boolean waitCompaction) throws Exception;
 
+    /** Check if a compaction is in progress, or if a compaction result remains to be fetched. */
+    boolean isCompacting();
+
     /**
      * Sync the writer. The structure related to file reading and writing is thread unsafe, there
      * are asynchronous threads inside the writer, which should be synced before reading data.
      */
     void sync() throws Exception;
+
+    /**
+     * This method is called when the insert only status of the records changes.
+     *
+     * @param insertOnly If true, all the following records would be of {@link
+     *     org.apache.paimon.types.RowKind#INSERT}, and no two records would have the same primary
+     *     key.
+     */
+    void withInsertOnly(boolean insertOnly);
 
     /** Close this writer, the call will delete newly generated but not committed files. */
     void close() throws Exception;

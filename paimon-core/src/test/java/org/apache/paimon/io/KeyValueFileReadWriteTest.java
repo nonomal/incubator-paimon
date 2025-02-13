@@ -25,21 +25,20 @@ import org.apache.paimon.TestKeyValueGenerator;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.serializer.InternalRowSerializer;
+import org.apache.paimon.deletionvectors.DeletionVector;
 import org.apache.paimon.format.FlushingFileFormat;
+import org.apache.paimon.format.SimpleColStats;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileIOFinder;
 import org.apache.paimon.fs.FileStatus;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReaderIterator;
-import org.apache.paimon.stats.FieldStatsArraySerializer;
 import org.apache.paimon.stats.StatsTestUtils;
-import org.apache.paimon.types.BigIntType;
-import org.apache.paimon.types.DataType;
-import org.apache.paimon.types.IntType;
+import org.apache.paimon.table.SpecialFields;
 import org.apache.paimon.types.RowType;
-import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.utils.CloseableIterator;
 import org.apache.paimon.utils.FailingFileIO;
 import org.apache.paimon.utils.FileStorePathFactory;
@@ -47,6 +46,8 @@ import org.apache.paimon.utils.FileStorePathFactory;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -60,6 +61,9 @@ import java.util.function.Function;
 import static org.apache.paimon.TestKeyValueGenerator.DEFAULT_ROW_TYPE;
 import static org.apache.paimon.TestKeyValueGenerator.KEY_TYPE;
 import static org.apache.paimon.TestKeyValueGenerator.createTestSchemaManager;
+import static org.apache.paimon.io.DataFileTestUtils.newFile;
+import static org.apache.paimon.stats.StatsTestUtils.convertWithoutSchemaEvolution;
+import static org.apache.paimon.utils.FileStorePathFactoryTest.createNonPartFactory;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -75,7 +79,10 @@ public class KeyValueFileReadWriteTest {
     public void testReadNonExistentFile() {
         KeyValueFileReaderFactory readerFactory =
                 createReaderFactory(tempDir.toString(), "avro", null, null);
-        assertThatThrownBy(() -> readerFactory.createRecordReader(0, "dummy_file.avro", 1, 0))
+        assertThatThrownBy(
+                        () ->
+                                readerFactory.createRecordReader(
+                                        newFile("non_avro_file.avro", 0, 0, 1, 0)))
                 .hasMessageContaining(
                         "you can configure 'snapshot.time-retained' option with a larger value.");
     }
@@ -96,7 +103,7 @@ public class KeyValueFileReadWriteTest {
         DataFileMetaSerializer serializer = new DataFileMetaSerializer();
 
         RollingFileWriter<KeyValue, DataFileMeta> writer =
-                writerFactory.createRollingMergeTreeFileWriter(0);
+                writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
         writer.write(CloseableIterator.fromList(data.content, kv -> {}));
         writer.close();
         List<DataFileMeta> actualMetas = writer.result();
@@ -125,7 +132,8 @@ public class KeyValueFileReadWriteTest {
                         FailingFileIO.getFailingPath(failingName, tempDir.toString()), "avro");
 
         try {
-            FileWriter<KeyValue, ?> writer = writerFactory.createRollingMergeTreeFileWriter(0);
+            FileWriter<KeyValue, ?> writer =
+                    writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
             writer.write(CloseableIterator.fromList(data.content, kv -> {}));
         } catch (Throwable e) {
             if (e.getCause() != null) {
@@ -143,27 +151,22 @@ public class KeyValueFileReadWriteTest {
     }
 
     @Test
-    public void testKeyProjection() throws Exception {
+    public void testReadKeyType() throws Exception {
         DataFileTestDataGenerator.Data data = gen.next();
         KeyValueFileWriterFactory writerFactory = createWriterFactory(tempDir.toString(), "avro");
         DataFileMetaSerializer serializer = new DataFileMetaSerializer();
 
         RollingFileWriter<KeyValue, DataFileMeta> writer =
-                writerFactory.createRollingMergeTreeFileWriter(0);
+                writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
         writer.write(CloseableIterator.fromList(data.content, kv -> {}));
         writer.close();
         List<DataFileMeta> actualMetas = writer.result();
 
         // projection: (shopId, orderId) -> (orderId)
+        RowType readKeyType = KEY_TYPE.project(SpecialFields.KEY_FIELD_PREFIX + "orderId");
         KeyValueFileReaderFactory readerFactory =
-                createReaderFactory(tempDir.toString(), "avro", new int[][] {new int[] {1}}, null);
-        RowType projectedKeyType =
-                RowType.builder()
-                        .fields(
-                                new DataType[] {new BigIntType(false)},
-                                new String[] {"key_orderId"})
-                        .build();
-        InternalRowSerializer projectedKeySerializer = new InternalRowSerializer(projectedKeyType);
+                createReaderFactory(tempDir.toString(), "avro", readKeyType, null);
+        InternalRowSerializer projectedKeySerializer = new InternalRowSerializer(readKeyType);
         assertData(
                 data,
                 actualMetas,
@@ -181,13 +184,13 @@ public class KeyValueFileReadWriteTest {
     }
 
     @Test
-    public void testValueProjection() throws Exception {
+    public void testReadValueType() throws Exception {
         DataFileTestDataGenerator.Data data = gen.next();
         KeyValueFileWriterFactory writerFactory = createWriterFactory(tempDir.toString(), "avro");
         DataFileMetaSerializer serializer = new DataFileMetaSerializer();
 
         RollingFileWriter<KeyValue, DataFileMeta> writer =
-                writerFactory.createRollingMergeTreeFileWriter(0);
+                writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
         writer.write(CloseableIterator.fromList(data.content, kv -> {}));
         writer.close();
         List<DataFileMeta> actualMetas = writer.result();
@@ -195,23 +198,10 @@ public class KeyValueFileReadWriteTest {
         // projection:
         // (dt, hr, shopId, orderId, itemId, priceAmount, comment) ->
         // (shopId, itemId, dt, hr)
+        RowType readValueType = DEFAULT_ROW_TYPE.project("shopId", "itemId", "dt", "hr");
         KeyValueFileReaderFactory readerFactory =
-                createReaderFactory(
-                        tempDir.toString(),
-                        "avro",
-                        null,
-                        new int[][] {new int[] {2}, new int[] {4}, new int[] {0}, new int[] {1}});
-        RowType projectedValueType =
-                RowType.of(
-                        new DataType[] {
-                            new IntType(false),
-                            new BigIntType(),
-                            new VarCharType(false, 8),
-                            new IntType(false)
-                        },
-                        new String[] {"shopId", "itemId", "dt", "hr"});
-        InternalRowSerializer projectedValueSerializer =
-                new InternalRowSerializer(projectedValueType);
+                createReaderFactory(tempDir.toString(), "avro", null, readValueType);
+        InternalRowSerializer projectedValueSerializer = new InternalRowSerializer(readValueType);
         assertData(
                 data,
                 actualMetas,
@@ -241,7 +231,14 @@ public class KeyValueFileReadWriteTest {
                         path,
                         RowType.of(),
                         CoreOptions.PARTITION_DEFAULT_NAME.defaultValue(),
-                        format);
+                        format,
+                        CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                        CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                        CoreOptions.PARTITION_GENERATE_LEGCY_NAME.defaultValue(),
+                        CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                        CoreOptions.FILE_COMPRESSION.defaultValue(),
+                        null,
+                        null);
         int suggestedFileSize = ThreadLocalRandom.current().nextInt(8192) + 1024;
         FileIO fileIO = FileIOFinder.find(path);
         Options options = new Options();
@@ -255,7 +252,14 @@ public class KeyValueFileReadWriteTest {
                         path,
                         RowType.of(),
                         CoreOptions.PARTITION_DEFAULT_NAME.defaultValue(),
-                        CoreOptions.FILE_FORMAT.defaultValue().toString()));
+                        CoreOptions.FILE_FORMAT.defaultValue().toString(),
+                        CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                        CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                        CoreOptions.PARTITION_GENERATE_LEGCY_NAME.defaultValue(),
+                        CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                        CoreOptions.FILE_COMPRESSION.defaultValue(),
+                        null,
+                        null));
 
         return KeyValueFileWriterFactory.builder(
                         fileIO,
@@ -272,28 +276,28 @@ public class KeyValueFileReadWriteTest {
     }
 
     private KeyValueFileReaderFactory createReaderFactory(
-            String pathStr, String format, int[][] keyProjection, int[][] valueProjection) {
+            String pathStr, String format, RowType readKeyType, RowType readValueType) {
         Path path = new Path(pathStr);
         FileIO fileIO = FileIOFinder.find(path);
-        FileStorePathFactory pathFactory = new FileStorePathFactory(path);
+        FileStorePathFactory pathFactory = createNonPartFactory(path);
         KeyValueFileReaderFactory.Builder builder =
                 KeyValueFileReaderFactory.builder(
                         fileIO,
                         createTestSchemaManager(path),
-                        0,
+                        createTestSchemaManager(path).schema(0),
                         KEY_TYPE,
                         DEFAULT_ROW_TYPE,
                         ignore -> new FlushingFileFormat(format),
                         pathFactory,
                         new TestKeyValueGenerator.TestKeyValueFieldsExtractor(),
                         new CoreOptions(new HashMap<>()));
-        if (keyProjection != null) {
-            builder.withKeyProjection(keyProjection);
+        if (readKeyType != null) {
+            builder.withReadKeyType(readKeyType);
         }
-        if (valueProjection != null) {
-            builder.withValueProjection(valueProjection);
+        if (readValueType != null) {
+            builder.withReadValueType(readValueType);
         }
-        return builder.build(BinaryRow.EMPTY_ROW, 0);
+        return builder.build(BinaryRow.EMPTY_ROW, 0, DeletionVector.emptyFactory());
     }
 
     private void assertData(
@@ -309,12 +313,7 @@ public class KeyValueFileReadWriteTest {
         for (DataFileMeta meta : actualMetas) {
             // check the contents of data file
             CloseableIterator<KeyValue> actualKvsIterator =
-                    new RecordReaderIterator<>(
-                            readerFactory.createRecordReader(
-                                    meta.schemaId(),
-                                    meta.fileName(),
-                                    meta.fileSize(),
-                                    meta.level()));
+                    new RecordReaderIterator<>(readerFactory.createRecordReader(meta));
             while (actualKvsIterator.hasNext()) {
                 assertThat(expectedIterator.hasNext()).isTrue();
                 KeyValue actualKv = actualKvsIterator.next();
@@ -338,10 +337,6 @@ public class KeyValueFileReadWriteTest {
 
     private void checkRollingFiles(
             DataFileMeta expected, List<DataFileMeta> actual, long suggestedFileSize) {
-        FieldStatsArraySerializer keyStatsConverter = new FieldStatsArraySerializer(KEY_TYPE);
-        FieldStatsArraySerializer valueStatsConverter =
-                new FieldStatsArraySerializer(DEFAULT_ROW_TYPE);
-
         // all but last file should be no smaller than suggestedFileSize
         for (int i = 0; i + 1 < actual.size(); i++) {
             assertThat(actual.get(i).fileSize() >= suggestedFileSize).isTrue();
@@ -358,19 +353,20 @@ public class KeyValueFileReadWriteTest {
         assertThat(actual.get(actual.size() - 1).maxKey()).isEqualTo(expected.maxKey());
 
         // check stats
+        SimpleColStats[] keyStats = convertWithoutSchemaEvolution(expected.keyStats(), KEY_TYPE);
         for (int i = 0; i < KEY_TYPE.getFieldCount(); i++) {
             int idx = i;
             StatsTestUtils.checkRollingFileStats(
-                    keyStatsConverter.fromBinary(expected.keyStats())[i],
+                    keyStats[i],
                     actual,
-                    m -> keyStatsConverter.fromBinary(m.keyStats())[idx]);
+                    m -> convertWithoutSchemaEvolution(m.keyStats(), KEY_TYPE)[idx]);
         }
         for (int i = 0; i < DEFAULT_ROW_TYPE.getFieldCount(); i++) {
             int idx = i;
             StatsTestUtils.checkRollingFileStats(
-                    valueStatsConverter.fromBinary(expected.valueStats())[i],
+                    convertWithoutSchemaEvolution(expected.valueStats(), DEFAULT_ROW_TYPE)[i],
                     actual,
-                    m -> valueStatsConverter.fromBinary(m.valueStats())[idx]);
+                    m -> convertWithoutSchemaEvolution(m.valueStats(), DEFAULT_ROW_TYPE)[idx]);
         }
 
         // expected.minSequenceNumber == min(minSequenceNumber)
@@ -385,5 +381,30 @@ public class KeyValueFileReadWriteTest {
         for (DataFileMeta meta : actual) {
             assertThat(meta.level()).isEqualTo(expected.level());
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"parquet", "orc", "avro"})
+    public void testReaderUseFileSizeFromMetadata(String format) throws Exception {
+        DataFileTestDataGenerator.Data data = gen.next();
+        KeyValueFileWriterFactory writerFactory = createWriterFactory(tempDir.toString(), format);
+        DataFileMetaSerializer serializer = new DataFileMetaSerializer();
+
+        RollingFileWriter<KeyValue, DataFileMeta> writer =
+                writerFactory.createRollingMergeTreeFileWriter(0, FileSource.APPEND);
+        writer.write(CloseableIterator.fromList(data.content, kv -> {}));
+        writer.close();
+        List<DataFileMeta> actualMetas = writer.result();
+
+        KeyValueFileReaderFactory readerFactory =
+                createReaderFactory(tempDir.toString(), format, null, null);
+        assertData(
+                data,
+                actualMetas,
+                TestKeyValueGenerator.KEY_SERIALIZER,
+                TestKeyValueGenerator.DEFAULT_ROW_SERIALIZER,
+                serializer,
+                readerFactory,
+                kv -> kv);
     }
 }

@@ -32,6 +32,7 @@ import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.io.DataInputView;
 import org.apache.paimon.io.DataOutputView;
 import org.apache.paimon.memory.MemorySegment;
+import org.apache.paimon.memory.MemorySlice;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
@@ -42,6 +43,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Objects;
 
 import static org.apache.paimon.data.BinaryRow.HEADER_SIZE_IN_BITS;
@@ -50,6 +52,7 @@ import static org.apache.paimon.memory.MemorySegmentUtils.bitSet;
 import static org.apache.paimon.types.DataTypeChecks.getPrecision;
 import static org.apache.paimon.types.DataTypeChecks.getScale;
 import static org.apache.paimon.utils.Preconditions.checkArgument;
+import static org.apache.paimon.utils.VarLengthIntUtils.MAX_VAR_INT_SIZE;
 
 /** A {@link Serializer} for {@link InternalRow} using compacted binary. */
 public class RowCompactedSerializer implements Serializer<InternalRow> {
@@ -159,6 +162,10 @@ public class RowCompactedSerializer implements Serializer<InternalRow> {
         return row;
     }
 
+    public Comparator<MemorySlice> createSliceComparator() {
+        return new SliceComparator(rowType);
+    }
+
     private static FieldWriter createFieldWriter(DataType fieldType) {
         final FieldWriter fieldWriter;
         switch (fieldType.getTypeRoot()) {
@@ -229,7 +236,12 @@ public class RowCompactedSerializer implements Serializer<InternalRow> {
                         (writer, pos, value) -> writer.writeRow((InternalRow) value, rowSerializer);
                 break;
             default:
-                throw new IllegalArgumentException();
+                String msg =
+                        String.format(
+                                "type %s not support in %s",
+                                fieldType.getTypeRoot().toString(),
+                                RowCompactedSerializer.class.getName());
+                throw new IllegalArgumentException(msg);
         }
 
         if (!fieldType.isNullable()) {
@@ -301,7 +313,12 @@ public class RowCompactedSerializer implements Serializer<InternalRow> {
                 fieldReader = (reader, pos) -> reader.readRow(serializer);
                 break;
             default:
-                throw new IllegalArgumentException();
+                String msg =
+                        String.format(
+                                "type %s not support in %s",
+                                fieldType.getTypeRoot().toString(),
+                                RowCompactedSerializer.class.getName());
+                throw new IllegalArgumentException(msg);
         }
         if (!fieldType.isNullable()) {
             return fieldReader;
@@ -415,7 +432,7 @@ public class RowCompactedSerializer implements Serializer<InternalRow> {
 
         private void writeUnsignedInt(int value) {
             checkArgument(value >= 0);
-            ensureCapacity(5);
+            ensureCapacity(MAX_VAR_INT_SIZE);
             int len = VarLengthIntUtils.encodeInt(buffer, position, value);
             position += len;
         }
@@ -504,6 +521,7 @@ public class RowCompactedSerializer implements Serializer<InternalRow> {
 
         private MemorySegment segment;
         private MemorySegment[] segments;
+        private int offset;
         private int position;
 
         private RowReader(int headerSizeInBytes) {
@@ -511,17 +529,22 @@ public class RowCompactedSerializer implements Serializer<InternalRow> {
         }
 
         private void pointTo(byte[] bytes) {
-            this.segment = MemorySegment.wrap(bytes);
+            pointTo(MemorySegment.wrap(bytes), 0);
+        }
+
+        private void pointTo(MemorySegment segment, int offset) {
+            this.segment = segment;
             this.segments = new MemorySegment[] {segment};
-            this.position = headerSizeInBytes;
+            this.offset = offset;
+            this.position = offset + headerSizeInBytes;
         }
 
         private RowKind readRowKind() {
-            return RowKind.fromByteValue(segment.get(0));
+            return RowKind.fromByteValue(segment.get(offset));
         }
 
         private boolean isNullAt(int pos) {
-            return bitGet(segment, 0, pos + HEADER_SIZE_IN_BITS);
+            return bitGet(segment, offset, pos + HEADER_SIZE_IN_BITS);
         }
 
         private boolean readBoolean() {
@@ -622,6 +645,50 @@ public class RowCompactedSerializer implements Serializer<InternalRow> {
         private InternalRow readRow(RowCompactedSerializer serializer) {
             byte[] bytes = readBinary();
             return serializer.deserialize(bytes);
+        }
+    }
+
+    private static class SliceComparator implements Comparator<MemorySlice> {
+
+        private final RowReader reader1;
+        private final RowReader reader2;
+        private final FieldReader[] fieldReaders;
+
+        public SliceComparator(RowType rowType) {
+            int bitSetInBytes = calculateBitSetInBytes(rowType.getFieldCount());
+            this.reader1 = new RowReader(bitSetInBytes);
+            this.reader2 = new RowReader(bitSetInBytes);
+            this.fieldReaders = new FieldReader[rowType.getFieldCount()];
+            for (int i = 0; i < rowType.getFieldCount(); i++) {
+                fieldReaders[i] = createFieldReader(rowType.getTypeAt(i));
+            }
+        }
+
+        @Override
+        public int compare(MemorySlice slice1, MemorySlice slice2) {
+            reader1.pointTo(slice1.segment(), slice1.offset());
+            reader2.pointTo(slice2.segment(), slice2.offset());
+            for (int i = 0; i < fieldReaders.length; i++) {
+                boolean isNull1 = reader1.isNullAt(i);
+                boolean isNull2 = reader2.isNullAt(i);
+                if (!isNull1 || !isNull2) {
+                    if (isNull1) {
+                        return -1;
+                    } else if (isNull2) {
+                        return 1;
+                    } else {
+                        FieldReader fieldReader = fieldReaders[i];
+                        Object o1 = fieldReader.readField(reader1, i);
+                        Object o2 = fieldReader.readField(reader2, i);
+                        @SuppressWarnings({"unchecked", "rawtypes"})
+                        int comp = ((Comparable) o1).compareTo(o2);
+                        if (comp != 0) {
+                            return comp;
+                        }
+                    }
+                }
+            }
+            return 0;
         }
     }
 }

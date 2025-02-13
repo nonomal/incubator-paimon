@@ -20,6 +20,7 @@ package org.apache.paimon.flink.sink.cdc;
 
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.flink.sink.MultiTableCommittable;
@@ -28,6 +29,7 @@ import org.apache.paimon.flink.sink.StateUtils;
 import org.apache.paimon.flink.sink.StoreSinkWrite;
 import org.apache.paimon.flink.sink.StoreSinkWriteImpl;
 import org.apache.paimon.flink.sink.StoreSinkWriteState;
+import org.apache.paimon.flink.sink.StoreSinkWriteStateImpl;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
 import org.apache.paimon.memory.MemoryPoolFactory;
 import org.apache.paimon.options.Options;
@@ -37,6 +39,9 @@ import org.apache.paimon.utils.ExecutorThreadFactory;
 
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
+import org.apache.flink.streaming.api.operators.StreamOperator;
+import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
+import org.apache.flink.streaming.api.operators.StreamOperatorParameters;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 
 import java.io.IOException;
@@ -49,7 +54,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.flink.sink.cdc.CdcRecordStoreWriteOperator.LOG_CORRUPT_RECORD;
+import static org.apache.paimon.flink.sink.cdc.CdcRecordStoreWriteOperator.MAX_RETRY_NUM_TIMES;
 import static org.apache.paimon.flink.sink.cdc.CdcRecordStoreWriteOperator.RETRY_SLEEP_TIME;
+import static org.apache.paimon.flink.sink.cdc.CdcRecordStoreWriteOperator.SKIP_CORRUPT_RECORD;
 import static org.apache.paimon.flink.sink.cdc.CdcRecordUtils.toGenericRow;
 
 /**
@@ -63,7 +71,7 @@ public class CdcRecordStoreMultiWriteOperator
 
     private final StoreSinkWrite.WithWriteBufferProvider storeSinkWriteProvider;
     private final String initialCommitUser;
-    private final Catalog.Loader catalogLoader;
+    private final CatalogLoader catalogLoader;
 
     private MemoryPoolFactory memoryPoolFactory;
     private Catalog catalog;
@@ -72,19 +80,17 @@ public class CdcRecordStoreMultiWriteOperator
     private Map<Identifier, StoreSinkWrite> writes;
     private String commitUser;
     private ExecutorService compactExecutor;
-    private final Map<String, String> dynamicOptions;
 
-    public CdcRecordStoreMultiWriteOperator(
-            Catalog.Loader catalogLoader,
+    private CdcRecordStoreMultiWriteOperator(
+            StreamOperatorParameters<MultiTableCommittable> parameters,
+            CatalogLoader catalogLoader,
             StoreSinkWrite.WithWriteBufferProvider storeSinkWriteProvider,
             String initialCommitUser,
-            Options options,
-            Map<String, String> dynamicOptions) {
-        super(options);
+            Options options) {
+        super(parameters, options);
         this.catalogLoader = catalogLoader;
         this.storeSinkWriteProvider = storeSinkWriteProvider;
         this.initialCommitUser = initialCommitUser;
-        this.dynamicOptions = dynamicOptions;
     }
 
     @Override
@@ -101,7 +107,7 @@ public class CdcRecordStoreMultiWriteOperator
                         context, "commit_user_state", String.class, initialCommitUser);
 
         // TODO: should use CdcRecordMultiChannelComputer to filter
-        state = new StoreSinkWriteState(context, (tableName, partition, bucket) -> true);
+        state = new StoreSinkWriteStateImpl(context, (tableName, partition, bucket) -> true);
         tables = new HashMap<>();
         writes = new HashMap<>();
         compactExecutor =
@@ -119,6 +125,9 @@ public class CdcRecordStoreMultiWriteOperator
         Identifier tableId = Identifier.create(databaseName, tableName);
 
         FileStoreTable table = getTable(tableId);
+
+        int retryCnt = table.coreOptions().toConfiguration().get(MAX_RETRY_NUM_TIMES);
+        boolean skipCorruptRecord = table.coreOptions().toConfiguration().get(SKIP_CORRUPT_RECORD);
 
         // all table write should share one write buffer so that writers can preempt memory
         // from those of other tables
@@ -142,18 +151,22 @@ public class CdcRecordStoreMultiWriteOperator
                                         commitUser,
                                         state,
                                         getContainingTask().getEnvironment().getIOManager(),
-                                        memoryPoolFactory));
+                                        memoryPoolFactory,
+                                        getMetricGroup()));
 
         ((StoreSinkWriteImpl) write).withCompactExecutor(compactExecutor);
 
+        boolean logCorruptRecord = table.coreOptions().toConfiguration().get(LOG_CORRUPT_RECORD);
         Optional<GenericRow> optionalConverted =
-                toGenericRow(record.record(), table.schema().fields());
+                toGenericRow(record.record(), table.schema().fields(), logCorruptRecord);
         if (!optionalConverted.isPresent()) {
             FileStoreTable latestTable = table;
-            while (true) {
+            for (int retry = 0; retry < retryCnt; ++retry) {
                 latestTable = latestTable.copyWithLatestSchema();
                 tables.put(tableId, latestTable);
-                optionalConverted = toGenericRow(record.record(), latestTable.schema().fields());
+                optionalConverted =
+                        toGenericRow(
+                                record.record(), latestTable.schema().fields(), logCorruptRecord);
                 if (optionalConverted.isPresent()) {
                     break;
                 }
@@ -167,10 +180,22 @@ public class CdcRecordStoreMultiWriteOperator
             write.replace(latestTable);
         }
 
-        try {
-            write.write(optionalConverted.get());
-        } catch (Exception e) {
-            throw new IOException(e);
+        if (!optionalConverted.isPresent()) {
+            if (skipCorruptRecord) {
+                LOG.warn(
+                        "Skipping corrupt or unparsable record {}",
+                        (logCorruptRecord ? record : "<redacted>"));
+            } else {
+                throw new RuntimeException(
+                        "Unable to process element. Possibly a corrupt record: "
+                                + (logCorruptRecord ? record : "<redacted>"));
+            }
+        } else {
+            try {
+                write.write(optionalConverted.get());
+            } catch (Exception e) {
+                throw new IOException(e);
+            }
         }
     }
 
@@ -180,7 +205,6 @@ public class CdcRecordStoreMultiWriteOperator
             while (true) {
                 try {
                     table = (FileStoreTable) catalog.getTable(tableId);
-                    table.copy(dynamicOptions);
                     tables.put(tableId, table);
                     break;
                 } catch (Catalog.TableNotExistException e) {
@@ -191,9 +215,11 @@ public class CdcRecordStoreMultiWriteOperator
             }
         }
 
-        if (table.bucketMode() != BucketMode.FIXED) {
+        if (table.bucketMode() != BucketMode.HASH_FIXED) {
             throw new UnsupportedOperationException(
-                    "Unified Sink only supports FIXED bucket mode, but is " + table.bucketMode());
+                    String.format(
+                            "Combine mode Sink only supports FIXED bucket mode, but %s is %s",
+                            table.name(), table.bucketMode()));
         }
         return table;
     }
@@ -217,6 +243,10 @@ public class CdcRecordStoreMultiWriteOperator
         if (compactExecutor != null) {
             compactExecutor.shutdownNow();
         }
+        if (catalog != null) {
+            catalog.close();
+            catalog = null;
+        }
     }
 
     @Override
@@ -226,12 +256,17 @@ public class CdcRecordStoreMultiWriteOperator
         for (Map.Entry<Identifier, StoreSinkWrite> entry : writes.entrySet()) {
             Identifier key = entry.getKey();
             StoreSinkWrite write = entry.getValue();
-            committables.addAll(
-                    write.prepareCommit(waitCompaction, checkpointId).stream()
-                            .map(
-                                    committable ->
-                                            MultiTableCommittable.fromCommittable(key, committable))
-                            .collect(Collectors.toList()));
+            try {
+                committables.addAll(
+                        write.prepareCommit(waitCompaction, checkpointId).stream()
+                                .map(
+                                        committable ->
+                                                MultiTableCommittable.fromCommittable(
+                                                        key, committable))
+                                .collect(Collectors.toList()));
+            } catch (Exception e) {
+                throw new IOException("Failed to prepare commit for table: " + key.toString(), e);
+            }
         }
         return committables;
     }
@@ -249,5 +284,43 @@ public class CdcRecordStoreMultiWriteOperator
     @VisibleForTesting
     public String commitUser() {
         return commitUser;
+    }
+
+    /** {@link StreamOperatorFactory} of {@link CdcRecordStoreMultiWriteOperator}. */
+    public static class Factory
+            extends PrepareCommitOperator.Factory<CdcMultiplexRecord, MultiTableCommittable> {
+        private final StoreSinkWrite.WithWriteBufferProvider storeSinkWriteProvider;
+        private final String initialCommitUser;
+        private final CatalogLoader catalogLoader;
+
+        public Factory(
+                CatalogLoader catalogLoader,
+                StoreSinkWrite.WithWriteBufferProvider storeSinkWriteProvider,
+                String initialCommitUser,
+                Options options) {
+            super(options);
+            this.catalogLoader = catalogLoader;
+            this.storeSinkWriteProvider = storeSinkWriteProvider;
+            this.initialCommitUser = initialCommitUser;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <T extends StreamOperator<MultiTableCommittable>> T createStreamOperator(
+                StreamOperatorParameters<MultiTableCommittable> parameters) {
+            return (T)
+                    new CdcRecordStoreMultiWriteOperator(
+                            parameters,
+                            catalogLoader,
+                            storeSinkWriteProvider,
+                            initialCommitUser,
+                            options);
+        }
+
+        @Override
+        @SuppressWarnings("rawtypes")
+        public Class<? extends StreamOperator> getStreamOperatorClass(ClassLoader classLoader) {
+            return CdcRecordStoreMultiWriteOperator.class;
+        }
     }
 }

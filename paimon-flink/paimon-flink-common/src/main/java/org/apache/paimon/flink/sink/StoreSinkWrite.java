@@ -27,6 +27,7 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.SinkRecord;
 import org.apache.paimon.table.sink.TableWriteImpl;
 
+import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
 
 import javax.annotation.Nullable;
@@ -38,7 +39,20 @@ import java.util.List;
 /** Helper class of {@link PrepareCommitOperator} for different types of paimon sinks. */
 public interface StoreSinkWrite {
 
+    /**
+     * This method is called when the insert only status of the records changes.
+     *
+     * @param insertOnly If true, all the following records would be of {@link
+     *     org.apache.paimon.types.RowKind#INSERT}, and no two records would have the same primary
+     *     key.
+     */
+    void withInsertOnly(boolean insertOnly);
+
+    @Nullable
     SinkRecord write(InternalRow rowData) throws Exception;
+
+    @Nullable
+    SinkRecord write(InternalRow rowData, int bucket) throws Exception;
 
     SinkRecord toLogRecord(SinkRecord record);
 
@@ -70,23 +84,33 @@ public interface StoreSinkWrite {
     @FunctionalInterface
     interface Provider extends Serializable {
 
+        /**
+         * TODO: The argument list has become too complicated. Build {@link TableWriteImpl} directly
+         * in caller and simplify the argument list.
+         */
         StoreSinkWrite provide(
                 FileStoreTable table,
                 String commitUser,
                 StoreSinkWriteState state,
                 IOManager ioManager,
-                @Nullable MemorySegmentPool memoryPool);
+                @Nullable MemorySegmentPool memoryPool,
+                @Nullable MetricGroup metricGroup);
     }
 
     /** Provider of {@link StoreSinkWrite} that uses given write buffer. */
     @FunctionalInterface
     interface WithWriteBufferProvider extends Serializable {
 
+        /**
+         * TODO: The argument list has become too complicated. Build {@link TableWriteImpl} directly
+         * in caller and simplify the argument list.
+         */
         StoreSinkWrite provide(
                 FileStoreTable table,
                 String commitUser,
                 StoreSinkWriteState state,
                 IOManager ioManager,
-                @Nullable MemoryPoolFactory memoryPoolFactory);
+                @Nullable MemoryPoolFactory memoryPoolFactory,
+                MetricGroup metricGroup);
     }
 }

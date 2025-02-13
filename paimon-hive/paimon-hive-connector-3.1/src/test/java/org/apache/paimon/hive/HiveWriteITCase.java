@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +19,6 @@
 package org.apache.paimon.hive;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.hive.mapred.PaimonOutputFormat;
@@ -45,6 +44,9 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 
+import javax.annotation.Nullable;
+
+import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -91,56 +93,22 @@ public class HiveWriteITCase {
         hiveShell.execute("DROP DATABASE IF EXISTS test_db CASCADE");
     }
 
-    private String createChangelogExternalTable(
+    private String createAppendOnlyExternalTable(
             RowType rowType,
             List<String> partitionKeys,
-            List<String> primaryKeys,
-            List<InternalRow> data)
-            throws Exception {
-
-        return createChangelogExternalTable(rowType, partitionKeys, primaryKeys, data, "");
-    }
-
-    private String createChangelogExternalTable(
-            RowType rowType,
-            List<String> partitionKeys,
-            List<String> primaryKeys,
             List<InternalRow> data,
-            String tableName)
+            String tableName,
+            @Nullable String fileFormatType)
             throws Exception {
         String path = folder.newFolder().toURI().toString();
         String tableNameNotNull =
                 StringUtils.isNullOrWhitespaceOnly(tableName) ? TABLE_NAME : tableName;
-        String tablePath = String.format("%s/default.db/%s", path, tableNameNotNull);
+        String tablePath = String.format("%s/test_db.db/%s", path, tableNameNotNull);
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, path);
-        conf.set(CoreOptions.BUCKET, 1);
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
-        Identifier identifier = Identifier.create(DATABASE_NAME, tableNameNotNull);
-        Table table =
-                FileStoreTestUtils.createFileStoreTable(
-                        conf, rowType, partitionKeys, primaryKeys, identifier);
-
-        return writeData(table, tablePath, data);
-    }
-
-    private String createAppendOnlyExternalTable(
-            RowType rowType, List<String> partitionKeys, List<InternalRow> data) throws Exception {
-        return createAppendOnlyExternalTable(rowType, partitionKeys, data, "");
-    }
-
-    private String createAppendOnlyExternalTable(
-            RowType rowType, List<String> partitionKeys, List<InternalRow> data, String tableName)
-            throws Exception {
-        String path = folder.newFolder().toURI().toString();
-        String tableNameNotNull =
-                StringUtils.isNullOrWhitespaceOnly(tableName) ? TABLE_NAME : tableName;
-        String tablePath = String.format("%s/default.db/%s", path, tableNameNotNull);
-        Options conf = new Options();
-        conf.set(CatalogOptions.WAREHOUSE, path);
-        conf.set(CoreOptions.BUCKET, 2);
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.APPEND_ONLY);
+        conf.set(
+                CoreOptions.FILE_FORMAT,
+                fileFormatType == null ? CoreOptions.FILE_FORMAT_AVRO : fileFormatType.toString());
         Identifier identifier = Identifier.create(DATABASE_NAME, tableNameNotNull);
         Table table =
                 FileStoreTestUtils.createFileStoreTable(
@@ -172,6 +140,7 @@ public class HiveWriteITCase {
                                 "CREATE EXTERNAL TABLE " + tableName + " ",
                                 "STORED BY '" + PaimonStorageHandler.class.getName() + "'",
                                 "LOCATION '" + path + "'")));
+        commit.close();
         return tableName;
     }
 
@@ -191,7 +160,8 @@ public class HiveWriteITCase {
                                 new String[] {"pt", "a", "b", "c"}),
                         Collections.singletonList("pt"),
                         emptyData,
-                        "hive_test_table_output");
+                        "hive_test_table_output",
+                        null);
 
         hiveShell.execute(
                 "insert into " + outputTableName + " values (1,2,3,'Hello'),(4,5,6,'Fine')");
@@ -200,25 +170,91 @@ public class HiveWriteITCase {
     }
 
     @Test
+    public void testHiveCreateAndHiveWrite() throws Exception {
+        List<InternalRow> emptyData = Collections.emptyList();
+
+        hiveShell.execute(
+                "CREATE TABLE paimon_table (\n"
+                        + "    `a`   STRING  comment '',\n"
+                        + "    `b`    STRING comment '',\n"
+                        + "    `c`    STRING comment ''\n"
+                        + ") \n"
+                        + "STORED BY 'org.apache.paimon.hive.PaimonStorageHandler'\n"
+                        + "TBLPROPERTIES (\n"
+                        + "    'primary-key' = 'a',\n"
+                        + "       'bucket' = '1',\n"
+                        + "   'bucket_key' = 'a'\n"
+                        + ");");
+        hiveShell.execute("insert into  paimon_table  values (2,3,'Hello'),(5,6,'Fine')");
+        List<String> select = hiveShell.executeQuery("select * from paimon_table");
+        assertThat(select).containsExactly("2\t3\tHello", "5\t6\tFine");
+    }
+
+    @Test
     public void testInsertTimestampAndDate() throws Exception {
         List<InternalRow> emptyData = Collections.emptyList();
+
+        // test different precisions
+        int precision = ThreadLocalRandom.current().nextInt(10);
+        String fraction = precision == 0 ? "" : "." + "123456789".substring(0, precision);
 
         String outputTableName =
                 createAppendOnlyExternalTable(
                         RowType.of(
                                 new DataType[] {
-                                    DataTypes.INT(), DataTypes.TIMESTAMP(), DataTypes.DATE()
+                                    DataTypes.INT(),
+                                    DataTypes.TIMESTAMP(precision),
+                                    DataTypes.DATE(),
                                 },
                                 new String[] {"pt", "a", "b"}),
                         Collections.singletonList("pt"),
                         emptyData,
-                        "hive_test_table_output");
+                        "hive_test_table_output",
+                        CoreOptions.FILE_FORMAT_ORC);
         hiveShell.execute(
-                "insert into "
-                        + outputTableName
-                        + " values(1,'2023-01-13 20:00:01.123','2023-12-23')");
-        List<String> select = hiveShell.executeQuery("select * from " + outputTableName);
+                String.format(
+                        "INSERT INTO %s VALUES (1, '2023-01-13 20:00:01%s', '2023-12-23')",
+                        outputTableName, fraction));
+
+        List<String> select = hiveShell.executeQuery("SELECT * FROM " + outputTableName);
         assertThat(select)
-                .isEqualTo(Collections.singletonList("1\t2023-01-13 20:00:01.123\t2023-12-23"));
+                .containsExactly(String.format("1\t2023-01-13 20:00:01%s\t2023-12-23", fraction));
+    }
+
+    @Test
+    public void testInsertLocalZonedTimestamp() throws Exception {
+        List<InternalRow> emptyData = Collections.emptyList();
+
+        // test different precisions
+        int precision = ThreadLocalRandom.current().nextInt(3, 10);
+        String fraction = "." + "123456789".substring(0, precision);
+
+        String outputTableName =
+                createAppendOnlyExternalTable(
+                        RowType.of(
+                                new DataType[] {
+                                    DataTypes.INT(),
+                                    DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(precision),
+                                },
+                                new String[] {
+                                    "pt", "ltz",
+                                }),
+                        Collections.singletonList("pt"),
+                        emptyData,
+                        "hive_test_table_output",
+                        CoreOptions.FILE_FORMAT_ORC);
+
+        assertThat(hiveShell.executeQuery("SHOW CREATE TABLE " + outputTableName))
+                .contains("  `ltz` timestamp with local time zone COMMENT 'from deserializer')");
+
+        hiveShell.execute(
+                String.format(
+                        "INSERT INTO %s VALUES (1, '2023-01-12 20:00:01%s')",
+                        outputTableName, fraction));
+
+        assertThat(hiveShell.executeQuery("SELECT * FROM " + outputTableName))
+                .containsExactly(
+                        String.format(
+                                "1\t2023-01-12 20:00:01%s %s", fraction, ZoneId.systemDefault()));
     }
 }

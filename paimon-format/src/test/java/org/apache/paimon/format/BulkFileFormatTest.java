@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -75,12 +75,18 @@ public class BulkFileFormatTest {
         for (InternalRow row : expected) {
             writer.addElement(row);
         }
-        writer.finish();
+        writer.close();
         out.close();
 
         // read
         RecordReader<InternalRow> reader =
-                fileFormat.createReaderFactory(rowType).createReader(new LocalFileIO(), path);
+                fileFormat
+                        .createReaderFactory(rowType)
+                        .createReader(
+                                new FormatReaderContext(
+                                        new LocalFileIO(),
+                                        path,
+                                        new LocalFileIO().getFileSize(path)));
         List<InternalRow> result = new ArrayList<>();
         reader.forEachRemaining(
                 rowData -> result.add(GenericRow.of(rowData.getInt(0), rowData.getInt(0))));

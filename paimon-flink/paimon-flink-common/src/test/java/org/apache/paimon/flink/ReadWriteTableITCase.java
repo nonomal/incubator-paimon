@@ -19,7 +19,6 @@
 package org.apache.paimon.flink;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.flink.sink.FlinkTableSink;
 import org.apache.paimon.flink.util.AbstractTestBase;
 import org.apache.paimon.fs.Path;
@@ -27,18 +26,18 @@ import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
-import org.apache.paimon.testutils.assertj.AssertionUtils;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.utils.BlockingIterator;
 
-import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
 import org.apache.paimon.shade.guava30.com.google.common.collect.Lists;
 
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.transformations.PartitionTransformation;
+import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.catalog.ObjectIdentifier;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
@@ -55,18 +54,18 @@ import org.apache.flink.types.Row;
 import org.apache.flink.util.CollectionUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -75,12 +74,10 @@ import static org.apache.paimon.CoreOptions.BUCKET;
 import static org.apache.paimon.CoreOptions.CHANGELOG_PRODUCER;
 import static org.apache.paimon.CoreOptions.ChangelogProducer.LOOKUP;
 import static org.apache.paimon.CoreOptions.MERGE_ENGINE;
-import static org.apache.paimon.CoreOptions.MergeEngine.DEDUPLICATE;
 import static org.apache.paimon.CoreOptions.MergeEngine.FIRST_ROW;
 import static org.apache.paimon.CoreOptions.SOURCE_SPLIT_OPEN_FILE_COST;
 import static org.apache.paimon.CoreOptions.SOURCE_SPLIT_TARGET_SIZE;
-import static org.apache.paimon.CoreOptions.WRITE_MODE;
-import static org.apache.paimon.flink.AbstractFlinkTableFactory.buildPaimonTable;
+import static org.apache.paimon.flink.FlinkConnectorOptions.INFER_SCAN_MAX_PARALLELISM;
 import static org.apache.paimon.flink.FlinkConnectorOptions.INFER_SCAN_PARALLELISM;
 import static org.apache.paimon.flink.FlinkConnectorOptions.SCAN_PARALLELISM;
 import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_PARALLELISM;
@@ -91,6 +88,7 @@ import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.bExeEnv;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.buildQuery;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.buildQueryWithTableOptions;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.buildSimpleQuery;
+import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.checkExternalFileStorePath;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.checkFileStorePath;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.createTable;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.createTemporaryTable;
@@ -104,7 +102,9 @@ import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.testBatchRead;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.testStreamingRead;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.validateStreamingReadResult;
 import static org.apache.paimon.flink.util.ReadWriteTableTestUtil.warehouse;
+import static org.apache.paimon.testutils.assertj.PaimonAssertions.anyCauseMatches;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Paimon reading and writing IT cases. */
@@ -115,6 +115,8 @@ public class ReadWriteTableITCase extends AbstractTestBase {
 
     private final Map<String, String> staticPartitionOverwrite =
             Collections.singletonMap(CoreOptions.DYNAMIC_PARTITION_OVERWRITE.key(), "false");
+
+    @TempDir public static java.nio.file.Path externalPath1;
 
     @BeforeEach
     public void setUp() {
@@ -140,6 +142,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT", "dt String"),
                         Arrays.asList("currency", "dt"),
+                        Collections.emptyList(),
                         Collections.singletonList("dt"));
 
         insertInto(
@@ -150,6 +153,120 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 "('Euro', 119, '2022-01-02')");
 
         checkFileStorePath(table, Arrays.asList("dt=2022-01-01", "dt=2022-01-02"));
+
+        testBatchRead(buildSimpleQuery(table), initialRecords);
+
+        insertOverwritePartition(
+                table, "PARTITION (dt = '2022-01-02')", "('Euro', 100)", "('Yen', 1)");
+
+        // batch read to check partition refresh
+        testBatchRead(
+                buildQuery(table, "*", "WHERE dt IN ('2022-01-02')"),
+                Arrays.asList(
+                        // part = 2022-01-02
+                        changelogRow("+I", "Euro", 100L, "2022-01-02"),
+                        changelogRow("+I", "Yen", 1L, "2022-01-02")));
+
+        // test partition filter
+        List<Row> expectedPartitionRecords =
+                Arrays.asList(
+                        changelogRow("+I", "Yen", 1L, "2022-01-01"),
+                        changelogRow("+I", "Euro", 114L, "2022-01-01"),
+                        changelogRow("+I", "US Dollar", 114L, "2022-01-01"));
+
+        testBatchRead(buildQuery(table, "*", "WHERE dt <> '2022-01-02'"), expectedPartitionRecords);
+
+        testBatchRead(
+                buildQuery(table, "*", "WHERE dt IN ('2022-01-01')"), expectedPartitionRecords);
+
+        // test field filter
+        testBatchRead(
+                buildQuery(table, "*", "WHERE rate >= 100"),
+                Arrays.asList(
+                        changelogRow("+I", "US Dollar", 114L, "2022-01-01"),
+                        changelogRow("+I", "Euro", 114L, "2022-01-01"),
+                        changelogRow("+I", "Euro", 100L, "2022-01-02")));
+
+        // test partition and field filter
+        testBatchRead(
+                buildQuery(table, "*", "WHERE dt = '2022-01-02' AND rate >= 100"),
+                Collections.singletonList(changelogRow("+I", "Euro", 100L, "2022-01-02")));
+
+        // test projection
+        testBatchRead(
+                buildQuery(table, "dt", ""),
+                Arrays.asList(
+                        changelogRow("+I", "2022-01-01"),
+                        changelogRow("+I", "2022-01-01"),
+                        changelogRow("+I", "2022-01-01"),
+                        changelogRow("+I", "2022-01-02"),
+                        changelogRow("+I", "2022-01-02")));
+
+        testBatchRead(
+                buildQuery(table, "dt, currency, rate", ""),
+                Arrays.asList(
+                        changelogRow("+I", "2022-01-01", "US Dollar", 114L),
+                        changelogRow("+I", "2022-01-01", "Yen", 1L),
+                        changelogRow("+I", "2022-01-01", "Euro", 114L),
+                        changelogRow("+I", "2022-01-02", "Euro", 100L),
+                        changelogRow("+I", "2022-01-02", "Yen", 1L)));
+
+        // test projection and filter
+        testBatchRead(
+                buildQuery(table, "currency, dt", "WHERE rate = 114"),
+                Arrays.asList(
+                        changelogRow("+I", "US Dollar", "2022-01-01"),
+                        changelogRow("+I", "Euro", "2022-01-01")));
+    }
+
+    @Test
+    public void testBatchReadWriteWithPartitionedRecordsWithPkWithExternalPathRoundRobinStrategy()
+            throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(
+                CoreOptions.DATA_FILE_EXTERNAL_PATHS.key(), "file://" + externalPath1.toString());
+        options.put(CoreOptions.DATA_FILE_EXTERNAL_PATHS_STRATEGY.key(), "ROUND-ROBIN");
+        checkExternalPathTestResult(options, externalPath1.toString());
+    }
+
+    @Test
+    public void testBatchReadWriteWithPartitionedRecordsWithPkWithExternalPathSpecificFStrategy()
+            throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(
+                CoreOptions.DATA_FILE_EXTERNAL_PATHS.key(), "file://" + externalPath1.toString());
+        options.put(CoreOptions.DATA_FILE_EXTERNAL_PATHS_STRATEGY.key(), "specific-fs");
+        options.put(CoreOptions.DATA_FILE_EXTERNAL_PATHS_SPECIFIC_FS.key(), "file");
+        checkExternalPathTestResult(options, externalPath1.toString());
+    }
+
+    public void checkExternalPathTestResult(Map<String, String> options, String externalPath)
+            throws Exception {
+        List<Row> initialRecords =
+                Arrays.asList(
+                        // part = 2022-01-01
+                        changelogRow("+I", "US Dollar", 114L, "2022-01-01"),
+                        changelogRow("+I", "Yen", 1L, "2022-01-01"),
+                        changelogRow("+I", "Euro", 114L, "2022-01-01"),
+                        // part = 2022-01-02
+                        changelogRow("+I", "Euro", 119L, "2022-01-02"));
+
+        String table =
+                createTable(
+                        Arrays.asList("currency STRING", "rate BIGINT", "dt String"),
+                        Arrays.asList("currency", "dt"),
+                        Collections.emptyList(),
+                        Collections.singletonList("dt"),
+                        options);
+
+        insertInto(
+                table,
+                "('US Dollar', 114, '2022-01-01')",
+                "('Yen', 1, '2022-01-01')",
+                "('Euro', 114, '2022-01-01')",
+                "('Euro', 119, '2022-01-02')");
+
+        checkExternalFileStorePath(Arrays.asList("dt=2022-01-01", "dt=2022-01-02"), externalPath);
 
         testBatchRead(buildSimpleQuery(table), initialRecords);
 
@@ -270,6 +387,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT", "dt String"),
                         Collections.emptyList(),
+                        Collections.singletonList("currency"),
                         Collections.singletonList("dt"));
 
         insertInto(
@@ -328,6 +446,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT"),
                         Collections.singletonList("currency"),
+                        Collections.emptyList(),
                         Collections.emptyList());
 
         insertInto(table, "('US Dollar', 102)", "('Yen', 1)", "('Euro', 119)");
@@ -383,6 +502,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT"),
                         Collections.emptyList(),
+                        Collections.singletonList("currency"),
                         Collections.emptyList());
 
         insertInto(
@@ -463,6 +583,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT", "dt STRING"),
                         Arrays.asList("currency", "dt"),
+                        Collections.emptyList(),
                         Collections.singletonList("dt"));
 
         insertIntoFromTable(temporaryTable, table);
@@ -506,93 +627,6 @@ public class ReadWriteTableITCase extends AbstractTestBase {
     }
 
     @Test
-    public void testStreamingReadWriteWithPartitionedRecordsWithoutPk() throws Exception {
-        // file store bounded read with merge
-        List<Row> initialRecords =
-                Arrays.asList(
-                        // dt = 2022-01-01
-                        changelogRow("+I", "US Dollar", 102L, "2022-01-01"),
-                        changelogRow("+I", "Euro", 116L, "2022-01-01"),
-                        changelogRow("-D", "Euro", 116L, "2022-01-01"),
-                        changelogRow("+I", "Yen", 1L, "2022-01-01"),
-                        changelogRow("-D", "Yen", 1L, "2022-01-01"),
-                        // dt = 2022-01-02
-                        changelogRow("+I", "Euro", 114L, "2022-01-02"),
-                        changelogRow("-U", "Euro", 114L, "2022-01-02"),
-                        changelogRow("+U", "Euro", 119L, "2022-01-02"),
-                        changelogRow("-D", "Euro", 119L, "2022-01-02"),
-                        changelogRow("+I", "Euro", 115L, "2022-01-02"));
-
-        String temporaryTable =
-                createTemporaryTable(
-                        Arrays.asList("currency STRING", "rate BIGINT", "dt STRING"),
-                        Collections.emptyList(),
-                        Collections.singletonList("dt"),
-                        initialRecords,
-                        "dt:2022-01-01;dt:2022-01-02",
-                        false,
-                        "I,UA,UB,D");
-
-        String table =
-                createTable(
-                        Arrays.asList("currency STRING", "rate BIGINT", "dt STRING"),
-                        Collections.emptyList(),
-                        Collections.singletonList("dt"),
-                        ImmutableMap.of(WRITE_MODE.key(), WriteMode.CHANGE_LOG.toString()));
-
-        insertIntoFromTable(temporaryTable, table);
-
-        checkFileStorePath(table, Arrays.asList("dt=2022-01-01", "dt=2022-01-02"));
-
-        testStreamingRead(
-                        buildSimpleQuery(table),
-                        Arrays.asList(
-                                changelogRow("+I", "US Dollar", 102L, "2022-01-01"),
-                                changelogRow("+I", "Euro", 115L, "2022-01-02")))
-                .close();
-
-        // test partition filter
-        testStreamingRead(
-                        buildQuery(table, "*", "WHERE dt IS NOT NULL"),
-                        Arrays.asList(
-                                changelogRow("+I", "US Dollar", 102L, "2022-01-01"),
-                                changelogRow("+I", "Euro", 115L, "2022-01-02")))
-                .close();
-
-        testStreamingRead(buildQuery(table, "*", "WHERE dt IS NULL"), Collections.emptyList())
-                .close();
-
-        // test field filter
-        testStreamingRead(
-                        buildQuery(table, "*", "WHERE currency = 'US Dollar' OR rate = 115"),
-                        Arrays.asList(
-                                changelogRow("+I", "US Dollar", 102L, "2022-01-01"),
-                                changelogRow("+I", "Euro", 115L, "2022-01-02")))
-                .close();
-
-        // test partition and field filter
-        testStreamingRead(
-                        buildQuery(
-                                table,
-                                "*",
-                                "WHERE (dt = '2022-01-02' AND currency = 'US Dollar') OR (dt = '2022-01-01' AND rate = 115)"),
-                        Collections.emptyList())
-                .close();
-
-        // test projection
-        testStreamingRead(
-                        buildQuery(table, "rate", ""),
-                        Arrays.asList(changelogRow("+I", 102L), changelogRow("+I", 115L)))
-                .close();
-
-        // test projection and filter
-        testStreamingRead(
-                        buildQuery(table, "rate", "WHERE dt <> '2022-01-01'"),
-                        Collections.singletonList(changelogRow("+I", 115L)))
-                .close();
-    }
-
-    @Test
     void testStreamingReadWriteWithNonPartitionedRecordsWithPk() throws Exception {
         // file store bounded read with merge
         List<Row> initialRecords =
@@ -620,6 +654,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT"),
                         Collections.singletonList("currency"),
+                        Collections.emptyList(),
                         Collections.emptyList());
 
         insertIntoFromTable(temporaryTable, table);
@@ -650,79 +685,6 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 .close();
     }
 
-    @Test
-    public void testStreamingReadWriteWithNonPartitionedRecordsWithoutPk() throws Exception {
-        // default full scan mode, will merge
-        List<Row> initialRecords =
-                Arrays.asList(
-                        changelogRow("+I", "US Dollar", 102L),
-                        changelogRow("+I", "Euro", 114L),
-                        changelogRow("+I", "Yen", 1L),
-                        changelogRow("-U", "Euro", 114L),
-                        changelogRow("+U", "Euro", 116L),
-                        changelogRow("-D", "Euro", 116L),
-                        changelogRow("+I", "Euro", 119L),
-                        changelogRow("-U", "Euro", 119L),
-                        changelogRow("+U", "Euro", 119L),
-                        changelogRow("-D", "Yen", 1L),
-                        changelogRow("+I", null, 100L),
-                        changelogRow("+I", "HK Dollar", null));
-
-        String temporaryTable =
-                createTemporaryTable(
-                        Arrays.asList("currency STRING", "rate BIGINT"),
-                        Collections.emptyList(),
-                        Collections.emptyList(),
-                        initialRecords,
-                        null,
-                        false,
-                        "I,UA,UB,D");
-
-        String table =
-                createTable(
-                        Arrays.asList("currency STRING", "rate BIGINT"),
-                        Collections.emptyList(),
-                        Collections.emptyList(),
-                        ImmutableMap.of(WRITE_MODE.key(), WriteMode.CHANGE_LOG.toString()));
-
-        insertIntoFromTable(temporaryTable, table);
-
-        checkFileStorePath(table, Collections.emptyList());
-
-        testStreamingRead(
-                        buildSimpleQuery(table),
-                        Arrays.asList(
-                                changelogRow("+I", "US Dollar", 102L),
-                                changelogRow("+I", "Euro", 119L),
-                                changelogRow("+I", null, 100L),
-                                changelogRow("+I", "HK Dollar", null)))
-                .close();
-
-        // test field filter
-        testStreamingRead(
-                        buildQuery(table, "*", "WHERE currency IS NOT NULL"),
-                        Arrays.asList(
-                                changelogRow("+I", "US Dollar", 102L),
-                                changelogRow("+I", "Euro", 119L),
-                                changelogRow("+I", "HK Dollar", null)))
-                .close();
-
-        testStreamingRead(
-                        buildQuery(table, "*", "WHERE rate IS NOT NULL"),
-                        Arrays.asList(
-                                changelogRow("+I", "US Dollar", 102L),
-                                changelogRow("+I", "Euro", 119L),
-                                changelogRow("+I", null, 100L)))
-                .close();
-
-        // test projection and filter
-        testStreamingRead(
-                        buildQuery(
-                                table, "rate", "WHERE currency IS NOT NULL AND rate IS NOT NULL"),
-                        Arrays.asList(changelogRow("+I", 102L), changelogRow("+I", 119L)))
-                .close();
-    }
-
     // ----------------------------------------------------------------------------------------------------------------
     // Dynamic partition overwrite (default option)
     // ----------------------------------------------------------------------------------------------------------------
@@ -733,6 +695,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("pk INT", "part0 INT", "part1 STRING", "v STRING"),
                         Arrays.asList("pk", "part0", "part1"),
+                        Collections.emptyList(),
                         Arrays.asList("part0", "part1"),
                         streamingReadOverwrite);
 
@@ -802,6 +765,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("k0 INT", "k1 STRING", "v STRING"),
                         Collections.emptyList(),
+                        Collections.singletonList("k0"),
                         Collections.emptyList(),
                         staticPartitionOverwrite);
 
@@ -817,6 +781,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         fieldsSpec,
                         Collections.emptyList(),
+                        Collections.singletonList("k1"),
                         Collections.singletonList("k0"),
                         staticPartitionOverwrite);
 
@@ -834,6 +799,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         fieldsSpec,
                         Collections.emptyList(),
+                        Collections.singletonList("v"),
                         Arrays.asList("k0", "k1"),
                         staticPartitionOverwrite);
 
@@ -851,6 +817,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         fieldsSpec,
                         Collections.emptyList(),
+                        Collections.singletonList("v"),
                         Arrays.asList("k0", "k1"),
                         staticPartitionOverwrite);
 
@@ -875,6 +842,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT", "dt String"),
                         Arrays.asList("currency", "dt"),
+                        Collections.emptyList(),
                         Collections.singletonList("dt"),
                         streamingReadOverwrite);
 
@@ -921,6 +889,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                         Arrays.asList("currency STRING", "rate BIGINT", "dt STRING"),
                         Collections.singletonList("currency"),
                         Collections.emptyList(),
+                        Collections.emptyList(),
                         streamingReadOverwrite);
 
         insertInto(
@@ -951,6 +920,43 @@ public class ReadWriteTableITCase extends AbstractTestBase {
     }
 
     @Test
+    public void testStreamingReadOverwriteWithDeleteRecords() throws Exception {
+        String table =
+                createTable(
+                        Arrays.asList("currency STRING", "rate BIGINT", "dt STRING"),
+                        Collections.singletonList("currency"),
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        streamingReadOverwrite);
+
+        insertInto(
+                table,
+                "('US Dollar', 102, '2022-01-01')",
+                "('Yen', 1, '2022-01-02')",
+                "('Euro', 119, '2022-01-02')");
+
+        bEnv.executeSql(String.format("DELETE FROM %s WHERE currency = 'Euro'", table)).await();
+
+        checkFileStorePath(table, Collections.emptyList());
+
+        // test projection and filter
+        BlockingIterator<Row, Row> streamingItr =
+                testStreamingRead(
+                        buildQuery(table, "currency, rate", "WHERE dt = '2022-01-02'"),
+                        Collections.singletonList(changelogRow("+I", "Yen", 1L)));
+
+        insertOverwrite(table, "('US Dollar', 100, '2022-01-02')", "('Yen', 10, '2022-01-01')");
+
+        validateStreamingReadResult(
+                streamingItr,
+                Arrays.asList(
+                        changelogRow("-D", "Yen", 1L), changelogRow("+I", "US Dollar", 100L)));
+        assertNoMoreRecords(streamingItr);
+
+        streamingItr.close();
+    }
+
+    @Test
     public void testUnsupportStreamingReadOverwriteWithoutPk() {
         assertThatThrownBy(
                         () ->
@@ -958,10 +964,11 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                         Arrays.asList(
                                                 "currency STRING", "rate BIGINT", "dt String"),
                                         Collections.emptyList(),
+                                        Collections.singletonList("currency"),
                                         Collections.singletonList("dt"),
                                         streamingReadOverwrite))
                 .satisfies(
-                        AssertionUtils.anyCauseMatches(
+                        anyCauseMatches(
                                 RuntimeException.class,
                                 "Doesn't support streaming read the changes from overwrite when the primary keys are not defined."));
     }
@@ -976,6 +983,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("f0 INT", "f1 STRING"),
                         Collections.emptyList(),
+                        Collections.singletonList("f0"),
                         Collections.emptyList());
 
         // insert multiple times
@@ -1068,6 +1076,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("f0 INT", "f1 STRING"),
                         Collections.emptyList(),
+                        Collections.singletonList("f0"),
                         Collections.emptyList());
 
         insertInto(
@@ -1114,6 +1123,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT", "dt STRING"),
                         Arrays.asList("currency", "dt"),
+                        Collections.emptyList(),
                         Collections.singletonList("dt"));
 
         insertInto(
@@ -1151,6 +1161,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT"),
                         Collections.emptyList(),
+                        Collections.singletonList("currency"),
                         Collections.emptyList(),
                         Collections.singletonMap(INFER_SCAN_PARALLELISM.key(), "false"));
 
@@ -1184,11 +1195,37 @@ public class ReadWriteTableITCase extends AbstractTestBase {
     }
 
     @Test
+    void testConvertRowType2Serializer() {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamTableEnvironment tEnv =
+                StreamTableEnvironment.create(
+                        env, EnvironmentSettings.newInstance().inBatchMode().build());
+        tEnv.executeSql(
+                "CREATE CATALOG my_catalog WITH (\n"
+                        + "    'type' = 'paimon',\n"
+                        + "    'warehouse' = '"
+                        + getTempDirPath()
+                        + "'\n"
+                        + ")");
+        tEnv.executeSql("USE CATALOG my_catalog");
+        tEnv.executeSql(
+                "CREATE TABLE tmp (\n"
+                        + "execution\n"
+                        + "ROW<`execution_server` STRING, `execution_insertion` ARRAY<ROW<`platform_id` BIGINT, `user_info` ROW<`user_id` STRING, `log_user_id` STRING, `is_internal_user` BOOLEAN, `ignore_usage` BOOLEAN, `anon_user_id` STRING, `retained_user_id` STRING>, `timing` ROW<`client_log_timestamp` BIGINT, `event_api_timestamp` BIGINT, `log_timestamp` BIGINT, `processing_timestamp` BIGINT>, `client_info` ROW<`client_type` STRING, `traffic_type` STRING>, `insertion_id` STRING, `request_id` STRING, `view_id` STRING, `auto_view_id` STRING, `session_id` STRING, `content_id` STRING, `position` BIGINT, `properties` ROW<`struct` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `struct_json` STRING>, `feature_stage` ROW<`features` ROW<`numeric` ARRAY<ROW<`key` INT, `value` FLOAT> NOT NULL>, `categorical` ARRAY<ROW<`key` INT, `value` STRING> NOT NULL>, `sparse` ARRAY<ROW<`key` BIGINT, `value` FLOAT> NOT NULL>, `sparse_id` ARRAY<ROW<`key` BIGINT, `value` BIGINT> NOT NULL>, `embeddings` ARRAY<ROW<`key` BIGINT, `value` ROW<`embeddings` ARRAY<FLOAT>>> NOT NULL>, `feature_references` ARRAY<ROW<`type` STRING, `key` STRING, `version` STRING, `timestamp` BIGINT> NOT NULL>, `sparse_id_list` ARRAY<ROW<`key` BIGINT, `value` ROW<`ids` ARRAY<BIGINT>>> NOT NULL>, `user_events` ROW<`user_events` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>, `user_events_all` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>>, `string_features` ARRAY<ROW<`key` BIGINT, `value` STRING> NOT NULL>>>, `personalize_stage` ROW<`personalize_ranking_score` FLOAT, `score_source` STRING, `personalize_ranking_scores` ARRAY<ROW<`key` STRING, `value` ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT>> NOT NULL>, `model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `predictor_stage` ROW<`model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `backoff_predictors` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `blender_stage` ROW<`score` FLOAT, `steps` ARRAY<ROW<`force_step` ROW<`reason` STRING>, `boost_step` ROW<`fid` BIGINT, `delta` FLOAT>> NOT NULL>, `sort_key` ARRAY<FLOAT>, `experiments` ARRAY<ROW<`experiment_ref` INT, `score` FLOAT> NOT NULL>>, `retrieval_rank` BIGINT, `retrieval_score` FLOAT> NOT NULL>, `latency` ARRAY<ROW<`method` STRING, `start_millis` BIGINT, `duration_millis` INT> NOT NULL>, `execution_stats` ROW<`stages` ARRAY<ROW<`key` INT, `value` ROW<`stats` ARRAY<ROW<`key` INT, `value` BIGINT> NOT NULL>>> NOT NULL>>, `request_feature_stage` ROW<`features` ROW<`numeric` ARRAY<ROW<`key` INT, `value` FLOAT> NOT NULL>, `categorical` ARRAY<ROW<`key` INT, `value` STRING> NOT NULL>, `sparse` ARRAY<ROW<`key` BIGINT, `value` FLOAT> NOT NULL>, `sparse_id` ARRAY<ROW<`key` BIGINT, `value` BIGINT> NOT NULL>, `embeddings` ARRAY<ROW<`key` BIGINT, `value` ROW<`embeddings` ARRAY<FLOAT>>> NOT NULL>, `feature_references` ARRAY<ROW<`type` STRING, `key` STRING, `version` STRING, `timestamp` BIGINT> NOT NULL>, `sparse_id_list` ARRAY<ROW<`key` BIGINT, `value` ROW<`ids` ARRAY<BIGINT>>> NOT NULL>, `user_events` ROW<`user_events` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>, `user_events_all` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>>, `string_features` ARRAY<ROW<`key` BIGINT, `value` STRING> NOT NULL>>>, `user_feature_stage` ROW<`features` ROW<`numeric` ARRAY<ROW<`key` INT, `value` FLOAT> NOT NULL>, `categorical` ARRAY<ROW<`key` INT, `value` STRING> NOT NULL>, `sparse` ARRAY<ROW<`key` BIGINT, `value` FLOAT> NOT NULL>, `sparse_id` ARRAY<ROW<`key` BIGINT, `value` BIGINT> NOT NULL>, `embeddings` ARRAY<ROW<`key` BIGINT, `value` ROW<`embeddings` ARRAY<FLOAT>>> NOT NULL>, `feature_references` ARRAY<ROW<`type` STRING, `key` STRING, `version` STRING, `timestamp` BIGINT> NOT NULL>, `sparse_id_list` ARRAY<ROW<`key` BIGINT, `value` ROW<`ids` ARRAY<BIGINT>>> NOT NULL>, `user_events` ROW<`user_events` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>, `user_events_all` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>>, `string_features` ARRAY<ROW<`key` BIGINT, `value` STRING> NOT NULL>>>, `model_ref` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>, `server_version` STRING, `after_response_stage` ROW<`removed_execution_insertion_count` INT>, `personalize_stage` ROW<`personalize_ranking_score` FLOAT, `score_source` STRING, `personalize_ranking_scores` ARRAY<ROW<`key` STRING, `value` ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT>> NOT NULL>, `model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `predictor_stage` ROW<`model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `backoff_predictors` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `blender_config` STRING, `hyperloop_log` ROW<`parameter_logs` ARRAY<ROW<`key` BIGINT, `value` ROW<`bucket` INT, `value` FLOAT>> NOT NULL>>, `blender_session_log` ROW<`config_statements` ARRAY<STRING>, `ids` ARRAY<STRING>, `variable_logs` ARRAY<ROW<`name` STRING, `values` ARRAY<FLOAT>> NOT NULL>, `allocation_logs` ARRAY<ROW<`indexes` ARRAY<INT>, `name` STRING, `positions_considered` ARRAY<INT>, `positions_filled` ARRAY<INT>> NOT NULL>>, `experiments` ARRAY<ROW<`name` STRING, `cohort_arm` INT> NOT NULL>, `effective_user_info` ROW<`user_id` STRING, `log_user_id` STRING, `is_internal_user` BOOLEAN, `ignore_usage` BOOLEAN, `anon_user_id` STRING, `retained_user_id` STRING>>);");
+        assertThatCode(
+                        () ->
+                                tEnv.executeSql(
+                                        "INSERT INTO tmp VALUES (CAST(NULL AS ROW<`execution_server` STRING, `execution_insertion` ARRAY<ROW<`platform_id` BIGINT, `user_info` ROW<`user_id` STRING, `log_user_id` STRING, `is_internal_user` BOOLEAN, `ignore_usage` BOOLEAN, `anon_user_id` STRING, `retained_user_id` STRING>, `timing` ROW<`client_log_timestamp` BIGINT, `event_api_timestamp` BIGINT, `log_timestamp` BIGINT, `processing_timestamp` BIGINT>, `client_info` ROW<`client_type` STRING, `traffic_type` STRING>, `insertion_id` STRING, `request_id` STRING, `view_id` STRING, `auto_view_id` STRING, `session_id` STRING, `content_id` STRING, `position` BIGINT, `properties` ROW<`struct` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN, `struct_value` ROW<`fields` ARRAY<ROW<`key` STRING, `value` ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN>> NOT NULL>>, `list_value` ROW<`values` ARRAY<ROW<`null_value` STRING, `number_value` DOUBLE, `string_value` STRING, `bool_value` BOOLEAN> NOT NULL>>> NOT NULL>>> NOT NULL>>> NOT NULL>>>> NOT NULL>>, `struct_json` STRING>, `feature_stage` ROW<`features` ROW<`numeric` ARRAY<ROW<`key` INT, `value` FLOAT> NOT NULL>, `categorical` ARRAY<ROW<`key` INT, `value` STRING> NOT NULL>, `sparse` ARRAY<ROW<`key` BIGINT, `value` FLOAT> NOT NULL>, `sparse_id` ARRAY<ROW<`key` BIGINT, `value` BIGINT> NOT NULL>, `embeddings` ARRAY<ROW<`key` BIGINT, `value` ROW<`embeddings` ARRAY<FLOAT>>> NOT NULL>, `feature_references` ARRAY<ROW<`type` STRING, `key` STRING, `version` STRING, `timestamp` BIGINT> NOT NULL>, `sparse_id_list` ARRAY<ROW<`key` BIGINT, `value` ROW<`ids` ARRAY<BIGINT>>> NOT NULL>, `user_events` ROW<`user_events` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>, `user_events_all` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>>, `string_features` ARRAY<ROW<`key` BIGINT, `value` STRING> NOT NULL>>>, `personalize_stage` ROW<`personalize_ranking_score` FLOAT, `score_source` STRING, `personalize_ranking_scores` ARRAY<ROW<`key` STRING, `value` ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT>> NOT NULL>, `model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `predictor_stage` ROW<`model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `backoff_predictors` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `blender_stage` ROW<`score` FLOAT, `steps` ARRAY<ROW<`force_step` ROW<`reason` STRING>, `boost_step` ROW<`fid` BIGINT, `delta` FLOAT>> NOT NULL>, `sort_key` ARRAY<FLOAT>, `experiments` ARRAY<ROW<`experiment_ref` INT, `score` FLOAT> NOT NULL>>, `retrieval_rank` BIGINT, `retrieval_score` FLOAT> NOT NULL>, `latency` ARRAY<ROW<`method` STRING, `start_millis` BIGINT, `duration_millis` INT> NOT NULL>, `execution_stats` ROW<`stages` ARRAY<ROW<`key` INT, `value` ROW<`stats` ARRAY<ROW<`key` INT, `value` BIGINT> NOT NULL>>> NOT NULL>>, `request_feature_stage` ROW<`features` ROW<`numeric` ARRAY<ROW<`key` INT, `value` FLOAT> NOT NULL>, `categorical` ARRAY<ROW<`key` INT, `value` STRING> NOT NULL>, `sparse` ARRAY<ROW<`key` BIGINT, `value` FLOAT> NOT NULL>, `sparse_id` ARRAY<ROW<`key` BIGINT, `value` BIGINT> NOT NULL>, `embeddings` ARRAY<ROW<`key` BIGINT, `value` ROW<`embeddings` ARRAY<FLOAT>>> NOT NULL>, `feature_references` ARRAY<ROW<`type` STRING, `key` STRING, `version` STRING, `timestamp` BIGINT> NOT NULL>, `sparse_id_list` ARRAY<ROW<`key` BIGINT, `value` ROW<`ids` ARRAY<BIGINT>>> NOT NULL>, `user_events` ROW<`user_events` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>, `user_events_all` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>>, `string_features` ARRAY<ROW<`key` BIGINT, `value` STRING> NOT NULL>>>, `user_feature_stage` ROW<`features` ROW<`numeric` ARRAY<ROW<`key` INT, `value` FLOAT> NOT NULL>, `categorical` ARRAY<ROW<`key` INT, `value` STRING> NOT NULL>, `sparse` ARRAY<ROW<`key` BIGINT, `value` FLOAT> NOT NULL>, `sparse_id` ARRAY<ROW<`key` BIGINT, `value` BIGINT> NOT NULL>, `embeddings` ARRAY<ROW<`key` BIGINT, `value` ROW<`embeddings` ARRAY<FLOAT>>> NOT NULL>, `feature_references` ARRAY<ROW<`type` STRING, `key` STRING, `version` STRING, `timestamp` BIGINT> NOT NULL>, `sparse_id_list` ARRAY<ROW<`key` BIGINT, `value` ROW<`ids` ARRAY<BIGINT>>> NOT NULL>, `user_events` ROW<`user_events` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>, `user_events_all` ARRAY<ROW<`event_type` BIGINT, `content_id` STRING, `timestamp` BIGINT, `custom_event_type` STRING> NOT NULL>>, `string_features` ARRAY<ROW<`key` BIGINT, `value` STRING> NOT NULL>>>, `model_ref` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>, `server_version` STRING, `after_response_stage` ROW<`removed_execution_insertion_count` INT>, `personalize_stage` ROW<`personalize_ranking_score` FLOAT, `score_source` STRING, `personalize_ranking_scores` ARRAY<ROW<`key` STRING, `value` ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT>> NOT NULL>, `model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `predictor_stage` ROW<`model_scores` ARRAY<ROW<`score` FLOAT, `score_source` STRING, `model_type` STRING, `model_id` STRING, `model_index` INT> NOT NULL>, `backoff_predictors` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>, `models` ARRAY<ROW<`model_id` STRING, `model_type` STRING, `prediction_type` STRING, `name` STRING, `feature_id` BIGINT, `is_assigned` BOOLEAN> NOT NULL>>, `blender_config` STRING, `hyperloop_log` ROW<`parameter_logs` ARRAY<ROW<`key` BIGINT, `value` ROW<`bucket` INT, `value` FLOAT>> NOT NULL>>, `blender_session_log` ROW<`config_statements` ARRAY<STRING>, `ids` ARRAY<STRING>, `variable_logs` ARRAY<ROW<`name` STRING, `values` ARRAY<FLOAT>> NOT NULL>, `allocation_logs` ARRAY<ROW<`indexes` ARRAY<INT>, `name` STRING, `positions_considered` ARRAY<INT>, `positions_filled` ARRAY<INT>> NOT NULL>>, `experiments` ARRAY<ROW<`name` STRING, `cohort_arm` INT> NOT NULL>, `effective_user_info` ROW<`user_id` STRING, `log_user_id` STRING, `is_internal_user` BOOLEAN, `ignore_usage` BOOLEAN, `anon_user_id` STRING, `retained_user_id` STRING>>))"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     public void testInferParallelism() throws Exception {
         String table =
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT"),
                         Collections.emptyList(),
+                        Collections.singletonList("currency"),
                         Collections.emptyList(),
                         new HashMap<String, String>() {
                             {
@@ -1300,6 +1337,22 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                         })))
                 .isEqualTo(3);
 
+        // when scan.infer-parallelism.max less than infer parallelism, the parallelism is
+        // scan.infer-parallelism.max
+        assertThat(
+                        sourceParallelism(
+                                buildQueryWithTableOptions(
+                                        table,
+                                        "*",
+                                        "",
+                                        new HashMap<String, String>() {
+                                            {
+                                                put(INFER_SCAN_PARALLELISM.key(), "true");
+                                                put(INFER_SCAN_MAX_PARALLELISM.key(), "1");
+                                            }
+                                        })))
+                .isEqualTo(1);
+
         // for streaming mode
         assertThat(
                         sourceParallelismStreaming(
@@ -1324,7 +1377,8 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 + " dt STRING\n"
                                 + ") PARTITIONED BY (dt)\n"
                                 + "WITH (\n"
-                                + " 'bucket' = '2'\n"
+                                + " 'bucket' = '2',\n"
+                                + " 'bucket-key' = 'currency'\n"
                                 + ")",
                         table));
 
@@ -1343,6 +1397,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 createTable(
                         Arrays.asList("currency STRING", "rate BIGINT", "dt String"),
                         Collections.emptyList(),
+                        Collections.singletonList("currency"),
                         Collections.singletonList("dt"));
 
         assertThatThrownBy(
@@ -1372,7 +1427,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
     }
 
     @Test
-    public void testUnsupportedComputedColumnComments() {
+    public void testComputedColumnComments() {
         String ddl = "CREATE TABLE T(a INT , b INT, c AS a + b COMMENT 'computed');";
         bEnv.executeSql(ddl);
 
@@ -1382,9 +1437,9 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                         .collect(Collectors.toList());
         assertThat(result)
                 .containsExactlyInAnyOrder(
-                        "+I[a, INT, true, null, null, null]",
-                        "+I[b, INT, true, null, null, null]",
-                        "+I[c, INT, true, null, AS `a` + `b`, null]");
+                        "+I[a, INT, true, null, null, null, null]",
+                        "+I[b, INT, true, null, null, null, null]",
+                        "+I[c, INT, true, null, AS `a` + `b`, null, computed]");
     }
 
     @Test
@@ -1476,18 +1531,11 @@ public class ReadWriteTableITCase extends AbstractTestBase {
     // ----------------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest
-    @EnumSource(CoreOptions.MergeEngine.class)
-    public void testUpdateWithPrimaryKey(CoreOptions.MergeEngine mergeEngine) throws Exception {
-        Set<CoreOptions.MergeEngine> supportUpdateEngines = new HashSet<>();
-        supportUpdateEngines.add(DEDUPLICATE);
-        supportUpdateEngines.add(CoreOptions.MergeEngine.PARTIAL_UPDATE);
+    @ValueSource(strings = {"deduplicate", "partial-update"})
+    public void testUpdateWithPrimaryKey(String mergeEngine) throws Exception {
         // Step1: define table schema
         Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), WriteMode.CHANGE_LOG.toString());
-        options.put(MERGE_ENGINE.key(), mergeEngine.toString());
-        if (mergeEngine == FIRST_ROW) {
-            options.put(CHANGELOG_PRODUCER.key(), LOOKUP.toString());
-        }
+        options.put(MERGE_ENGINE.key(), mergeEngine);
         String table =
                 createTable(
                         Arrays.asList(
@@ -1496,6 +1544,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "rate BIGINT",
                                 "dt String"),
                         Arrays.asList("id", "dt"),
+                        Collections.emptyList(),
                         Collections.singletonList("dt"),
                         options);
 
@@ -1507,42 +1556,33 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 "(3, 'Euro', 114, '2022-01-01')",
                 "(3, 'Euro', 119, '2022-01-02')");
 
-        // Step3: prepare expected data.
-        String rowKind = mergeEngine == CoreOptions.MergeEngine.PARTIAL_UPDATE ? "+I" : "+U";
-        List<Row> expectedRecords =
+        // Step3: prepare update statement
+        String updateStatement =
+                String.format(
+                        "UPDATE %s "
+                                + "SET currency = 'Yen', "
+                                + "rate = 1 "
+                                + "WHERE currency = 'UNKNOWN' and dt = '2022-01-01'",
+                        table);
+
+        // Step4: execute update statement and verify result
+        bEnv.executeSql(updateStatement).await();
+        String querySql = String.format("SELECT * FROM %s", table);
+        String rowKind = mergeEngine.equals("deduplicate") ? "+U" : "+I";
+        testBatchRead(
+                querySql,
                 Arrays.asList(
                         // part = 2022-01-01
                         changelogRow("+I", 1L, "US Dollar", 114L, "2022-01-01"),
                         changelogRow(rowKind, 2L, "Yen", 1L, "2022-01-01"),
                         changelogRow("+I", 3L, "Euro", 114L, "2022-01-01"),
                         // part = 2022-01-02
-                        changelogRow("+I", 3L, "Euro", 119L, "2022-01-02"));
-
-        // Step4: prepare update statement
-        String updateStatement =
-                String.format(
-                        ""
-                                + "UPDATE %s "
-                                + "SET currency = 'Yen', "
-                                + "rate = 1 "
-                                + "WHERE currency = 'UNKNOWN' and dt = '2022-01-01'",
-                        table);
-
-        // Step5: execute update statement and verify result
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(updateStatement).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(updateStatement).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+                        changelogRow("+I", 3L, "Euro", 119L, "2022-01-02")));
     }
 
     @Test
     public void testDefaultValueWithoutPrimaryKey() throws Exception {
         Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), WriteMode.AUTO.name());
         options.put(
                 CoreOptions.FIELDS_PREFIX + ".rate." + CoreOptions.DEFAULT_VALUE_SUFFIX, "1000");
 
@@ -1554,6 +1594,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "rate BIGINT",
                                 "dt String"),
                         Collections.emptyList(),
+                        Collections.singletonList("id"),
                         Collections.emptyList(),
                         options);
         insertInto(
@@ -1578,7 +1619,6 @@ public class ReadWriteTableITCase extends AbstractTestBase {
     public void testDefaultValueWithPrimaryKey(CoreOptions.MergeEngine mergeEngine)
             throws Exception {
         Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), WriteMode.AUTO.name());
         options.put(
                 CoreOptions.FIELDS_PREFIX + ".rate." + CoreOptions.DEFAULT_VALUE_SUFFIX, "1000");
         options.put(MERGE_ENGINE.key(), mergeEngine.toString());
@@ -1593,6 +1633,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "rate BIGINT",
                                 "dt String"),
                         Lists.newArrayList("id", "dt"),
+                        Collections.emptyList(),
                         Lists.newArrayList("dt"),
                         options);
         insertInto(
@@ -1610,13 +1651,10 @@ public class ReadWriteTableITCase extends AbstractTestBase {
         testBatchRead(querySql, expectedRecords);
     }
 
-    @ParameterizedTest
-    @EnumSource(WriteMode.class)
-    public void testUpdateWithoutPrimaryKey(WriteMode writeMode) throws Exception {
+    @Test
+    public void testUpdateWithoutPrimaryKey() throws Exception {
         // Step1: define table schema
         Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), writeMode.toString());
-        options.put(MERGE_ENGINE.key(), MERGE_ENGINE.defaultValue().toString());
         String table =
                 createTable(
                         Arrays.asList(
@@ -1625,6 +1663,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "rate BIGINT",
                                 "dt String"),
                         Collections.emptyList(),
+                        Collections.singletonList("id"),
                         Collections.singletonList("dt"),
                         options);
 
@@ -1648,26 +1687,16 @@ public class ReadWriteTableITCase extends AbstractTestBase {
 
         // Step4: execute update statement
         assertThatThrownBy(() -> bEnv.executeSql(updateStatement).await())
-                .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
+                .satisfies(anyCauseMatches(UnsupportedOperationException.class));
     }
 
     // ----------------------------------------------------------------------------------------------------------------
     // Delete statement
     // ----------------------------------------------------------------------------------------------------------------
 
-    @ParameterizedTest
-    @EnumSource(CoreOptions.MergeEngine.class)
-    public void testDeleteWithPrimaryKey(CoreOptions.MergeEngine mergeEngine) throws Exception {
-        Set<CoreOptions.MergeEngine> supportUpdateEngines = new HashSet<>();
-        supportUpdateEngines.add(DEDUPLICATE);
-
+    @Test
+    public void testDeleteWithPrimaryKey() throws Exception {
         // Step1: define table schema
-        Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), WriteMode.CHANGE_LOG.toString());
-        options.put(MERGE_ENGINE.key(), mergeEngine.toString());
-        if (mergeEngine == FIRST_ROW) {
-            options.put(CHANGELOG_PRODUCER.key(), LOOKUP.toString());
-        }
         String table =
                 createTable(
                         Arrays.asList(
@@ -1676,8 +1705,9 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "rate BIGINT",
                                 "dt String"),
                         Arrays.asList("id", "dt"),
+                        Collections.emptyList(),
                         Collections.singletonList("dt"),
-                        options);
+                        Collections.emptyMap());
 
         // Step2: batch write some historical data
         insertInto(
@@ -1690,27 +1720,19 @@ public class ReadWriteTableITCase extends AbstractTestBase {
         String deleteStatement = String.format("DELETE FROM %s WHERE currency = 'UNKNOWN'", table);
 
         // Step4: execute delete statement and verify result
-        List<Row> expectedRecords =
+        bEnv.executeSql(deleteStatement).await();
+        String querySql = String.format("SELECT * FROM %s", table);
+        testBatchRead(
+                querySql,
                 Arrays.asList(
                         changelogRow("+I", 1L, "US Dollar", 114L, "2022-01-01"),
-                        changelogRow("+I", 3L, "Euro", 119L, "2022-01-02"));
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+                        changelogRow("+I", 3L, "Euro", 119L, "2022-01-02")));
     }
 
-    @ParameterizedTest
-    @EnumSource(WriteMode.class)
-    public void testDeleteWithoutPrimaryKey(WriteMode writeMode) throws Exception {
+    @Test
+    public void testDeleteWithoutPrimaryKey() throws Exception {
         // Step1: define table schema
         Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), writeMode.toString());
-        options.put(MERGE_ENGINE.key(), MERGE_ENGINE.defaultValue().toString());
         String table =
                 createTable(
                         Arrays.asList(
@@ -1719,6 +1741,7 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "rate BIGINT",
                                 "dt String"),
                         Collections.emptyList(),
+                        Collections.singletonList("id"),
                         Collections.singletonList("dt"),
                         options);
 
@@ -1733,34 +1756,13 @@ public class ReadWriteTableITCase extends AbstractTestBase {
         String deleteStatement = String.format("DELETE FROM %s WHERE currency = 'UNKNOWN'", table);
 
         // Step4: execute delete statement and verify result
-        List<Row> expectedRecords =
-                Arrays.asList(
-                        changelogRow("+I", 1L, "US Dollar", 114L, "2022-01-01"),
-                        changelogRow("+I", 3L, "Euro", 119L, "2022-01-02"));
-        if (writeMode == WriteMode.CHANGE_LOG) {
-            bEnv.executeSql(deleteStatement).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        assertThatThrownBy(() -> bEnv.executeSql(deleteStatement).await())
+                .satisfies(anyCauseMatches(UnsupportedOperationException.class));
     }
 
-    @ParameterizedTest
-    @EnumSource(CoreOptions.MergeEngine.class)
-    public void testDeletePushDownWithPrimaryKey(CoreOptions.MergeEngine mergeEngine)
-            throws Exception {
-        Set<CoreOptions.MergeEngine> supportUpdateEngines = new HashSet<>();
-        supportUpdateEngines.add(CoreOptions.MergeEngine.DEDUPLICATE);
-
+    @Test
+    public void testDeleteWithPrimaryKeyFilter() throws Exception {
         // Step1: define table schema
-        Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), WriteMode.CHANGE_LOG.toString());
-        options.put(MERGE_ENGINE.key(), mergeEngine.toString());
-        if (mergeEngine == FIRST_ROW) {
-            options.put(CHANGELOG_PRODUCER.key(), LOOKUP.toString());
-        }
         String table =
                 createTable(
                         Arrays.asList(
@@ -1769,8 +1771,9 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "rate BIGINT",
                                 "dt String"),
                         Arrays.asList("id", "dt"),
+                        Collections.emptyList(),
                         Collections.singletonList("dt"),
-                        options);
+                        Collections.emptyMap());
 
         // Step2: batch write some historical data
         insertInto(
@@ -1796,52 +1799,24 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                         changelogRow("+I", 6L, "CAD", 119L, "2022-01-03"),
                         changelogRow("+I", 7L, "INR", 119L, "2022-01-03"),
                         changelogRow("+I", 8L, "MOP", 119L, "2022-01-03"));
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        bEnv.executeSql(deleteStatement).await();
+        String querySql = String.format("SELECT * FROM %s", table);
+        testBatchRead(querySql, expectedRecords);
 
         // Test2 delete statement no where
         String deleteStatement2 = String.format("DELETE FROM %s", table);
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement2).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, Collections.emptyList());
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement2).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        bEnv.executeSql(deleteStatement2).await();
+        testBatchRead(String.format("SELECT * FROM %s", table), Collections.emptyList());
 
         // Test3 delete statement where pt
         String deleteStatement3 = String.format("DELETE FROM %s WHERE dt = '2022-01-03'", table);
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement3).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, Collections.emptyList());
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement3).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        bEnv.executeSql(deleteStatement3).await();
+        testBatchRead(String.format("SELECT * FROM %s", table), Collections.emptyList());
     }
 
-    @ParameterizedTest
-    @EnumSource(CoreOptions.MergeEngine.class)
-    public void testDeletePushDownWithPartitionKey(CoreOptions.MergeEngine mergeEngine)
-            throws Exception {
-        Set<CoreOptions.MergeEngine> supportUpdateEngines = new HashSet<>();
-        supportUpdateEngines.add(CoreOptions.MergeEngine.DEDUPLICATE);
-
+    @Test
+    public void testDeletePushDownWithPartitionKey() throws Exception {
         // Step1: define table schema
-        Map<String, String> options = new HashMap<>();
-        options.put(WRITE_MODE.key(), WriteMode.CHANGE_LOG.toString());
-        options.put(MERGE_ENGINE.key(), mergeEngine.toString());
-        if (mergeEngine == FIRST_ROW) {
-            options.put(CHANGELOG_PRODUCER.key(), LOOKUP.toString());
-        }
         String table =
                 createTable(
                         Arrays.asList(
@@ -1851,8 +1826,9 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                                 "dt String",
                                 "hh String"),
                         Arrays.asList("id", "dt", "hh"),
+                        Collections.emptyList(),
                         Arrays.asList("dt", "hh"),
-                        options);
+                        Collections.emptyMap());
 
         // Step2: batch write some historical data
         insertInto(
@@ -1880,14 +1856,9 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                         changelogRow("+I", 6L, "CAD", 119L, "2022-01-03", "16"),
                         changelogRow("+I", 7L, "INR", 119L, "2022-01-03", "17"),
                         changelogRow("+I", 8L, "MOP", 119L, "2022-01-03", "18"));
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        bEnv.executeSql(deleteStatement).await();
+        String querySql = String.format("SELECT * FROM %s", table);
+        testBatchRead(querySql, expectedRecords);
 
         // Step5: partition key not push down
         String deleteStatement1 =
@@ -1899,14 +1870,8 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                         changelogRow("+I", 6L, "CAD", 119L, "2022-01-03", "16"),
                         changelogRow("+I", 7L, "INR", 119L, "2022-01-03", "17"),
                         changelogRow("+I", 8L, "MOP", 119L, "2022-01-03", "18"));
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement1).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords1);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement1).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        bEnv.executeSql(deleteStatement1).await();
+        testBatchRead(String.format("SELECT * FROM %s", table), expectedRecords1);
 
         // Step6: partition key delete push down
         String deleteStatement2 =
@@ -1919,14 +1884,8 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                         changelogRow("+I", 2L, "UNKNOWN", -1L, "2022-01-01", "12"),
                         changelogRow("+I", 7L, "INR", 119L, "2022-01-03", "17"),
                         changelogRow("+I", 8L, "MOP", 119L, "2022-01-03", "18"));
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement2).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords2);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement2).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        bEnv.executeSql(deleteStatement2).await();
+        testBatchRead(String.format("SELECT * FROM %s", table), expectedRecords2);
 
         // Step8: partition key delete push down
         String deleteStatement3 = String.format("DELETE FROM %s WHERE dt = '2022-01-03'", table);
@@ -1936,14 +1895,8 @@ public class ReadWriteTableITCase extends AbstractTestBase {
                 Arrays.asList(
                         changelogRow("+I", 1L, "US Dollar", 114L, "2022-01-01", "11"),
                         changelogRow("+I", 2L, "UNKNOWN", -1L, "2022-01-01", "12"));
-        if (supportUpdateEngines.contains(mergeEngine)) {
-            bEnv.executeSql(deleteStatement3).await();
-            String querySql = String.format("SELECT * FROM %s", table);
-            testBatchRead(querySql, expectedRecords3);
-        } else {
-            assertThatThrownBy(() -> bEnv.executeSql(deleteStatement3).await())
-                    .satisfies(AssertionUtils.anyCauseMatches(UnsupportedOperationException.class));
-        }
+        bEnv.executeSql(deleteStatement3).await();
+        testBatchRead(String.format("SELECT * FROM %s", table), expectedRecords3);
     }
 
     // ----------------------------------------------------------------------------------------------------------------
@@ -2001,6 +1954,8 @@ public class ReadWriteTableITCase extends AbstractTestBase {
             options.put(SINK_PARALLELISM.key(), configParallelism.toString());
         }
         options.put("path", getTempFilePath(UUID.randomUUID().toString()));
+        options.put("bucket", "1");
+        options.put("bucket-key", "a");
 
         DynamicTableFactory.Context context =
                 new FactoryUtil.DefaultDynamicTableContext(
@@ -2026,7 +1981,10 @@ public class ReadWriteTableITCase extends AbstractTestBase {
 
         DynamicTableSink tableSink =
                 new FlinkTableSink(
-                        context.getObjectIdentifier(), buildPaimonTable(context), context, null);
+                        context.getObjectIdentifier(),
+                        new FlinkTableFactory().buildPaimonTable(context),
+                        context,
+                        null);
         assertThat(tableSink).isInstanceOf(FlinkTableSink.class);
 
         // 2. get sink provider

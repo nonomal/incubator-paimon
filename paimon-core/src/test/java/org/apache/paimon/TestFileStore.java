@@ -25,9 +25,14 @@ import org.apache.paimon.fs.FileIOFinder;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.index.IndexFileMeta;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataFilePathFactory;
 import org.apache.paimon.io.IndexIncrement;
+import org.apache.paimon.manifest.FileEntry;
+import org.apache.paimon.manifest.FileKind;
+import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.ManifestFile;
 import org.apache.paimon.manifest.ManifestFileMeta;
 import org.apache.paimon.manifest.ManifestList;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
@@ -36,20 +41,26 @@ import org.apache.paimon.mergetree.compact.MergeFunctionFactory;
 import org.apache.paimon.operation.AbstractFileStoreWrite;
 import org.apache.paimon.operation.FileStoreCommit;
 import org.apache.paimon.operation.FileStoreCommitImpl;
-import org.apache.paimon.operation.FileStoreExpireImpl;
-import org.apache.paimon.operation.FileStoreRead;
-import org.apache.paimon.operation.FileStoreScan;
+import org.apache.paimon.operation.SplitRead;
+import org.apache.paimon.options.ExpireConfig;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReaderIterator;
 import org.apache.paimon.schema.KeyValueFieldsExtractor;
 import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.CatalogEnvironment;
+import org.apache.paimon.table.ExpireChangelogImpl;
+import org.apache.paimon.table.ExpireSnapshots;
+import org.apache.paimon.table.ExpireSnapshotsImpl;
 import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.ScanMode;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.CommitIncrement;
+import org.apache.paimon.utils.DataFilePathFactories;
 import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.RecordWriter;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.TagManager;
@@ -60,6 +71,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -100,11 +112,21 @@ public class TestFileStore extends KeyValueFileStore {
             RowType keyType,
             RowType valueType,
             KeyValueFieldsExtractor keyValueFieldsExtractor,
-            MergeFunctionFactory<KeyValue> mfFactory) {
+            MergeFunctionFactory<KeyValue> mfFactory,
+            TableSchema tableSchema) {
         super(
                 FileIOFinder.find(new Path(root)),
-                new SchemaManager(FileIOFinder.find(new Path(root)), options.path()),
-                0L,
+                schemaManager(root, options),
+                tableSchema != null
+                        ? tableSchema
+                        : new TableSchema(
+                                0L,
+                                valueType.getFields(),
+                                valueType.getFieldCount(),
+                                partitionType.getFieldNames(),
+                                keyType.getFieldNames(),
+                                Collections.emptyMap(),
+                                null),
                 false,
                 options,
                 partitionType,
@@ -112,7 +134,9 @@ public class TestFileStore extends KeyValueFileStore {
                 keyType,
                 valueType,
                 keyValueFieldsExtractor,
-                mfFactory);
+                mfFactory,
+                (new Path(root)).getName(),
+                CatalogEnvironment.empty());
         this.root = root;
         this.fileIO = FileIOFinder.find(new Path(root));
         this.keySerializer = new InternalRowSerializer(keyType);
@@ -120,6 +144,10 @@ public class TestFileStore extends KeyValueFileStore {
         this.commitUser = UUID.randomUUID().toString();
 
         this.commitIdentifier = 0L;
+    }
+
+    private static SchemaManager schemaManager(String root, CoreOptions options) {
+        return new SchemaManager(FileIOFinder.find(new Path(root)), options.path());
     }
 
     public AbstractFileStoreWrite<KeyValue> newWrite() {
@@ -130,16 +158,35 @@ public class TestFileStore extends KeyValueFileStore {
         return super.newCommit(commitUser);
     }
 
-    public FileStoreExpireImpl newExpire(
-            int numRetainedMin, int numRetainedMax, long millisRetained) {
-        return new FileStoreExpireImpl(
-                numRetainedMin,
-                numRetainedMax,
-                millisRetained,
-                snapshotManager(),
-                newSnapshotDeletion(),
-                new TagManager(fileIO, options.path()),
-                Integer.MAX_VALUE);
+    public ExpireSnapshots newExpire(int numRetainedMin, int numRetainedMax, long millisRetained) {
+        return new ExpireSnapshotsImpl(
+                        snapshotManager(),
+                        newSnapshotDeletion(),
+                        new TagManager(fileIO, options.path()))
+                .config(
+                        ExpireConfig.builder()
+                                .snapshotRetainMax(numRetainedMax)
+                                .snapshotRetainMin(numRetainedMin)
+                                .snapshotTimeRetain(Duration.ofMillis(millisRetained))
+                                .build());
+    }
+
+    public ExpireSnapshots newExpire(ExpireConfig expireConfig) {
+        return new ExpireSnapshotsImpl(
+                        snapshotManager(),
+                        newSnapshotDeletion(),
+                        new TagManager(fileIO, options.path()))
+                .config(expireConfig);
+    }
+
+    public ExpireSnapshots newChangelogExpire(ExpireConfig config) {
+        ExpireChangelogImpl impl =
+                new ExpireChangelogImpl(
+                        snapshotManager(),
+                        new TagManager(fileIO, options.path()),
+                        newChangelogDeletion());
+        impl.config(config);
+        return impl;
     }
 
     public List<Snapshot> commitData(
@@ -179,7 +226,8 @@ public class TestFileStore extends KeyValueFileStore {
                 null,
                 Collections.emptyList(),
                 (commit, committable) -> {
-                    logOffsets.forEach(committable::addLogOffset);
+                    logOffsets.forEach(
+                            (bucket, offset) -> committable.addLogOffset(bucket, offset, false));
                     commit.commit(committable, Collections.emptyMap());
                 });
     }
@@ -203,14 +251,15 @@ public class TestFileStore extends KeyValueFileStore {
     }
 
     public Snapshot dropPartitions(List<Map<String, String>> partitions) {
-        FileStoreCommit commit = newCommit(commitUser);
-
         SnapshotManager snapshotManager = snapshotManager();
         Long snapshotIdBeforeCommit = snapshotManager.latestSnapshotId();
         if (snapshotIdBeforeCommit == null) {
             snapshotIdBeforeCommit = Snapshot.FIRST_SNAPSHOT_ID - 1;
         }
-        commit.dropPartitions(partitions, Long.MAX_VALUE);
+
+        try (FileStoreCommit commit = newCommit(commitUser)) {
+            commit.dropPartitions(partitions, Long.MAX_VALUE);
+        }
 
         Long snapshotIdAfterCommit = snapshotManager.latestSnapshotId();
         assertThat(snapshotIdAfterCommit).isNotNull();
@@ -273,7 +322,6 @@ public class TestFileStore extends KeyValueFileStore {
                     .write(kv);
         }
 
-        FileStoreCommit commit = newCommit(commitUser);
         ManifestCommittable committable =
                 new ManifestCommittable(
                         identifier == null ? commitIdentifier++ : identifier, watermark);
@@ -298,7 +346,11 @@ public class TestFileStore extends KeyValueFileStore {
         if (snapshotIdBeforeCommit == null) {
             snapshotIdBeforeCommit = Snapshot.FIRST_SNAPSHOT_ID - 1;
         }
-        commitFunction.accept(commit, committable);
+
+        try (FileStoreCommit commit = newCommit(commitUser)) {
+            commitFunction.accept(commit, committable);
+        }
+
         Long snapshotIdAfterCommit = snapshotManager.latestSnapshotId();
         if (snapshotIdAfterCommit == null) {
             snapshotIdAfterCommit = Snapshot.FIRST_SNAPSHOT_ID - 1;
@@ -368,7 +420,7 @@ public class TestFileStore extends KeyValueFileStore {
         }
 
         List<KeyValue> kvs = new ArrayList<>();
-        FileStoreRead<KeyValue> read = newRead();
+        SplitRead<KeyValue> read = newRead();
         for (Map.Entry<BinaryRow, Map<Integer, List<DataFileMeta>>> entryWithPartition :
                 filesPerPartitionAndBucket.entrySet()) {
             for (Map.Entry<Integer, List<DataFileMeta>> entryWithBucket :
@@ -381,6 +433,8 @@ public class TestFileStore extends KeyValueFileStore {
                                                 .withBucket(entryWithBucket.getKey())
                                                 .withDataFiles(entryWithBucket.getValue())
                                                 .isStreaming(isStreaming)
+                                                .rawConvertible(false)
+                                                .withBucketPath("not used")
                                                 .build()));
                 while (iterator.hasNext()) {
                     kvs.add(iterator.next().copy(keySerializer, valueSerializer));
@@ -452,7 +506,20 @@ public class TestFileStore extends KeyValueFileStore {
             fileIO.delete(latest, false);
             assertThat(latestId <= snapshotManager.latestSnapshotId()).isTrue();
         }
-        actualFiles.remove(latest);
+        Path changelogDir = snapshotManager.changelogDirectory();
+        Path earliestChangelog = new Path(changelogDir, SnapshotManager.EARLIEST);
+        Path latestChangelog = new Path(changelogDir, SnapshotManager.LATEST);
+
+        if (actualFiles.remove(earliestChangelog)) {
+            long earliestId = snapshotManager.readHint(SnapshotManager.EARLIEST, changelogDir);
+            fileIO.delete(earliest, false);
+            assertThat(earliestId <= snapshotManager.earliestLongLivedChangelogId()).isTrue();
+        }
+        if (actualFiles.remove(latestChangelog)) {
+            long latestId = snapshotManager.readHint(SnapshotManager.LATEST, changelogDir);
+            fileIO.delete(latest, false);
+            assertThat(latestId <= snapshotManager.latestLongLivedChangelogId()).isTrue();
+        }
 
         // for easier debugging
         String expectedString =
@@ -480,7 +547,8 @@ public class TestFileStore extends KeyValueFileStore {
 
         long firstInUseSnapshotId = Snapshot.FIRST_SNAPSHOT_ID;
         for (long id = latestSnapshotId - 1; id >= Snapshot.FIRST_SNAPSHOT_ID; id--) {
-            if (!snapshotManager.snapshotExists(id)) {
+            if (!snapshotManager.snapshotExists(id)
+                    && !snapshotManager.longLivedChangelogExists(id)) {
                 firstInUseSnapshotId = id + 1;
                 break;
             }
@@ -489,6 +557,7 @@ public class TestFileStore extends KeyValueFileStore {
         for (long id = firstInUseSnapshotId; id <= latestSnapshotId; id++) {
             result.addAll(getFilesInUse(id));
         }
+
         return result;
     }
 
@@ -496,20 +565,63 @@ public class TestFileStore extends KeyValueFileStore {
         return getFilesInUse(
                 snapshotId,
                 snapshotManager(),
-                newScan(),
                 fileIO,
                 pathFactory(),
-                manifestListFactory().create());
+                manifestListFactory().create(),
+                manifestFileFactory().create());
     }
 
     public static Set<Path> getFilesInUse(
             long snapshotId,
             SnapshotManager snapshotManager,
-            FileStoreScan scan,
             FileIO fileIO,
             FileStorePathFactory pathFactory,
-            ManifestList manifestList) {
+            ManifestList manifestList,
+            ManifestFile manifestFile) {
         Set<Path> result = new HashSet<>();
+
+        if (snapshotManager.snapshotExists(snapshotId)) {
+            Set<Path> files =
+                    getSnapshotFileInUse(
+                            snapshotId,
+                            snapshotManager,
+                            fileIO,
+                            pathFactory,
+                            manifestList,
+                            manifestFile);
+            result.addAll(files);
+        } else if (snapshotManager.longLivedChangelogExists(snapshotId)) {
+            Set<Path> files =
+                    getChangelogFileInUse(
+                            snapshotId,
+                            snapshotManager,
+                            fileIO,
+                            pathFactory,
+                            manifestList,
+                            manifestFile);
+            result.addAll(files);
+        } else {
+            throw new RuntimeException(
+                    String.format("The snapshot %s does not exist.", snapshotId));
+        }
+
+        return result;
+    }
+
+    private static Set<Path> getSnapshotFileInUse(
+            long snapshotId,
+            SnapshotManager snapshotManager,
+            FileIO fileIO,
+            FileStorePathFactory pathFactory,
+            ManifestList manifestList,
+            ManifestFile manifestFile) {
+        Set<Path> result = new HashSet<>();
+        SchemaManager schemaManager = new SchemaManager(fileIO, snapshotManager.tablePath());
+        CoreOptions options = new CoreOptions(schemaManager.latest().get().options());
+        boolean produceChangelog =
+                options.changelogProducer() != CoreOptions.ChangelogProducer.NONE;
+        // The option from the table may not align with the expiration config
+        boolean changelogDecoupled = snapshotManager.earliestLongLivedChangelogId() != null;
 
         Path snapshotPath = snapshotManager.snapshotPath(snapshotId);
         Snapshot snapshot = Snapshot.fromPath(fileIO, snapshotPath);
@@ -525,18 +637,118 @@ public class TestFileStore extends KeyValueFileStore {
         }
 
         // manifests
-        List<ManifestFileMeta> manifests = snapshot.allManifests(manifestList);
+        List<ManifestFileMeta> manifests = manifestList.readAllManifests(snapshot);
         manifests.forEach(m -> result.add(pathFactory.toManifestFilePath(m.fileName())));
 
         // data file
-        List<ManifestEntry> entries = scan.withManifestList(manifests).plan().files();
+        List<ManifestEntry> entries =
+                manifests.stream()
+                        .flatMap(m -> manifestFile.read(m.fileName()).stream())
+                        .collect(Collectors.toList());
+        entries = new ArrayList<>(FileEntry.mergeEntries(entries));
+        DataFilePathFactories factories = new DataFilePathFactories(pathFactory);
+
         for (ManifestEntry entry : entries) {
-            result.add(
-                    new Path(
-                            pathFactory.bucketPath(entry.partition(), entry.bucket()),
-                            entry.file().fileName()));
+            DataFilePathFactory dataFilePathFactory =
+                    factories.get(entry.partition(), entry.bucket());
+            result.add(dataFilePathFactory.toPath(entry));
         }
 
+        // Add 'DELETE' 'APPEND' file in snapshot
+        // These 'delete' files can be merged by the plan#splits,
+        // so it's not shown in the entries above.
+        // In other words, these files are not used (by snapshot or changelog) now,
+        // but it can only be cleaned after this snapshot expired, so we should add it to the file
+        // use list.
+        if (changelogDecoupled && !produceChangelog) {
+            entries =
+                    manifestList.readDeltaManifests(snapshot).stream()
+                            .flatMap(m -> manifestFile.read(m.fileName()).stream())
+                            .collect(Collectors.toList());
+            for (ManifestEntry entry : entries) {
+                // append delete file are delayed to delete
+                if (entry.kind() == FileKind.DELETE
+                        && entry.file().fileSource().orElse(FileSource.APPEND)
+                                == FileSource.APPEND) {
+                    DataFilePathFactory dataFilePathFactory =
+                            factories.get(entry.partition(), entry.bucket());
+                    result.add(dataFilePathFactory.toPath(entry));
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static Set<Path> getChangelogFileInUse(
+            long changelogId,
+            SnapshotManager snapshotManager,
+            FileIO fileIO,
+            FileStorePathFactory pathFactory,
+            ManifestList manifestList,
+            ManifestFile manifestFile) {
+        Set<Path> result = new HashSet<>();
+        SchemaManager schemaManager = new SchemaManager(fileIO, snapshotManager.tablePath());
+        CoreOptions options = new CoreOptions(schemaManager.latest().get().options());
+
+        Path changelogPath = snapshotManager.longLivedChangelogPath(changelogId);
+        Changelog changelog = Changelog.fromPath(fileIO, changelogPath);
+
+        // changelog file
+        result.add(changelogPath);
+
+        Map<Pair<BinaryRow, Integer>, DataFilePathFactory> dataFilePathFactoryMap = new HashMap<>();
+        // data file
+        // not all manifests contains useful data file
+        // (1) produceChangelog = 'true': data file in changelog manifests
+        // (2) produceChangelog = 'false': 'APPEND' data file in delta manifests
+
+        // delta file
+        if (options.changelogProducer() == CoreOptions.ChangelogProducer.NONE) {
+            // TODO why we need to keep base manifests?
+            result.add(pathFactory.toManifestListPath(changelog.baseManifestList()));
+            manifestList
+                    .readDataManifests(changelog)
+                    .forEach(m -> result.add(pathFactory.toManifestFilePath(m.fileName())));
+
+            result.add(pathFactory.toManifestListPath(changelog.deltaManifestList()));
+            List<ManifestFileMeta> manifests = manifestList.readDeltaManifests(changelog);
+            manifests.forEach(m -> result.add(pathFactory.toManifestFilePath(m.fileName())));
+            List<ManifestEntry> files =
+                    manifests.stream()
+                            .flatMap(m -> manifestFile.read(m.fileName()).stream())
+                            .collect(Collectors.toList());
+            for (ManifestEntry entry : files) {
+                if (entry.file().fileSource().orElse(FileSource.APPEND) == FileSource.APPEND) {
+                    Pair<BinaryRow, Integer> bucket = Pair.of(entry.partition(), entry.bucket());
+                    DataFilePathFactory dataFilePathFactory =
+                            dataFilePathFactoryMap.computeIfAbsent(
+                                    bucket,
+                                    b ->
+                                            pathFactory.createDataFilePathFactory(
+                                                    entry.partition(), entry.bucket()));
+                    result.add(dataFilePathFactory.toPath(entry));
+                }
+            }
+        } else if (changelog.changelogManifestList() != null) {
+            result.add(pathFactory.toManifestListPath(changelog.changelogManifestList()));
+            List<ManifestFileMeta> manifests = manifestList.readChangelogManifests(changelog);
+            manifests.forEach(m -> result.add(pathFactory.toManifestFilePath(m.fileName())));
+            List<ManifestEntry> files =
+                    manifests.stream()
+                            .flatMap(m -> manifestFile.read(m.fileName()).stream())
+                            .collect(Collectors.toList());
+            for (ManifestEntry entry : files) {
+                Pair<BinaryRow, Integer> bucket = Pair.of(entry.partition(), entry.bucket());
+                DataFilePathFactory dataFilePathFactory =
+                        dataFilePathFactoryMap.computeIfAbsent(
+                                bucket,
+                                b ->
+                                        pathFactory.createDataFilePathFactory(
+                                                entry.partition(), entry.bucket()));
+                result.add(dataFilePathFactory.toPath(entry));
+            }
+        }
         return result;
     }
 
@@ -551,6 +763,7 @@ public class TestFileStore extends KeyValueFileStore {
         private final RowType valueType;
         private final KeyValueFieldsExtractor keyValueFieldsExtractor;
         private final MergeFunctionFactory<KeyValue> mfFactory;
+        private final TableSchema tableSchema;
 
         private CoreOptions.ChangelogProducer changelogProducer;
 
@@ -562,7 +775,8 @@ public class TestFileStore extends KeyValueFileStore {
                 RowType keyType,
                 RowType valueType,
                 KeyValueFieldsExtractor keyValueFieldsExtractor,
-                MergeFunctionFactory<KeyValue> mfFactory) {
+                MergeFunctionFactory<KeyValue> mfFactory,
+                TableSchema tableSchema) {
             this.format = format;
             this.root = root;
             this.numBuckets = numBuckets;
@@ -571,6 +785,7 @@ public class TestFileStore extends KeyValueFileStore {
             this.valueType = valueType;
             this.keyValueFieldsExtractor = keyValueFieldsExtractor;
             this.mfFactory = mfFactory;
+            this.tableSchema = tableSchema;
 
             this.changelogProducer = CoreOptions.ChangelogProducer.NONE;
         }
@@ -581,7 +796,8 @@ public class TestFileStore extends KeyValueFileStore {
         }
 
         public TestFileStore build() {
-            Options conf = new Options();
+            Options conf =
+                    tableSchema == null ? new Options() : Options.fromMap(tableSchema.options());
 
             conf.set(CoreOptions.WRITE_BUFFER_SIZE, WRITE_BUFFER_SIZE);
             conf.set(CoreOptions.PAGE_SIZE, PAGE_SIZE);
@@ -591,8 +807,8 @@ public class TestFileStore extends KeyValueFileStore {
                     CoreOptions.MANIFEST_TARGET_FILE_SIZE,
                     MemorySize.parse((ThreadLocalRandom.current().nextInt(16) + 1) + "kb"));
 
-            conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.fromValue(format));
-            conf.set(CoreOptions.MANIFEST_FORMAT, CoreOptions.FileFormatType.fromValue(format));
+            conf.set(CoreOptions.FILE_FORMAT, format);
+            conf.set(CoreOptions.MANIFEST_FORMAT, format);
             conf.set(CoreOptions.PATH, root);
             conf.set(CoreOptions.BUCKET, numBuckets);
 
@@ -608,7 +824,8 @@ public class TestFileStore extends KeyValueFileStore {
                     keyType,
                     valueType,
                     keyValueFieldsExtractor,
-                    mfFactory);
+                    mfFactory,
+                    tableSchema);
         }
     }
 }

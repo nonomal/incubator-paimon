@@ -21,6 +21,7 @@ package org.apache.paimon.flink.source;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryRowWriter;
@@ -41,7 +42,6 @@ import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.SnapshotManager;
 
-import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.data.RowData;
@@ -54,6 +54,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -66,7 +67,7 @@ import java.util.regex.Pattern;
 import static org.apache.paimon.utils.SerializationUtils.deserializeBinaryRow;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** IT cases for {@link MultiTablesCompactorSourceBuilder}. */
+/** IT cases for {@link CombinedTableCompactorSourceBuilder}. */
 public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
         implements Serializable {
     private String warehouse;
@@ -112,6 +113,7 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
             // change options to test whether CompactorSourceBuilder work normally
             options.put(CoreOptions.SCAN_SNAPSHOT_ID.key(), "2");
         }
+        options.put("bucket", "1");
         long monitorInterval = 1000;
 
         for (String dbName : DATABASE_NAMES) {
@@ -155,11 +157,13 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
             }
         }
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setRuntimeMode(RuntimeExecutionMode.BATCH);
-        env.setParallelism(ThreadLocalRandom.current().nextInt(2) + 1);
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder()
+                        .batchMode()
+                        .parallelism(ThreadLocalRandom.current().nextInt(2) + 1)
+                        .build();
         DataStream<RowData> source =
-                new MultiTablesCompactorSourceBuilder(
+                new CombinedTableCompactorSourceBuilder(
                                 catalogLoader(),
                                 Pattern.compile("db1|db2"),
                                 Pattern.compile(".*"),
@@ -167,7 +171,7 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                                 monitorInterval)
                         .withContinuousMode(false)
                         .withEnv(env)
-                        .build();
+                        .buildAwareBucketTableSource();
         CloseableIterator<RowData> it = source.executeAndCollect();
         List<String> actual = new ArrayList<>();
         while (it.hasNext()) {
@@ -203,6 +207,7 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                     CoreOptions.ChangelogProducer.NONE.toString());
             options.put(CoreOptions.SCAN_BOUNDED_WATERMARK.key(), "0");
         }
+        options.put("bucket", "1");
         long monitorInterval = 1000;
         List<FileStoreTable> tables = new ArrayList<>();
         for (String dbName : DATABASE_NAMES) {
@@ -252,9 +257,10 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
             }
         }
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().streamingMode().build();
         DataStream<RowData> compactorSource =
-                new MultiTablesCompactorSourceBuilder(
+                new CombinedTableCompactorSourceBuilder(
                                 catalogLoader(),
                                 Pattern.compile(".*"),
                                 Pattern.compile(".*"),
@@ -262,7 +268,7 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                                 monitorInterval)
                         .withContinuousMode(true)
                         .withEnv(env)
-                        .build();
+                        .buildAwareBucketTableSource();
         CloseableIterator<RowData> it = compactorSource.executeAndCollect();
 
         List<String> actual = new ArrayList<>();
@@ -301,6 +307,8 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                     rowData(2, 1520, 15, BinaryString.fromString("20221209")),
                     rowData(1, 1510, 16, BinaryString.fromString("20221208")),
                     rowData(1, 1511, 15, BinaryString.fromString("20221209")));
+            write.close();
+            commit.close();
         }
         actual.clear();
         for (int i = 0; i < 8; i++) {
@@ -340,6 +348,8 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                         0,
                         rowData(2, 1520, 15, BinaryString.fromString("20221209")),
                         rowData(1, 1510, 16, BinaryString.fromString("20221208")));
+                write.close();
+                commit.close();
             }
         }
         actual.clear();
@@ -368,6 +378,7 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                     CoreOptions.ChangelogProducer.NONE.toString());
             options.put(CoreOptions.SCAN_BOUNDED_WATERMARK.key(), "0");
         }
+        options.put("bucket", "1");
         long monitorInterval = 1000;
 
         for (String dbName : DATABASE_NAMES) {
@@ -416,9 +427,10 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
             }
         }
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().streamingMode().build();
         DataStream<RowData> compactorSource =
-                new MultiTablesCompactorSourceBuilder(
+                new CombinedTableCompactorSourceBuilder(
                                 catalogLoader(),
                                 Pattern.compile(".*"),
                                 Pattern.compile("db1.+|db2.t1|db3.t1"),
@@ -426,7 +438,7 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                                 monitorInterval)
                         .withContinuousMode(true)
                         .withEnv(env)
-                        .build();
+                        .buildAwareBucketTableSource();
         CloseableIterator<RowData> it = compactorSource.executeAndCollect();
 
         List<String> actual = new ArrayList<>();
@@ -466,6 +478,8 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
                         0,
                         rowData(2, 1520, 15, BinaryString.fromString("20221209")),
                         rowData(1, 1510, 16, BinaryString.fromString("20221208")));
+                write.close();
+                commit.close();
             }
         }
         actual.clear();
@@ -479,6 +493,109 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
         it.close();
     }
 
+    @ParameterizedTest(name = "defaultOptions = {0}")
+    @ValueSource(booleans = {true, false})
+    public void testHistoryPatitionRead(boolean defaultOptions) throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.WRITE_ONLY.key(), "true");
+        if (!defaultOptions) {
+            // change options to test whether CompactorSourceBuilder work normally
+            options.put(CoreOptions.SCAN_SNAPSHOT_ID.key(), "2");
+        }
+        options.put("bucket", "1");
+        long monitorInterval = 1000;
+        Duration partitionIdleTime = Duration.ofMillis(3000);
+        List<FileStoreTable> tables = new ArrayList<>();
+
+        for (String dbName : DATABASE_NAMES) {
+            for (String tableName : TABLE_NAMES) {
+                FileStoreTable table =
+                        createTable(
+                                dbName,
+                                tableName,
+                                ROW_TYPE_MAP.get(tableName),
+                                Arrays.asList("dt", "hh"),
+                                Arrays.asList("dt", "hh", "k"),
+                                options);
+                tables.add(table);
+                SnapshotManager snapshotManager = table.snapshotManager();
+                StreamWriteBuilder streamWriteBuilder =
+                        table.newStreamWriteBuilder().withCommitUser(commitUser);
+                StreamTableWrite write = streamWriteBuilder.newWrite();
+                StreamTableCommit commit = streamWriteBuilder.newCommit();
+
+                writeData(
+                        write,
+                        commit,
+                        0,
+                        rowData(1, 100, 15, BinaryString.fromString("20221208")),
+                        rowData(1, 100, 16, BinaryString.fromString("20221208")),
+                        rowData(1, 100, 15, BinaryString.fromString("20221209")));
+
+                writeData(
+                        write,
+                        commit,
+                        1,
+                        rowData(2, 100, 15, BinaryString.fromString("20221208")),
+                        rowData(2, 100, 16, BinaryString.fromString("20221208")),
+                        rowData(2, 100, 15, BinaryString.fromString("20221209")));
+
+                Snapshot snapshot = snapshotManager.snapshot(snapshotManager.latestSnapshotId());
+                assertThat(snapshot.id()).isEqualTo(2);
+                assertThat(snapshot.commitKind()).isEqualTo(Snapshot.CommitKind.APPEND);
+
+                write.close();
+                commit.close();
+            }
+        }
+
+        // sleep 3 seconds, and update partition 20221208-16
+        Thread.sleep(3000);
+
+        for (FileStoreTable table : tables) {
+            StreamWriteBuilder streamWriteBuilder =
+                    table.newStreamWriteBuilder().withCommitUser(commitUser);
+            StreamTableWrite write = streamWriteBuilder.newWrite();
+            StreamTableCommit commit = streamWriteBuilder.newCommit();
+            writeData(write, commit, 2, rowData(3, 100, 16, BinaryString.fromString("20221208")));
+        }
+
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder()
+                        .batchMode()
+                        .parallelism(ThreadLocalRandom.current().nextInt(2) + 1)
+                        .build();
+
+        DataStream<RowData> source =
+                new CombinedTableCompactorSourceBuilder(
+                                catalogLoader(),
+                                Pattern.compile("db1|db2"),
+                                Pattern.compile(".*"),
+                                null,
+                                monitorInterval)
+                        .withPartitionIdleTime(partitionIdleTime)
+                        .withContinuousMode(false)
+                        .withEnv(env)
+                        .buildAwareBucketTableSource();
+        CloseableIterator<RowData> it = source.executeAndCollect();
+        List<String> actual = new ArrayList<>();
+        while (it.hasNext()) {
+            actual.add(toString(it.next()));
+        }
+        assertThat(actual)
+                .hasSameElementsAs(
+                        Arrays.asList(
+                                "+I 3|20221208|15|0|0|db1|t1",
+                                "+I 3|20221209|15|0|0|db1|t1",
+                                "+I 3|20221208|15|0|0|db1|t2",
+                                "+I 3|20221209|15|0|0|db1|t2",
+                                "+I 3|20221208|15|0|0|db2|t1",
+                                "+I 3|20221209|15|0|0|db2|t1",
+                                "+I 3|20221208|15|0|0|db2|t2",
+                                "+I 3|20221209|15|0|0|db2|t2"));
+        it.close();
+    }
+
     private FileStoreTable createTable(
             String databaseName,
             String tableName,
@@ -487,14 +604,15 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
             List<String> primaryKeys,
             Map<String, String> options)
             throws Exception {
-        Catalog catalog = catalogLoader().load();
-        Identifier identifier = Identifier.create(databaseName, tableName);
-        catalog.createDatabase(databaseName, true);
-        catalog.createTable(
-                identifier,
-                new Schema(rowType.getFields(), partitionKeys, primaryKeys, options, ""),
-                false);
-        return (FileStoreTable) catalog.getTable(identifier);
+        try (Catalog catalog = catalogLoader().load()) {
+            Identifier identifier = Identifier.create(databaseName, tableName);
+            catalog.createDatabase(databaseName, true);
+            catalog.createTable(
+                    identifier,
+                    new Schema(rowType.getFields(), partitionKeys, primaryKeys, options, ""),
+                    false);
+            return (FileStoreTable) catalog.getTable(identifier);
+        }
     }
 
     private GenericRow rowData(Object... values) {
@@ -545,7 +663,7 @@ public class MultiTablesCompactorSourceBuilderITCase extends AbstractTestBase
         return b;
     }
 
-    private Catalog.Loader catalogLoader() {
+    private CatalogLoader catalogLoader() {
         // to make the action workflow serializable
         catalogOptions.set(CatalogOptions.WAREHOUSE, warehouse);
         return () -> FlinkCatalogFactory.createPaimonCatalog(catalogOptions);

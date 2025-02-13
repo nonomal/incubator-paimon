@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -42,6 +42,8 @@ import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TimestampType;
+
+import javax.annotation.Nullable;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -193,12 +195,18 @@ public class InternalRowUtils {
             case BINARY:
             case VARBINARY:
                 return dataGetters.getBinary(pos);
+            case VARIANT:
+                return dataGetters.getVariant(pos);
             default:
                 throw new UnsupportedOperationException("Unsupported type: " + fieldType);
         }
     }
 
-    public static InternalArray toStringArrayData(List<String> list) {
+    public static InternalArray toStringArrayData(@Nullable List<String> list) {
+        if (list == null) {
+            return null;
+        }
+
         return new GenericArray(list.stream().map(BinaryString::fromString).toArray());
     }
 
@@ -279,8 +287,12 @@ public class InternalRowUtils {
             case VARBINARY:
                 ret = byteArrayCompare((byte[]) x, (byte[]) y);
                 break;
+            case VARCHAR:
+            case CHAR:
+                ret = ((BinaryString) x).compareTo((BinaryString) y);
+                break;
             default:
-                throw new IllegalArgumentException();
+                throw new IllegalArgumentException("Incomparable type: " + type);
         }
         return ret;
     }

@@ -18,16 +18,13 @@
 
 package org.apache.paimon.flink.action;
 
-import org.apache.flink.api.java.tuple.Tuple3;
-import org.apache.flink.api.java.utils.MultipleParameterTool;
-
+import java.time.Duration;
 import java.util.Map;
-import java.util.Optional;
 
 /** Factory to create {@link CreateTagAction}. */
-public class CreateTagActionFactory implements ActionFactory {
+public class CreateTagActionFactory extends CreateOrReplaceTagActionFactory {
 
-    public static final String IDENTIFIER = "create-tag";
+    public static final String IDENTIFIER = "create_tag";
 
     @Override
     public String identifier() {
@@ -35,30 +32,29 @@ public class CreateTagActionFactory implements ActionFactory {
     }
 
     @Override
-    public Optional<Action> create(MultipleParameterTool params) {
-        checkRequiredArgument(params, "tag-name");
-        checkRequiredArgument(params, "snapshot");
-
-        Tuple3<String, String, String> tablePath = getTablePath(params);
-        Map<String, String> catalogConfig = optionalConfigMap(params, "catalog-conf");
-        String tagName = params.get("tag-name");
-        long snapshot = Long.parseLong(params.get("snapshot"));
-
-        CreateTagAction action =
-                new CreateTagAction(
-                        tablePath.f0, tablePath.f1, tablePath.f2, catalogConfig, tagName, snapshot);
-        return Optional.of(action);
+    Action createOrReplaceTagAction(
+            String database,
+            String table,
+            Map<String, String> catalogConfig,
+            String tagName,
+            Long snapshot,
+            Duration timeRetained) {
+        return new CreateTagAction(database, table, catalogConfig, tagName, snapshot, timeRetained);
     }
 
     @Override
     public void printHelp() {
-        System.out.println("Action \"create-tag\" creates a tag from given snapshot.");
+        System.out.println("Action \"create_tag\" creates a tag from given snapshot.");
         System.out.println();
 
         System.out.println("Syntax:");
         System.out.println(
-                "  create-tag --warehouse <warehouse-path> --database <database-name> "
-                        + "--table <table-name> --tag-name <tag-name> --snapshot <snapshot-id>");
+                "  create_tag \\\n"
+                        + "--warehouse <warehouse_path> \\\n"
+                        + "--database <database_name> \\\n"
+                        + "--table <table_name> \\\n"
+                        + "--tag_name <tag_name> \\\n"
+                        + "[--snapshot <snapshot_id>]");
         System.out.println();
     }
 }

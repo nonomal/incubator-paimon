@@ -19,22 +19,19 @@
 package org.apache.paimon.flink.source.statistics;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
-import org.apache.paimon.table.AppendOnlyFileStoreTable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.FileStoreTableFactory;
 
-/** Statistics tests for {@link AppendOnlyFileStoreTable}. */
+/** Statistics tests for append only tables. */
 public class AppendOnlyTableStatisticsTest extends FileStoreTableStatisticsTestBase {
     @Override
     protected FileStoreTable createStoreTable() throws Exception {
         Options conf = new Options();
         conf.set(CoreOptions.PATH, tablePath.toString());
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.APPEND_ONLY);
         conf.set(CoreOptions.BUCKET, 1);
         TableSchema tableSchema =
                 new SchemaManager(LocalFileIO.create(), tablePath)

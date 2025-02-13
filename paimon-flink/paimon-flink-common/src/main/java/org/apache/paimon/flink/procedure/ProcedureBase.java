@@ -19,9 +19,10 @@
 package org.apache.paimon.flink.procedure;
 
 import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.factories.Factory;
-import org.apache.paimon.flink.action.Action;
-import org.apache.paimon.flink.utils.StreamExecutionEnvironmentUtils;
+import org.apache.paimon.flink.action.ActionBase;
+import org.apache.paimon.table.Table;
 import org.apache.paimon.utils.StringUtils;
 
 import org.apache.flink.configuration.PipelineOptions;
@@ -34,47 +35,62 @@ import org.apache.flink.table.procedures.Procedure;
 
 import javax.annotation.Nullable;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 
 import static org.apache.flink.table.api.config.TableConfigOptions.TABLE_DML_SYNC;
-import static org.apache.paimon.flink.action.ActionFactory.parseCommaSeparatedKeyValues;
+import static org.apache.paimon.utils.ParameterUtils.parseKeyValueString;
 
 /** Base implementation for flink {@link Procedure}. */
 public abstract class ProcedureBase implements Procedure, Factory {
 
     protected Catalog catalog;
 
-    ProcedureBase withCatalog(Catalog catalog) {
+    public ProcedureBase withCatalog(Catalog catalog) {
         this.catalog = catalog;
         return this;
     }
 
-    protected List<Map<String, String>> getPartitions(String... partitionStrings) {
-        List<Map<String, String>> partitions = new ArrayList<>();
-        for (String partition : partitionStrings) {
-            partitions.add(parseCommaSeparatedKeyValues(partition));
-        }
-        return partitions;
+    protected Table table(String tableId) throws Catalog.TableNotExistException {
+        return catalog.getTable(Identifier.fromString(tableId));
+    }
+
+    protected String notnull(@Nullable String arg) {
+        return arg == null ? "" : arg;
     }
 
     @Nullable
     protected String nullable(String arg) {
-        return StringUtils.isBlank(arg) ? null : arg;
+        return StringUtils.isNullOrWhitespaceOnly(arg) ? null : arg;
     }
 
     protected String[] execute(
-            ProcedureContext procedureContext, Action action, String defaultJobName)
+            ProcedureContext procedureContext, ActionBase action, String defaultJobName)
             throws Exception {
         StreamExecutionEnvironment env = procedureContext.getExecutionEnvironment();
-        action.build(env);
+        action.withStreamExecutionEnvironment(env);
+        action.build();
 
-        ReadableConfig conf = StreamExecutionEnvironmentUtils.getConfiguration(env);
+        return execute(env, defaultJobName);
+    }
+
+    protected String[] execute(ProcedureContext procedureContext, JobClient jobClient) {
+        StreamExecutionEnvironment env = procedureContext.getExecutionEnvironment();
+        ReadableConfig conf = env.getConfiguration();
+        return execute(jobClient, conf.get(TABLE_DML_SYNC));
+    }
+
+    protected String[] execute(StreamExecutionEnvironment env, String defaultJobName)
+            throws Exception {
+        ReadableConfig conf = env.getConfiguration();
         String name = conf.getOptional(PipelineOptions.NAME).orElse(defaultJobName);
-        JobClient jobClient = env.executeAsync(name);
+        return execute(env.executeAsync(name), conf.get(TABLE_DML_SYNC));
+    }
+
+    private String[] execute(JobClient jobClient, boolean dmlSync) {
         String jobId = jobClient.getJobID().toString();
-        if (conf.get(TABLE_DML_SYNC)) {
+        if (dmlSync) {
             try {
                 jobClient.getJobExecutionResult().get();
             } catch (Exception e) {
@@ -84,5 +100,17 @@ public abstract class ProcedureBase implements Procedure, Factory {
         } else {
             return new String[] {"JobID=" + jobId};
         }
+    }
+
+    protected Map<String, String> optionalConfigMap(String configStr) {
+        if (StringUtils.isNullOrWhitespaceOnly(configStr)) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, String> config = new HashMap<>();
+        for (String kvString : configStr.split(";")) {
+            parseKeyValueString(config, kvString);
+        }
+        return config;
     }
 }

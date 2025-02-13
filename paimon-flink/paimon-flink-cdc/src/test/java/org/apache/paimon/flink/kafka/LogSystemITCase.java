@@ -26,12 +26,18 @@ import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.exceptions.TableNotExistException;
 import org.apache.flink.types.Row;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -59,7 +65,8 @@ public class LogSystemITCase extends KafkaTableTestBase {
                 String.format(
                         "CREATE TABLE T (i INT, j INT) WITH ("
                                 + "'log.system'='kafka', "
-                                + "'write-mode'='append-only', "
+                                + "'bucket'='1', "
+                                + "'bucket-key'='i', "
                                 + "'log.consistency'='eventual', "
                                 + "'kafka.bootstrap.servers'='%s', "
                                 + "'kafka.topic'='T')",
@@ -90,6 +97,7 @@ public class LogSystemITCase extends KafkaTableTestBase {
                                 + " 'merge-engine' = 'aggregation',\n"
                                 + "  'changelog-producer' = 'full-compaction',\n"
                                 + "    'log.system' = 'kafka',\n"
+                                + "    'bucket'='1',\n"
                                 + "    'streaming-read-mode'='file',\n"
                                 + "    'fields.cnt.aggregate-function' = 'sum',\n"
                                 + "    'kafka.bootstrap.servers' = '%s',\n"
@@ -132,6 +140,7 @@ public class LogSystemITCase extends KafkaTableTestBase {
                                 + "    'changelog-producer' = 'full-compaction',\n"
                                 + "    'log.consistency' = 'eventual',\n"
                                 + "    'log.system' = 'kafka',\n"
+                                + "    'bucket'='1',\n"
                                 + "    'streaming-read-mode'='log',\n"
                                 + "    'kafka.bootstrap.servers' = '%s',\n"
                                 + "    'kafka.topic' = 'test-single-sink',\n"
@@ -170,7 +179,8 @@ public class LogSystemITCase extends KafkaTableTestBase {
                         + "      PRIMARY KEY (word) NOT ENFORCED\n"
                         + ")\n"
                         + "WITH (\n"
-                        + " 'merge-engine' = 'aggregation',\n"
+                        + "    'merge-engine' = 'aggregation',\n"
+                        + "    'bucket'='1',\n"
                         + "    'changelog-producer' = 'full-compaction',\n"
                         + "    'streaming-read-mode'='log'\n"
                         + ");");
@@ -185,7 +195,7 @@ public class LogSystemITCase extends KafkaTableTestBase {
                         () ->
                                 tEnv.executeSql(
                                         "INSERT INTO kafka_file_single_sink SELECT word, COUNT(*) FROM word_table GROUP BY word;"))
-                .getRootCause()
+                .rootCause()
                 .isInstanceOf(ValidationException.class)
                 .hasMessage(
                         "File store continuous reading does not support the log streaming read mode.");
@@ -210,8 +220,9 @@ public class LogSystemITCase extends KafkaTableTestBase {
                 String.format(
                         "CREATE TABLE T (i INT, j INT) WITH ("
                                 + "'log.system'='kafka', "
+                                + "'bucket'='1', "
+                                + "'bucket-key'='i', "
                                 + "'log.system.partitions'='2', "
-                                + "'write-mode'='append-only', "
                                 + "'kafka.bootstrap.servers'='%s', "
                                 + "'kafka.topic'='Tt')",
                         getBootstrapServers()));
@@ -223,7 +234,7 @@ public class LogSystemITCase extends KafkaTableTestBase {
                         "CREATE TABLE T2 (i INT, j INT) WITH ("
                                 + "'log.system'='kafka', "
                                 + "'bucket'='2', "
-                                + "'write-mode'='append-only', "
+                                + "'bucket-key'='i', "
                                 + "'kafka.bootstrap.servers'='%s', "
                                 + "'kafka.topic'='T2')",
                         getBootstrapServers()));
@@ -235,8 +246,9 @@ public class LogSystemITCase extends KafkaTableTestBase {
                 String.format(
                         "CREATE TABLE T1 (i INT, j INT) WITH ("
                                 + "'log.system'='kafka', "
+                                + "'bucket'='1', "
+                                + "'bucket-key'='i', "
                                 + "'log.system.partitions'='2', "
-                                + "'write-mode'='append-only', "
                                 + "'kafka.bootstrap.servers'='%s')",
                         getBootstrapServers()));
 
@@ -253,8 +265,9 @@ public class LogSystemITCase extends KafkaTableTestBase {
                                         String.format(
                                                 "CREATE TABLE T (i INT, j INT) WITH ("
                                                         + "'log.system'='kafka', "
+                                                        + "'bucket'='1', "
+                                                        + "'bucket-key'='i', "
                                                         + "'log.system.partitions'='2', "
-                                                        + "'write-mode'='append-only', "
                                                         + "'kafka.bootstrap.servers'='%s', "
                                                         + "'kafka.topic'='T1')",
                                                 getBootstrapServers())))
@@ -274,8 +287,9 @@ public class LogSystemITCase extends KafkaTableTestBase {
                                         String.format(
                                                 "CREATE TABLE NOT_EXIST.T (i INT, j INT) WITH ("
                                                         + "'log.system'='kafka', "
+                                                        + "'bucket'='1', "
+                                                        + "'bucket-key'='i', "
                                                         + "'log.system.partitions'='2', "
-                                                        + "'write-mode'='append-only', "
                                                         + "'kafka.bootstrap.servers'='%s', "
                                                         + "'kafka.topic'='T1')",
                                                 getBootstrapServers())))
@@ -312,12 +326,9 @@ public class LogSystemITCase extends KafkaTableTestBase {
         env.setParallelism(1);
 
         tEnv.executeSql(
-                String.format(
-                        "CREATE TABLE T (i INT, j INT) WITH ("
-                                + "'log.system'='kafka', "
-                                + "'write-mode'='append-only', "
-                                + "'kafka.topic'='T')",
-                        getBootstrapServers()));
+                "CREATE TABLE T (i INT, j INT) WITH ("
+                        + "'log.system'='kafka', "
+                        + "'kafka.topic'='T')");
 
         checkTopicExists("T", 2, 1);
     }
@@ -331,6 +342,8 @@ public class LogSystemITCase extends KafkaTableTestBase {
                     String.format(
                             "CREATE TABLE T (a STRING, b STRING, c STRING) WITH ("
                                     + "'log.system'='kafka', "
+                                    + "'bucket'='1', "
+                                    + "'bucket-key'='a', "
                                     + "'kafka.bootstrap.servers'='%s',"
                                     + "'kafka.topic'='%s'"
                                     + ")",
@@ -362,6 +375,8 @@ public class LogSystemITCase extends KafkaTableTestBase {
                                     + "d AS CAST(c as INT) + 1"
                                     + ") WITH ("
                                     + "'log.system'='kafka', "
+                                    + "'bucket'='1', "
+                                    + "'bucket-key'='a', "
                                     + "'kafka.bootstrap.servers'='%s',"
                                     + "'kafka.topic'='%s'"
                                     + ")",
@@ -373,6 +388,52 @@ public class LogSystemITCase extends KafkaTableTestBase {
             List<Row> result = iterator.collectAndClose(2);
             assertThat(result)
                     .containsExactlyInAnyOrder(Row.of("1", "2", "3", 4), Row.of("4", "5", "6", 7));
+        } finally {
+            deleteTopicIfExists(topic);
+        }
+    }
+
+    @Test
+    @Timeout(120)
+    public void testAppendOnlyWithUnawareBucket() throws Exception {
+        String topic = UUID.randomUUID().toString();
+        createTopicIfNotExists(topic, 2);
+
+        try {
+            // disable checkpointing to test eventual
+            env.getCheckpointConfig().disableCheckpointing();
+            env.setParallelism(1);
+            tEnv.executeSql(
+                    String.format(
+                            "CREATE TABLE T (i INT, j INT) WITH ("
+                                    + "'log.system'='kafka', "
+                                    + "'log.consistency'='eventual', "
+                                    + "'bucket'='-1', "
+                                    + "'kafka.bootstrap.servers'='%s', "
+                                    + "'kafka.topic'='%s',"
+                                    + "'kafka.batch.size'='20')",
+                            getBootstrapServers(), topic));
+            tEnv.executeSql(
+                    "CREATE TEMPORARY TABLE gen (i INT, j INT) WITH ('connector'='datagen', 'rows-per-second'='2')");
+            TableResult write = tEnv.executeSql("INSERT INTO T SELECT * FROM gen");
+            BlockingIterator<Row, Row> read =
+                    BlockingIterator.of(tEnv.executeSql("SELECT * FROM T").collect());
+            List<Row> collect = read.collect(10);
+            assertThat(collect).hasSize(10);
+            write.getJobClient().get().cancel();
+            read.close();
+
+            // check offsets
+            try (final AdminClient adminClient = AdminClient.create(getStandardProps())) {
+                Map<TopicPartition, OffsetSpec> topicPartitionOffsets = new HashMap<>(4);
+                for (int i = 0; i < 2; i++) {
+                    topicPartitionOffsets.put(new TopicPartition(topic, i), OffsetSpec.latest());
+                }
+                Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> result =
+                        adminClient.listOffsets(topicPartitionOffsets).all().get();
+                assertThat(result.values())
+                        .allMatch(partitionOffsetInfo -> partitionOffsetInfo.offset() > 0);
+            }
         } finally {
             deleteTopicIfExists(topic);
         }

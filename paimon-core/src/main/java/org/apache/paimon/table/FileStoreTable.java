@@ -19,14 +19,20 @@
 package org.apache.paimon.table;
 
 import org.apache.paimon.FileStore;
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.manifest.ManifestCacheFilter;
 import org.apache.paimon.schema.TableSchema;
-import org.apache.paimon.stats.BinaryTableStats;
+import org.apache.paimon.stats.Statistics;
+import org.apache.paimon.table.query.LocalTableQuery;
+import org.apache.paimon.table.sink.RowKeyExtractor;
 import org.apache.paimon.table.sink.TableCommitImpl;
 import org.apache.paimon.table.sink.TableWriteImpl;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.SegmentsCache;
+
+import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Cache;
 
 import java.util.List;
 import java.util.Map;
@@ -38,10 +44,11 @@ import java.util.Optional;
  */
 public interface FileStoreTable extends DataTable {
 
-    @Override
-    default String name() {
-        return location().getName();
-    }
+    void setManifestCache(SegmentsCache<Path> manifestCache);
+
+    void setSnapshotCache(Cache<Path, Snapshot> cache);
+
+    void setStatsCache(Cache<String, Statistics> cache);
 
     @Override
     default RowType rowType() {
@@ -58,6 +65,14 @@ public interface FileStoreTable extends DataTable {
         return schema().primaryKeys();
     }
 
+    default BucketSpec bucketSpec() {
+        return new BucketSpec(bucketMode(), schema().bucketKeys(), schema().numBuckets());
+    }
+
+    default BucketMode bucketMode() {
+        return store().bucketMode();
+    }
+
     @Override
     default Map<String, String> options() {
         return schema().options();
@@ -72,15 +87,15 @@ public interface FileStoreTable extends DataTable {
 
     FileStore<?> store();
 
-    BucketMode bucketMode();
-
     CatalogEnvironment catalogEnvironment();
 
     @Override
     FileStoreTable copy(Map<String, String> dynamicOptions);
 
-    /** Sometimes we have to change some Immutable options to implement features. */
-    FileStoreTable internalCopyWithoutCheck(Map<String, String> dynamicOptions);
+    FileStoreTable copy(TableSchema newTableSchema);
+
+    /** Doesn't change table schema even when there exists time travel scan options. */
+    FileStoreTable copyWithoutTimeTravel(Map<String, String> dynamicOptions);
 
     /** TODO: this method is weird, old options will overwrite new options. */
     FileStoreTable copyWithLatestSchema();
@@ -93,7 +108,16 @@ public interface FileStoreTable extends DataTable {
     @Override
     TableCommitImpl newCommit(String commitUser);
 
-    default BinaryTableStats getSchemaFieldStats(DataFileMeta dataFileMeta) {
-        return dataFileMeta.valueStats();
-    }
+    LocalTableQuery newLocalTableQuery();
+
+    boolean supportStreamingReadOverwrite();
+
+    RowKeyExtractor createRowKeyExtractor();
+
+    /**
+     * Get {@link DataTable} with branch identified by {@code branchName}. Note that this method
+     * does not keep dynamic options in current table.
+     */
+    @Override
+    FileStoreTable switchToBranch(String branchName);
 }

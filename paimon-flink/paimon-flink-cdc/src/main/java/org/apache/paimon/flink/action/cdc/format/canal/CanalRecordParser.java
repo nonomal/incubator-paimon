@@ -20,16 +20,23 @@ package org.apache.paimon.flink.action.cdc.format.canal;
 
 import org.apache.paimon.flink.action.cdc.ComputedColumn;
 import org.apache.paimon.flink.action.cdc.TypeMapping;
-import org.apache.paimon.flink.action.cdc.format.RecordParser;
+import org.apache.paimon.flink.action.cdc.format.AbstractJsonRecordParser;
 import org.apache.paimon.flink.action.cdc.mysql.MySqlTypeUtils;
 import org.apache.paimon.flink.sink.cdc.RichCdcMultiplexRecord;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.JsonSerdeUtil;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.node.ArrayNode;
+
+import org.apache.flink.api.java.tuple.Tuple3;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -38,10 +45,12 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import static org.apache.paimon.utils.Preconditions.checkNotNull;
+import static org.apache.paimon.utils.JsonSerdeUtil.getNodeAs;
+import static org.apache.paimon.utils.JsonSerdeUtil.isNull;
 
 /**
  * The {@code CanalRecordParser} class is responsible for parsing records from the Canal-JSON
@@ -56,7 +65,9 @@ import static org.apache.paimon.utils.Preconditions.checkNotNull;
  * <p>Additionally, the parser supports schema extraction, which can be used to understand the
  * structure of the incoming data and its corresponding field types.
  */
-public class CanalRecordParser extends RecordParser {
+public class CanalRecordParser extends AbstractJsonRecordParser {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CanalRecordParser.class);
 
     private static final String FIELD_IS_DDL = "isDdl";
     private static final String FIELD_MYSQL_TYPE = "mysqlType";
@@ -69,41 +80,33 @@ public class CanalRecordParser extends RecordParser {
 
     @Override
     protected boolean isDDL() {
-        return extractBooleanFromRootJson(FIELD_IS_DDL);
+        JsonNode node = root.get(FIELD_IS_DDL);
+        return !isNull(node) && node.asBoolean();
     }
 
-    public CanalRecordParser(
-            boolean caseSensitive, TypeMapping typeMapping, List<ComputedColumn> computedColumns) {
-        super(caseSensitive, typeMapping, computedColumns);
-    }
-
-    @Override
-    protected void extractFieldTypesFromDatabaseSchema() {
-        JsonNode schema = root.get(FIELD_MYSQL_TYPE);
-        LinkedHashMap<String, String> fieldTypes = new LinkedHashMap<>();
-
-        schema.fieldNames()
-                .forEachRemaining(
-                        fieldName -> {
-                            String fieldType = schema.get(fieldName).asText();
-                            fieldTypes.put(fieldName, fieldType);
-                        });
-        this.fieldTypes = fieldTypes;
+    public CanalRecordParser(TypeMapping typeMapping, List<ComputedColumn> computedColumns) {
+        super(typeMapping, computedColumns);
     }
 
     @Override
     public List<RichCdcMultiplexRecord> extractRecords() {
-        if (extractBooleanFromRootJson(FIELD_IS_DDL)) {
+        if (isDDL()) {
             return Collections.emptyList();
         }
+
         List<RichCdcMultiplexRecord> records = new ArrayList<>();
-        ArrayNode arrayData = JsonSerdeUtil.getNodeAs(root, fieldData, ArrayNode.class);
-        String type = extractStringFromRootJson(FIELD_TYPE);
+
+        ArrayNode arrayData = getNodeAs(root, dataField(), ArrayNode.class);
+        checkNotNull(arrayData, dataField());
+
+        String type = getAndCheck(FIELD_TYPE).asText();
+
         for (JsonNode data : arrayData) {
             switch (type) {
                 case OP_UPDATE:
-                    ArrayNode oldArrayData =
-                            JsonSerdeUtil.getNodeAs(root, FIELD_OLD, ArrayNode.class);
+                    ArrayNode oldArrayData = getNodeAs(root, FIELD_OLD, ArrayNode.class);
+                    checkNotNull(oldArrayData, FIELD_OLD, FIELD_TYPE, type);
+
                     Map<JsonNode, JsonNode> matchedOldRecords =
                             matchOldRecords(arrayData, oldArrayData);
                     JsonNode old = matchedOldRecords.get(data);
@@ -124,80 +127,66 @@ public class CanalRecordParser extends RecordParser {
         return records;
     }
 
-    @Override
-    protected LinkedHashMap<String, DataType> setPaimonFieldType() {
-        LinkedHashMap<String, DataType> paimonFieldTypes = new LinkedHashMap<>();
-        fieldTypes.forEach(
-                (name, type) ->
-                        paimonFieldTypes.put(
-                                applyCaseSensitiveFieldName(name),
-                                MySqlTypeUtils.toDataType(type, typeMapping)));
-        return paimonFieldTypes;
-    }
-
-    @Override
-    protected void validateFormat() {
-        String errorMessageTemplate =
-                "Didn't find '%s' node in json. Only supports canal-json format,"
-                        + "please make sure your topic's format is correct.";
-
-        checkNotNull(root.get(FIELD_DATABASE), errorMessageTemplate, FIELD_DATABASE);
-        checkNotNull(root.get(FIELD_TABLE), errorMessageTemplate, FIELD_TABLE);
-        checkNotNull(root.get(FIELD_TYPE), errorMessageTemplate, FIELD_TYPE);
-        checkNotNull(root.get(fieldData), errorMessageTemplate, fieldData);
-        checkNotNull(root.get(FIELD_IS_DDL), errorMessageTemplate, FIELD_IS_DDL);
-
-        if (!extractBooleanFromRootJson(FIELD_IS_DDL)) {
-            checkNotNull(root.get(FIELD_MYSQL_TYPE), errorMessageTemplate, FIELD_MYSQL_TYPE);
-            checkNotNull(root.get(fieldPrimaryKeys), errorMessageTemplate, fieldPrimaryKeys);
-        }
-    }
-
-    @Override
-    protected void setPrimaryField() {
-        fieldPrimaryKeys = "pkNames";
-    }
-
-    @Override
-    protected void setDataField() {
-        fieldData = "data";
-    }
-
-    @Override
-    protected Map<String, String> extractRowData(
-            JsonNode record, LinkedHashMap<String, DataType> paimonFieldTypes) {
-        fieldTypes.forEach(
-                (name, type) ->
-                        paimonFieldTypes.put(
-                                applyCaseSensitiveFieldName(name),
-                                MySqlTypeUtils.toDataType(type, typeMapping)));
-        Map<String, Object> jsonMap =
-                OBJECT_MAPPER.convertValue(record, new TypeReference<Map<String, Object>>() {});
-        if (jsonMap == null) {
-            return new HashMap<>();
+    @Nullable
+    private LinkedHashMap<String, String> tryExtractOriginalFieldTypes() {
+        JsonNode schema = root.get(FIELD_MYSQL_TYPE);
+        if (isNull(schema)) {
+            LOG.debug(
+                    "Cannot get original field types because '{}' field is missing.",
+                    FIELD_MYSQL_TYPE);
+            return null;
         }
 
-        Map<String, String> resultMap =
-                fieldTypes.entrySet().stream()
-                        .filter(entry -> jsonMap.get(entry.getKey()) != null)
-                        .collect(
-                                Collectors.toMap(
-                                        Map.Entry::getKey,
-                                        entry ->
-                                                transformValue(
-                                                        jsonMap.get(entry.getKey()).toString(),
-                                                        entry.getValue())));
+        return JsonSerdeUtil.convertValue(
+                schema, new TypeReference<LinkedHashMap<String, String>>() {});
+    }
 
-        // generate values for computed columns
-        for (ComputedColumn computedColumn : computedColumns) {
-            resultMap.put(
-                    computedColumn.columnName(),
-                    computedColumn.eval(resultMap.get(computedColumn.fieldReference())));
-            paimonFieldTypes.put(
-                    applyCaseSensitiveFieldName(computedColumn.columnName()),
-                    computedColumn.columnType());
+    @Override
+    protected String primaryField() {
+        return "pkNames";
+    }
+
+    @Override
+    protected String dataField() {
+        return "data";
+    }
+
+    @Override
+    protected Map<String, String> extractRowData(JsonNode record, RowType.Builder rowTypeBuilder) {
+        LinkedHashMap<String, String> originalFieldTypes = tryExtractOriginalFieldTypes();
+        Map<String, Object> recordMap =
+                JsonSerdeUtil.convertValue(record, new TypeReference<Map<String, Object>>() {});
+        Map<String, String> rowData = new HashMap<>();
+
+        if (originalFieldTypes != null) {
+            for (Map.Entry<String, String> e : originalFieldTypes.entrySet()) {
+                String originalName = e.getKey();
+                String originalType = e.getValue();
+                Tuple3<String, Integer, Integer> typeInfo =
+                        MySqlTypeUtils.getTypeInfo(originalType);
+                DataType paimonDataType =
+                        MySqlTypeUtils.toDataType(
+                                typeInfo.f0, typeInfo.f1, typeInfo.f2, typeMapping);
+                rowTypeBuilder.field(originalName, paimonDataType);
+
+                String filedValue = Objects.toString(recordMap.get(originalName), null);
+                String newValue = transformValue(filedValue, typeInfo.f0, originalType);
+                rowData.put(originalName, newValue);
+            }
+        } else {
+            fillDefaultTypes(record, rowTypeBuilder);
+            for (Map.Entry<String, Object> entry : recordMap.entrySet()) {
+                rowData.put(entry.getKey(), Objects.toString(entry.getValue(), null));
+            }
         }
-        return resultMap;
+
+        evalComputedColumns(rowData, rowTypeBuilder);
+        return rowData;
+    }
+
+    @Override
+    protected String format() {
+        return "canal-json";
     }
 
     private Map<JsonNode, JsonNode> matchOldRecords(ArrayNode newData, ArrayNode oldData) {
@@ -206,8 +195,10 @@ public class CanalRecordParser extends RecordParser {
                 .collect(Collectors.toMap(newData::get, oldData::get));
     }
 
-    private String transformValue(String oldValue, String mySqlType) {
-        String shortType = MySqlTypeUtils.getShortType(mySqlType);
+    private String transformValue(@Nullable String oldValue, String shortType, String mySqlType) {
+        if (oldValue == null) {
+            return null;
+        }
 
         if (MySqlTypeUtils.isSetType(shortType)) {
             return CanalFieldParser.convertSet(oldValue, mySqlType);

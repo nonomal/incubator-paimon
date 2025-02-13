@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,6 +23,7 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryRowWriter;
 import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.mergetree.SortedRun;
 import org.apache.paimon.stats.StatsTestUtils;
 
@@ -41,14 +42,13 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import static org.apache.paimon.stats.StatsTestUtils.newTableStats;
+import static org.apache.paimon.stats.StatsTestUtils.newSimpleStats;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests for {@link IntervalPartition}. */
 public class IntervalPartitionTest {
 
-    private static final RecordComparator COMPARATOR =
-            (RecordComparator) (o1, o2) -> o1.getInt(0) - o2.getInt(0);
+    private static final RecordComparator COMPARATOR = (o1, o2) -> o1.getInt(0) - o2.getInt(0);
 
     @Test
     public void testSameMinKey() {
@@ -173,14 +173,19 @@ public class IntervalPartitionTest {
                 25,
                 minKey,
                 maxKey,
-                newTableStats(left, right),
-                StatsTestUtils.newEmptyTableStats(), // not used
+                newSimpleStats(left, right),
+                StatsTestUtils.newEmptySimpleStats(), // not used
                 0,
                 24,
                 0,
                 0,
                 Collections.emptyList(),
-                Timestamp.fromEpochMillis(100000));
+                Timestamp.fromEpochMillis(100000),
+                0L,
+                null,
+                FileSource.APPEND,
+                null,
+                null);
     }
 
     private List<Map<SortedRun, Integer>> toMultiset(List<List<SortedRun>> sections) {

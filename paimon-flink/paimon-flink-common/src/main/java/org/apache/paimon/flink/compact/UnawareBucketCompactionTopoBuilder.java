@@ -18,26 +18,32 @@
 
 package org.apache.paimon.flink.compact;
 
-import org.apache.paimon.append.AppendOnlyCompactionTask;
+import org.apache.paimon.append.UnawareAppendCompactionTask;
+import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.flink.FlinkConnectorOptions;
-import org.apache.paimon.flink.sink.Committable;
 import org.apache.paimon.flink.sink.UnawareBucketCompactionSink;
 import org.apache.paimon.flink.source.BucketUnawareCompactSource;
+import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
-import org.apache.paimon.predicate.PredicateBuilder;
-import org.apache.paimon.table.AppendOnlyFileStoreTable;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.utils.Preconditions;
 
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.transformations.PartitionTransformation;
 import org.apache.flink.streaming.runtime.partitioner.RebalancePartitioner;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Build for unaware-bucket table flink compaction job.
@@ -52,14 +58,15 @@ public class UnawareBucketCompactionTopoBuilder {
 
     private final transient StreamExecutionEnvironment env;
     private final String tableIdentifier;
-    private final AppendOnlyFileStoreTable table;
-    @Nullable private List<Map<String, String>> specifiedPartitions = null;
+    private final FileStoreTable table;
+
     private boolean isContinuous = false;
 
+    @Nullable private Predicate partitionPredicate;
+    @Nullable private Duration partitionIdleTime = null;
+
     public UnawareBucketCompactionTopoBuilder(
-            StreamExecutionEnvironment env,
-            String tableIdentifier,
-            AppendOnlyFileStoreTable table) {
+            StreamExecutionEnvironment env, String tableIdentifier, FileStoreTable table) {
         this.env = env;
         this.tableIdentifier = tableIdentifier;
         this.table = table;
@@ -69,49 +76,71 @@ public class UnawareBucketCompactionTopoBuilder {
         this.isContinuous = isContinuous;
     }
 
-    public void withPartitions(List<Map<String, String>> partitions) {
-        this.specifiedPartitions = partitions;
+    public void withPartitionPredicate(Predicate predicate) {
+        this.partitionPredicate = predicate;
+    }
+
+    public void withPartitionIdleTime(@Nullable Duration partitionIdleTime) {
+        this.partitionIdleTime = partitionIdleTime;
     }
 
     public void build() {
         // build source from UnawareSourceFunction
-        DataStreamSource<AppendOnlyCompactionTask> source = buildSource();
+        DataStreamSource<UnawareAppendCompactionTask> source = buildSource();
+        if (isContinuous) {
+            Preconditions.checkArgument(
+                    partitionIdleTime == null, "Streaming mode does not support partitionIdleTime");
+        } else if (partitionIdleTime != null) {
+            Map<BinaryRow, Long> partitionInfo = getPartitionInfo(table);
+            long historyMilli =
+                    LocalDateTime.now()
+                            .minus(partitionIdleTime)
+                            .atZone(ZoneId.systemDefault())
+                            .toInstant()
+                            .toEpochMilli();
+            SingleOutputStreamOperator<UnawareAppendCompactionTask> filterStream =
+                    source.filter(
+                            task -> {
+                                BinaryRow partition = task.partition();
+                                return partitionInfo.get(partition) <= historyMilli;
+                            });
+            source = new DataStreamSource<>(filterStream);
+        }
 
         // from source, construct the full flink job
         sinkFromSource(source);
     }
 
-    public DataStream<Committable> fetchUncommitted(String commitUser) {
-        DataStreamSource<AppendOnlyCompactionTask> source = buildSource();
-
-        // rebalance input to default or assigned parallelism
-        DataStream<AppendOnlyCompactionTask> rebalanced = rebalanceInput(source);
-
-        return new UnawareBucketCompactionSink(table)
-                .doWrite(rebalanced, commitUser, rebalanced.getParallelism());
+    private Map<BinaryRow, Long> getPartitionInfo(FileStoreTable table) {
+        List<PartitionEntry> partitions = table.newSnapshotReader().partitionEntries();
+        return partitions.stream()
+                .collect(
+                        Collectors.toMap(
+                                PartitionEntry::partition, PartitionEntry::lastFileCreationTime));
     }
 
-    private DataStreamSource<AppendOnlyCompactionTask> buildSource() {
+    private DataStreamSource<UnawareAppendCompactionTask> buildSource() {
+
         long scanInterval = table.coreOptions().continuousDiscoveryInterval().toMillis();
         BucketUnawareCompactSource source =
                 new BucketUnawareCompactSource(
-                        table, isContinuous, scanInterval, getPartitionFilter());
+                        table, isContinuous, scanInterval, partitionPredicate);
 
-        return BucketUnawareCompactSource.buildSource(env, source, isContinuous, tableIdentifier);
+        return BucketUnawareCompactSource.buildSource(env, source, tableIdentifier);
     }
 
-    private void sinkFromSource(DataStreamSource<AppendOnlyCompactionTask> input) {
-        DataStream<AppendOnlyCompactionTask> rebalanced = rebalanceInput(input);
+    private void sinkFromSource(DataStreamSource<UnawareAppendCompactionTask> input) {
+        DataStream<UnawareAppendCompactionTask> rebalanced = rebalanceInput(input);
 
         UnawareBucketCompactionSink.sink(table, rebalanced);
     }
 
-    private DataStream<AppendOnlyCompactionTask> rebalanceInput(
-            DataStreamSource<AppendOnlyCompactionTask> input) {
+    private DataStream<UnawareAppendCompactionTask> rebalanceInput(
+            DataStreamSource<UnawareAppendCompactionTask> input) {
         Options conf = Options.fromMap(table.options());
         Integer compactionWorkerParallelism =
                 conf.get(FlinkConnectorOptions.UNAWARE_BUCKET_COMPACTION_PARALLELISM);
-        PartitionTransformation<AppendOnlyCompactionTask> transformation =
+        PartitionTransformation<UnawareAppendCompactionTask> transformation =
                 new PartitionTransformation<>(
                         input.getTransformation(), new RebalancePartitioner<>());
         if (compactionWorkerParallelism != null) {
@@ -122,17 +151,5 @@ public class UnawareBucketCompactionTopoBuilder {
             transformation.setParallelism(env.getParallelism());
         }
         return new DataStream<>(env, transformation);
-    }
-
-    private Predicate getPartitionFilter() {
-        Predicate partitionPredicate = null;
-        if (specifiedPartitions != null) {
-            partitionPredicate =
-                    PredicateBuilder.or(
-                            specifiedPartitions.stream()
-                                    .map(p -> PredicateBuilder.partition(p, table.rowType()))
-                                    .toArray(Predicate[]::new));
-        }
-        return partitionPredicate;
     }
 }

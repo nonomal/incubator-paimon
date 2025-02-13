@@ -18,20 +18,24 @@
 
 package org.apache.paimon.flink.action.cdc.mysql;
 
-import org.apache.paimon.flink.action.Action;
-import org.apache.paimon.flink.action.ActionFactory;
 import org.apache.paimon.flink.action.MultiTablesSinkMode;
-import org.apache.paimon.flink.action.cdc.TypeMapping;
-
-import org.apache.flink.api.java.utils.MultipleParameterTool;
+import org.apache.paimon.flink.action.MultipleParameterToolAdapter;
+import org.apache.paimon.flink.action.cdc.SyncDatabaseActionFactoryBase;
 
 import java.util.Arrays;
-import java.util.Optional;
+
+import static org.apache.paimon.flink.action.cdc.CdcActionCommonUtils.METADATA_COLUMN;
+import static org.apache.paimon.flink.action.cdc.CdcActionCommonUtils.MYSQL_CONF;
 
 /** Factory to create {@link MySqlSyncDatabaseAction}. */
-public class MySqlSyncDatabaseActionFactory implements ActionFactory {
+public class MySqlSyncDatabaseActionFactory
+        extends SyncDatabaseActionFactoryBase<MySqlSyncDatabaseAction> {
 
-    public static final String IDENTIFIER = "mysql-sync-database";
+    public static final String IDENTIFIER = "mysql_sync_database";
+
+    private static final String IGNORE_INCOMPATIBLE = "ignore_incompatible";
+    private static final String MERGE_SHARDS = "merge_shards";
+    private static final String MODE = "mode";
 
     @Override
     public String identifier() {
@@ -39,42 +43,31 @@ public class MySqlSyncDatabaseActionFactory implements ActionFactory {
     }
 
     @Override
-    public Optional<Action> create(MultipleParameterTool params) {
-        checkRequiredArgument(params, "mysql-conf");
+    protected String cdcConfigIdentifier() {
+        return MYSQL_CONF;
+    }
 
-        MySqlSyncDatabaseAction action =
-                new MySqlSyncDatabaseAction(
-                        getRequiredValue(params, "warehouse"),
-                        getRequiredValue(params, "database"),
-                        optionalConfigMap(params, "catalog-conf"),
-                        optionalConfigMap(params, "mysql-conf"));
+    @Override
+    public MySqlSyncDatabaseAction createAction() {
+        return new MySqlSyncDatabaseAction(database, catalogConfig, cdcSourceConfig);
+    }
 
-        action.withTableConfig(optionalConfigMap(params, "table-conf"))
-                .ignoreIncompatible(Boolean.parseBoolean(params.get("ignore-incompatible")))
+    @Override
+    protected void withParams(MultipleParameterToolAdapter params, MySqlSyncDatabaseAction action) {
+        super.withParams(params, action);
+        action.ignoreIncompatible(Boolean.parseBoolean(params.get(IGNORE_INCOMPATIBLE)))
                 .mergeShards(
-                        !params.has("merge-shards")
-                                || Boolean.parseBoolean(params.get("merge-shards")))
-                .withTablePrefix(params.get("table-prefix"))
-                .withTableSuffix(params.get("table-suffix"))
-                .includingTables(params.get("including-tables"))
-                .excludingTables(params.get("excluding-tables"))
-                .withMode(MultiTablesSinkMode.fromString(params.get("mode")));
-        if (params.has("metadata-column")) {
-            action.withMetadataKeys(Arrays.asList(params.get("metadata-column").split(",")));
+                        !params.has(MERGE_SHARDS) || Boolean.parseBoolean(params.get(MERGE_SHARDS)))
+                .withMode(MultiTablesSinkMode.fromString(params.get(MODE)));
+        if (params.has(METADATA_COLUMN)) {
+            action.withMetadataColumns(Arrays.asList(params.get(METADATA_COLUMN).split(",")));
         }
-
-        if (params.has("type-mapping")) {
-            String[] options = params.get("type-mapping").split(",");
-            action.withTypeMapping(TypeMapping.parse(options));
-        }
-
-        return Optional.of(action);
     }
 
     @Override
     public void printHelp() {
         System.out.println(
-                "Action \"mysql-sync-database\" creates a streaming job "
+                "Action \"mysql_sync_database\" creates a streaming job "
                         + "with a Flink MySQL CDC source and multiple Paimon table sinks "
                         + "to synchronize a whole MySQL database into one Paimon database.\n"
                         + "Only MySQL tables with primary keys will be considered. "
@@ -83,48 +76,50 @@ public class MySqlSyncDatabaseActionFactory implements ActionFactory {
 
         System.out.println("Syntax:");
         System.out.println(
-                "  mysql-sync-database --warehouse <warehouse-path> --database <database-name> "
-                        + "[--ignore-incompatible <true/false>] "
-                        + "[--merge-shards <true/false>] "
-                        + "[--table-prefix <paimon-table-prefix>] "
-                        + "[--table-suffix <paimon-table-suffix>] "
-                        + "[--including-tables <mysql-table-name|name-regular-expr>] "
-                        + "[--excluding-tables <mysql-table-name|name-regular-expr>] "
-                        + "[--mode <sync-mode>] "
-                        + "[--metadata-column <metadata-column>] "
-                        + "[--type-mapping <option1,option2...>] "
-                        + "[--mysql-conf <mysql-cdc-source-conf> [--mysql-conf <mysql-cdc-source-conf> ...]] "
-                        + "[--catalog-conf <paimon-catalog-conf> [--catalog-conf <paimon-catalog-conf> ...]] "
-                        + "[--table-conf <paimon-table-sink-conf> [--table-conf <paimon-table-sink-conf> ...]]");
+                "  mysql_sync_database \\\n"
+                        + "--warehouse <warehouse_path> \\\n"
+                        + "--database <database_name> \\\n"
+                        + "[--ignore_incompatible <true/false>] \\\n"
+                        + "[--merge_shards <true/false>] \\\n"
+                        + "[--table_prefix <paimon_table_prefix>] \\\n"
+                        + "[--table_suffix <paimon_table_suffix>] \\\n"
+                        + "[--including_tables <mysql_table_name|name_regular_expr>] \\\n"
+                        + "[--excluding_tables <mysql_table_name|name_regular_expr>] \\\n"
+                        + "[--mode <sync_mode>] \\\n"
+                        + "[--metadata_column <metadata_column>] \\\n"
+                        + "[--type_mapping <option1,option2...>] \\\n"
+                        + "[--mysql_conf <mysql_cdc_source_conf> [--mysql_conf <mysql_cdc_source_conf> ...]] \\\n"
+                        + "[--catalog_conf <paimon_catalog_conf> [--catalog_conf <paimon_catalog_conf> ...]] \\\n"
+                        + "[--table_conf <paimon_table_sink_conf> [--table_conf <paimon_table_sink_conf> ...]]");
         System.out.println();
 
         System.out.println(
-                "--ignore-incompatible is default false, in this case, if MySQL table name exists in Paimon "
+                "--ignore_incompatible is default false, in this case, if MySQL table name exists in Paimon "
                         + "and their schema is incompatible, an exception will be thrown. "
                         + "You can specify it to true explicitly to ignore the incompatible tables and exception.");
         System.out.println();
 
         System.out.println(
-                "--merge-shards is default true, in this case, if some tables in different databases have the same name, "
+                "--merge_shards is default true, in this case, if some tables in different databases have the same name, "
                         + "their schemas will be merged and their records will be synchronized into one Paimon table. "
                         + "Otherwise, each table's records will be synchronized to a corresponding Paimon table, "
                         + "and the Paimon table will be named to 'databaseName_tableName' to avoid potential name conflict.");
         System.out.println();
 
         System.out.println(
-                "--table-prefix is the prefix of all Paimon tables to be synchronized. For example, if you want all "
-                        + "synchronized tables to have \"ods_\" as prefix, you can specify `--table-prefix ods_`.");
-        System.out.println("The usage of --table-suffix is same as `--table-prefix`");
+                "--table_prefix is the prefix of all Paimon tables to be synchronized. For example, if you want all "
+                        + "synchronized tables to have \"ods_\" as prefix, you can specify `--table_prefix ods_`.");
+        System.out.println("The usage of --table_suffix is same as `--table_prefix`");
         System.out.println();
 
         System.out.println(
-                "--including-tables is used to specify which source tables are to be synchronized. "
+                "--including_tables is used to specify which source tables are to be synchronized. "
                         + "You must use '|' to separate multiple tables. Regular expression is supported.");
         System.out.println(
-                "--excluding-tables is used to specify which source tables are not to be synchronized. "
-                        + "The usage is same as --including-tables.");
+                "--excluding_tables is used to specify which source tables are not to be synchronized. "
+                        + "The usage is same as --including_tables.");
         System.out.println(
-                "--excluding-tables has higher priority than --including-tables if you specified both.");
+                "--excluding_tables has higher priority than --including_tables if you specified both.");
         System.out.println();
 
         System.out.println(
@@ -137,11 +132,11 @@ public class MySqlSyncDatabaseActionFactory implements ActionFactory {
         System.out.println();
 
         System.out.println(
-                "--metadata-column is used to specify which metadata columns to include in the output schema of the connector. Please see the doc for usage.");
+                "--metadata_column is used to specify which metadata columns to include in the output schema of the connector. Please see the doc for usage.");
         System.out.println();
 
         System.out.println(
-                "--type-mapping is used to specify how to map MySQL type to Paimon type. Please see the doc for usage.");
+                "--type_mapping is used to specify how to map MySQL type to Paimon type. Please see the doc for usage.");
         System.out.println();
 
         System.out.println("MySQL CDC source conf syntax:");
@@ -154,7 +149,7 @@ public class MySqlSyncDatabaseActionFactory implements ActionFactory {
                         + "It can't be a regular expression.");
         System.out.println(
                 "For a complete list of supported configurations, "
-                        + "see https://ververica.github.io/flink-cdc-connectors/master/content/connectors/mysql-cdc.html#connector-options");
+                        + "see https://nightlies.apache.org/flink/flink-cdc-docs-release-3.1/docs/connectors/flink-sources/mysql-cdc/#connector-options");
         System.out.println();
 
         System.out.println("Paimon catalog and table sink conf syntax:");
@@ -167,17 +162,17 @@ public class MySqlSyncDatabaseActionFactory implements ActionFactory {
 
         System.out.println("Examples:");
         System.out.println(
-                "  mysql-sync-database \\\n"
+                "  mysql_sync_database \\\n"
                         + "    --warehouse hdfs:///path/to/warehouse \\\n"
                         + "    --database test_db \\\n"
-                        + "    --mysql-conf hostname=127.0.0.1 \\\n"
-                        + "    --mysql-conf username=root \\\n"
-                        + "    --mysql-conf password=123456 \\\n"
-                        + "    --mysql-conf database-name=source_db \\\n"
-                        + "    --catalog-conf metastore=hive \\\n"
-                        + "    --catalog-conf uri=thrift://hive-metastore:9083 \\\n"
-                        + "    --table-conf bucket=4 \\\n"
-                        + "    --table-conf changelog-producer=input \\\n"
-                        + "    --table-conf sink.parallelism=4");
+                        + "    --mysql_conf hostname=127.0.0.1 \\\n"
+                        + "    --mysql_conf username=root \\\n"
+                        + "    --mysql_conf password=123456 \\\n"
+                        + "    --mysql_conf database-name=source_db \\\n"
+                        + "    --catalog_conf metastore=hive \\\n"
+                        + "    --catalog_conf uri=thrift://hive-metastore:9083 \\\n"
+                        + "    --table_conf bucket=4 \\\n"
+                        + "    --table_conf changelog-producer=input \\\n"
+                        + "    --table_conf sink.parallelism=4");
     }
 }

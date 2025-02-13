@@ -19,7 +19,6 @@
 package org.apache.paimon.hive.mapred;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
@@ -62,7 +61,8 @@ public class PaimonRecordReaderTest {
     public void testPk() throws Exception {
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, tempDir.toString());
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
+        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_AVRO);
+        conf.set("bucket", "1");
         Table table =
                 FileStoreTestUtils.createFileStoreTable(
                         conf,
@@ -82,6 +82,9 @@ public class PaimonRecordReaderTest {
         write.write(GenericRow.ofKind(RowKind.DELETE, 2L, BinaryString.fromString("Hello")));
         commit.commit(0, write.prepareCommit(true, 0));
 
+        write.close();
+        commit.close();
+
         PaimonRecordReader reader = read(table, BinaryRow.EMPTY_ROW, 0);
         RowDataContainer container = reader.createValue();
         Set<String> actual = new HashSet<>();
@@ -98,51 +101,10 @@ public class PaimonRecordReaderTest {
     }
 
     @Test
-    public void testValueCount() throws Exception {
-        Options conf = new Options();
-        conf.set(CatalogOptions.WAREHOUSE, tempDir.toString());
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.CHANGE_LOG);
-        Table table =
-                FileStoreTestUtils.createFileStoreTable(
-                        conf,
-                        RowType.of(
-                                new DataType[] {DataTypes.INT(), DataTypes.STRING()},
-                                new String[] {"a", "b"}),
-                        Collections.emptyList(),
-                        Collections.emptyList());
-
-        StreamWriteBuilder streamWriteBuilder = table.newStreamWriteBuilder();
-        StreamTableWrite write = streamWriteBuilder.newWrite();
-        StreamTableCommit commit = streamWriteBuilder.newCommit();
-        write.write(GenericRow.of(1, BinaryString.fromString("Hi")));
-        write.write(GenericRow.of(2, BinaryString.fromString("Hello")));
-        write.write(GenericRow.of(3, BinaryString.fromString("World")));
-        write.write(GenericRow.of(1, BinaryString.fromString("Hi")));
-        write.write(GenericRow.ofKind(RowKind.DELETE, 2, BinaryString.fromString("Hello")));
-        write.write(GenericRow.of(1, BinaryString.fromString("Hi")));
-        commit.commit(0, write.prepareCommit(true, 0));
-
-        PaimonRecordReader reader = read(table, BinaryRow.EMPTY_ROW, 0);
-        RowDataContainer container = reader.createValue();
-        Map<String, Integer> actual = new HashMap<>();
-        while (reader.next(null, container)) {
-            InternalRow rowData = container.get();
-            String key = rowData.getInt(0) + "|" + rowData.getString(1).toString();
-            actual.compute(key, (k, v) -> (v == null ? 0 : v) + 1);
-        }
-
-        Map<String, Integer> expected = new HashMap<>();
-        expected.put("1|Hi", 3);
-        expected.put("3|World", 1);
-        assertThat(actual).isEqualTo(expected);
-    }
-
-    @Test
     public void testProjectionPushdown() throws Exception {
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, tempDir.toString());
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
+        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_AVRO);
         Table table =
                 FileStoreTestUtils.createFileStoreTable(
                         conf,
@@ -161,6 +123,9 @@ public class PaimonRecordReaderTest {
         write.write(GenericRow.of(2, 20L, BinaryString.fromString("Hello")));
         write.write(GenericRow.of(1, 10L, BinaryString.fromString("Hi")));
         commit.commit(0, write.prepareCommit(true, 0));
+
+        write.close();
+        commit.close();
 
         PaimonRecordReader reader = read(table, BinaryRow.EMPTY_ROW, 0, Arrays.asList("c", "a"));
         RowDataContainer container = reader.createValue();
@@ -190,10 +155,11 @@ public class PaimonRecordReaderTest {
                 List<String> originalColumns = ((FileStoreTable) table).schema().fieldNames();
                 return new PaimonRecordReader(
                         table.newReadBuilder(),
-                        new PaimonInputSplit(tempDir.toString(), dataSplit),
+                        new PaimonInputSplit(tempDir.toString(), dataSplit, (FileStoreTable) table),
                         originalColumns,
                         originalColumns,
-                        selectedColumns);
+                        selectedColumns,
+                        null);
             }
         }
         throw new IllegalArgumentException(

@@ -18,8 +18,8 @@
 
 package org.apache.paimon.flink.sink.cdc;
 
-import org.apache.paimon.annotation.Experimental;
-import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.annotation.Public;
+import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.table.Table;
 
@@ -28,38 +28,41 @@ import org.apache.flink.streaming.api.datastream.DataStreamSink;
 
 import javax.annotation.Nullable;
 
-/** Builder for sink when syncing {@link RichCdcRecord} records into one Paimon table. */
-@Experimental
+/**
+ * DataStream API for building Flink Sink for {@link RichCdcRecord} to write with schema evolution.
+ *
+ * @since 0.8
+ */
+@Public
 public class RichCdcSinkBuilder {
 
     private DataStream<RichCdcRecord> input = null;
     private Table table = null;
     private Identifier identifier = null;
-    private Catalog.Loader catalogLoader = null;
+    private CatalogLoader catalogLoader = null;
 
     @Nullable private Integer parallelism;
 
-    public RichCdcSinkBuilder withInput(DataStream<RichCdcRecord> input) {
+    public RichCdcSinkBuilder(Table table) {
+        this.table = table;
+    }
+
+    public RichCdcSinkBuilder forRichCdcRecord(DataStream<RichCdcRecord> input) {
         this.input = input;
         return this;
     }
 
-    public RichCdcSinkBuilder withTable(Table table) {
-        this.table = table;
-        return this;
-    }
-
-    public RichCdcSinkBuilder withParallelism(@Nullable Integer parallelism) {
-        this.parallelism = parallelism;
-        return this;
-    }
-
-    public RichCdcSinkBuilder withIdentifier(Identifier identifier) {
+    public RichCdcSinkBuilder identifier(Identifier identifier) {
         this.identifier = identifier;
         return this;
     }
 
-    public RichCdcSinkBuilder withCatalogLoader(Catalog.Loader catalogLoader) {
+    public RichCdcSinkBuilder parallelism(@Nullable Integer parallelism) {
+        this.parallelism = parallelism;
+        return this;
+    }
+
+    public RichCdcSinkBuilder catalogLoader(CatalogLoader catalogLoader) {
         this.catalogLoader = catalogLoader;
         return this;
     }
@@ -73,5 +76,46 @@ public class RichCdcSinkBuilder {
                 .withIdentifier(identifier)
                 .withCatalogLoader(catalogLoader)
                 .build();
+    }
+
+    // ====================== Deprecated ============================
+
+    /** @deprecated Use constructor to pass table. */
+    @Deprecated
+    public RichCdcSinkBuilder() {}
+
+    /** @deprecated Use {@link #forRichCdcRecord}. */
+    @Deprecated
+    public RichCdcSinkBuilder withInput(DataStream<RichCdcRecord> input) {
+        this.input = input;
+        return this;
+    }
+
+    /** @deprecated Use constructor to pass Table. */
+    @Deprecated
+    public RichCdcSinkBuilder withTable(Table table) {
+        this.table = table;
+        return this;
+    }
+
+    /** @deprecated Use {@link #parallelism}. */
+    @Deprecated
+    public RichCdcSinkBuilder withParallelism(@Nullable Integer parallelism) {
+        this.parallelism = parallelism;
+        return this;
+    }
+
+    /** @deprecated Use {@link #identifier}. */
+    @Deprecated
+    public RichCdcSinkBuilder withIdentifier(Identifier identifier) {
+        this.identifier = identifier;
+        return this;
+    }
+
+    /** @deprecated Use {@link #catalogLoader}. */
+    @Deprecated
+    public RichCdcSinkBuilder withCatalogLoader(CatalogLoader catalogLoader) {
+        this.catalogLoader = catalogLoader;
+        return this;
     }
 }

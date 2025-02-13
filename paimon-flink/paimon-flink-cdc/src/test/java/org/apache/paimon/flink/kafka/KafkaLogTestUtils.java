@@ -20,7 +20,6 @@ package org.apache.paimon.flink.kafka;
 
 import org.apache.paimon.CoreOptions.LogChangelogMode;
 import org.apache.paimon.CoreOptions.LogConsistency;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.flink.log.LogStoreTableFactory;
 import org.apache.paimon.table.sink.SinkRecord;
@@ -48,11 +47,13 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.utils.TypeConversions;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -60,7 +61,6 @@ import java.util.stream.IntStream;
 import static org.apache.paimon.CoreOptions.DYNAMIC_PARTITION_OVERWRITE;
 import static org.apache.paimon.CoreOptions.LOG_CHANGELOG_MODE;
 import static org.apache.paimon.CoreOptions.LOG_CONSISTENCY;
-import static org.apache.paimon.CoreOptions.WRITE_MODE;
 import static org.apache.paimon.data.BinaryRow.EMPTY_ROW;
 import static org.apache.paimon.flink.FlinkConnectorOptions.LOG_SYSTEM;
 import static org.apache.paimon.flink.kafka.KafkaLogOptions.BOOTSTRAP_SERVERS;
@@ -121,6 +121,11 @@ public class KafkaLogTestUtils {
                     return new SinkRuntimeProviderContext(isBounded())
                             .createDataStructureConverter(producedDataType);
                 }
+
+                @Override
+                public Optional<int[][]> getTargetColumns() {
+                    return Optional.empty();
+                }
             };
 
     public static KafkaLogStoreFactory discoverKafkaLogFactory() {
@@ -170,7 +175,21 @@ public class KafkaLogTestUtils {
 
     public static DynamicTableFactory.Context testContext(
             String servers, LogChangelogMode changelogMode, boolean keyed) {
-        return testContext("table", servers, changelogMode, LogConsistency.TRANSACTIONAL, keyed);
+        return testContext(servers, changelogMode, keyed, Collections.emptyMap());
+    }
+
+    public static DynamicTableFactory.Context testContext(
+            String servers,
+            LogChangelogMode changelogMode,
+            boolean keyed,
+            Map<String, String> dynamicOptions) {
+        return testContext(
+                "table",
+                servers,
+                changelogMode,
+                LogConsistency.TRANSACTIONAL,
+                keyed,
+                dynamicOptions);
     }
 
     static DynamicTableFactory.Context testContext(
@@ -178,7 +197,8 @@ public class KafkaLogTestUtils {
             String servers,
             LogChangelogMode changelogMode,
             LogConsistency consistency,
-            boolean keyed) {
+            boolean keyed,
+            Map<String, String> dynamicOptions) {
         return testContext(
                 name,
                 servers,
@@ -186,7 +206,7 @@ public class KafkaLogTestUtils {
                 consistency,
                 RowType.of(new IntType(), new IntType()),
                 keyed ? new int[] {0} : new int[0],
-                new HashMap<>());
+                dynamicOptions);
     }
 
     public static DynamicTableFactory.Context testContext(
@@ -220,10 +240,22 @@ public class KafkaLogTestUtils {
             List<String> partitionKeys,
             boolean manuallyCreateLogTable) {
         String topic = "topic_" + UUID.randomUUID();
+        List<String> bucketKeys = new ArrayList<>();
+        if (primaryKeys.isEmpty()) {
+            for (String fieldSpec : fieldsSpec) {
+                String fieldName = fieldSpec.split(" ")[0];
+                if (!partitionKeys.contains(fieldName)
+                        && !"WATERMARK".equalsIgnoreCase(fieldName)
+                        && !fieldSpec.contains(" AS ")) {
+                    bucketKeys.add(fieldName);
+                }
+            }
+        }
         String table =
                 createTable(
                         fieldsSpec,
                         primaryKeys,
+                        bucketKeys,
                         partitionKeys,
                         new HashMap<String, String>() {
                             {
@@ -231,7 +263,6 @@ public class KafkaLogTestUtils {
                                 put(BOOTSTRAP_SERVERS.key(), getBootstrapServers());
                                 put(TOPIC.key(), topic);
                                 put(DYNAMIC_PARTITION_OVERWRITE.key(), "false");
-                                put(WRITE_MODE.key(), WriteMode.CHANGE_LOG.toString());
                             }
                         });
 

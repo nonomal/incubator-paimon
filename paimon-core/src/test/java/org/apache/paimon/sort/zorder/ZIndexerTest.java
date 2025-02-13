@@ -25,7 +25,6 @@ import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.VarCharType;
-import org.apache.paimon.utils.ZOrderByteUtils;
 
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -33,6 +32,8 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Random;
+
+import static org.apache.paimon.utils.RandomUtil.randomString;
 
 /** Tests for {@link ZIndexer}. */
 public class ZIndexerTest {
@@ -103,13 +104,36 @@ public class ZIndexerTest {
         }
     }
 
-    public static String randomString(int length) {
-        byte[] buffer = new byte[length];
+    @Test
+    public void testZIndexerForVarcharWithNull() {
+        RowType rowType = RowType.of(new VarCharType(), new VarCharType());
 
-        for (int i = 0; i < length; i += 1) {
-            buffer[i] = (byte) ('a' + RANDOM.nextInt(26));
+        int varTypeSize = 10;
+        ZIndexer zIndexer = new ZIndexer(rowType, Arrays.asList("f0", "f1"), varTypeSize);
+        zIndexer.open();
+
+        byte[] nullBytes = new byte[varTypeSize];
+        Arrays.fill(nullBytes, (byte) 0x00);
+        for (int i = 0; i < 1000; i++) {
+            BinaryString a = BinaryString.fromString(randomString(varTypeSize + 1));
+
+            InternalRow internalRow = GenericRow.of(a, null);
+
+            byte[] zOrder = zIndexer.index(internalRow);
+
+            byte[][] zCache = new byte[2][];
+            ByteBuffer byteBuffer = ByteBuffer.allocate(varTypeSize);
+            ZOrderByteUtils.stringToOrderedBytes(a.toString(), varTypeSize, byteBuffer);
+            zCache[0] = Arrays.copyOf(byteBuffer.array(), varTypeSize);
+
+            zCache[1] = nullBytes;
+
+            byte[] expectedZOrder =
+                    ZOrderByteUtils.interleaveBits(zCache, zCache.length * varTypeSize);
+
+            for (int j = 0; j < zCache.length * varTypeSize; j++) {
+                Assertions.assertThat(zOrder[j]).isEqualTo(expectedZOrder[j]);
+            }
         }
-
-        return new String(buffer);
     }
 }

@@ -23,7 +23,6 @@ import org.apache.paimon.types.DataType;
 import org.apache.paimon.utils.Preconditions;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -35,6 +34,12 @@ public class ComputedColumnUtils {
 
     public static List<ComputedColumn> buildComputedColumns(
             List<String> computedColumnArgs, List<DataField> physicFields) {
+        return buildComputedColumns(computedColumnArgs, physicFields, true);
+    }
+
+    /** The caseSensitive only affects check. We don't change field names at building phase. */
+    public static List<ComputedColumn> buildComputedColumns(
+            List<String> computedColumnArgs, List<DataField> physicFields, boolean caseSensitive) {
         Map<String, DataType> typeMapping =
                 physicFields.stream()
                         .collect(
@@ -64,23 +69,10 @@ public class ComputedColumnUtils {
             String[] args = expression.substring(left + 1, right).split(",");
             checkArgument(args.length >= 1, "Computed column needs at least one argument.");
 
-            String fieldReference = args[0].trim();
-            String[] literals =
-                    Arrays.stream(args).skip(1).map(String::trim).toArray(String[]::new);
-            checkArgument(
-                    typeMapping.containsKey(fieldReference),
-                    String.format(
-                            "Referenced field '%s' is not in given fields: %s.",
-                            fieldReference, typeMapping.keySet()));
-
             computedColumns.add(
                     new ComputedColumn(
                             columnName,
-                            Expression.create(
-                                    exprName,
-                                    fieldReference,
-                                    typeMapping.get(fieldReference),
-                                    literals)));
+                            Expression.create(typeMapping, caseSensitive, exprName, args)));
         }
 
         return computedColumns;

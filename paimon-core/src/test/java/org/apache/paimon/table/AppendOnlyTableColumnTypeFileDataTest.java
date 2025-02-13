@@ -18,8 +18,6 @@
 
 package org.apache.paimon.table;
 
-import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
 
@@ -32,7 +30,6 @@ public class AppendOnlyTableColumnTypeFileDataTest extends ColumnTypeFileDataTes
     @BeforeEach
     public void before() throws Exception {
         super.before();
-        tableConfig.set(CoreOptions.WRITE_MODE, WriteMode.APPEND_ONLY);
     }
 
     @Override
@@ -40,7 +37,7 @@ public class AppendOnlyTableColumnTypeFileDataTest extends ColumnTypeFileDataTes
         SchemaManager schemaManager = new TestingSchemaManager(tablePath, tableSchemas);
         return new AppendOnlyFileStoreTable(fileIO, tablePath, schemaManager.latest().get()) {
             @Override
-            protected SchemaManager schemaManager() {
+            public SchemaManager schemaManager() {
                 return schemaManager;
             }
         };

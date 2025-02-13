@@ -36,6 +36,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -86,19 +87,19 @@ public class CdcRecordKeyAndBucketExtractorTest {
                             StringData.fromString(v2));
             expected.setRecord(rowData);
 
-            Map<String, String> fields = new HashMap<>();
-            fields.put("pt1", pt1);
-            fields.put("pt2", String.valueOf(pt2));
-            fields.put("k1", String.valueOf(k1));
-            fields.put("v1", String.valueOf(v1));
-            fields.put("k2", k2);
-            fields.put("v2", v2);
+            Map<String, String> data = new HashMap<>();
+            data.put("pt1", pt1);
+            data.put("pt2", String.valueOf(pt2));
+            data.put("k1", String.valueOf(k1));
+            data.put("v1", String.valueOf(v1));
+            data.put("k2", k2);
+            data.put("v2", v2);
 
-            actual.setRecord(new CdcRecord(RowKind.INSERT, fields));
+            actual.setRecord(new CdcRecord(RowKind.INSERT, data));
             assertThat(actual.partition()).isEqualTo(expected.partition());
             assertThat(actual.bucket()).isEqualTo(expected.bucket());
 
-            actual.setRecord(new CdcRecord(RowKind.DELETE, fields));
+            actual.setRecord(new CdcRecord(RowKind.DELETE, data));
             assertThat(actual.partition()).isEqualTo(expected.partition());
             assertThat(actual.bucket()).isEqualTo(expected.bucket());
         }
@@ -121,19 +122,58 @@ public class CdcRecordKeyAndBucketExtractorTest {
                         null, null, k1, v1, StringData.fromString(k2), StringData.fromString(v2));
         expected.setRecord(rowData);
 
-        Map<String, String> fields = new HashMap<>();
-        fields.put("pt1", null);
-        fields.put("pt2", null);
-        fields.put("k1", String.valueOf(k1));
-        fields.put("v1", String.valueOf(v1));
-        fields.put("k2", k2);
-        fields.put("v2", v2);
+        Map<String, String> data = new HashMap<>();
+        data.put("pt1", null);
+        data.put("pt2", null);
+        data.put("k1", String.valueOf(k1));
+        data.put("v1", String.valueOf(v1));
+        data.put("k2", k2);
+        data.put("v2", v2);
 
-        actual.setRecord(new CdcRecord(RowKind.INSERT, fields));
+        actual.setRecord(new CdcRecord(RowKind.INSERT, data));
         assertThat(actual.partition()).isEqualTo(expected.partition());
         assertThat(actual.bucket()).isEqualTo(expected.bucket());
 
-        actual.setRecord(new CdcRecord(RowKind.DELETE, fields));
+        actual.setRecord(new CdcRecord(RowKind.DELETE, data));
+        assertThat(actual.partition()).isEqualTo(expected.partition());
+        assertThat(actual.bucket()).isEqualTo(expected.bucket());
+    }
+
+    @Test
+    public void testEmptyPartition() throws Exception {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        TableSchema schema = createTableSchema();
+        RowDataKeyAndBucketExtractor expected = new RowDataKeyAndBucketExtractor(schema);
+        CdcRecordKeyAndBucketExtractor actual = new CdcRecordKeyAndBucketExtractor(schema);
+
+        long k1 = random.nextLong();
+        int v1 = random.nextInt();
+        String k2 = UUID.randomUUID().toString();
+        String v2 = UUID.randomUUID().toString();
+
+        GenericRowData rowData =
+                GenericRowData.of(
+                        StringData.fromString(""),
+                        null,
+                        k1,
+                        v1,
+                        StringData.fromString(k2),
+                        StringData.fromString(v2));
+        expected.setRecord(rowData);
+
+        Map<String, String> data = new HashMap<>();
+        data.put("pt1", "");
+        data.put("pt2", null);
+        data.put("k1", String.valueOf(k1));
+        data.put("v1", String.valueOf(v1));
+        data.put("k2", k2);
+        data.put("v2", v2);
+
+        actual.setRecord(new CdcRecord(RowKind.INSERT, data));
+        assertThat(actual.partition()).isEqualTo(expected.partition());
+        assertThat(actual.bucket()).isEqualTo(expected.bucket());
+
+        actual.setRecord(new CdcRecord(RowKind.DELETE, data));
         assertThat(actual.partition()).isEqualTo(expected.partition());
         assertThat(actual.bucket()).isEqualTo(expected.bucket());
     }
@@ -145,7 +185,7 @@ public class CdcRecordKeyAndBucketExtractorTest {
                         ROW_TYPE.getFields(),
                         Arrays.asList("pt1", "pt2"),
                         Arrays.asList("pt1", "pt2", "k1", "k2"),
-                        new HashMap<>(),
+                        Collections.singletonMap("bucket", "1"),
                         ""));
     }
 }

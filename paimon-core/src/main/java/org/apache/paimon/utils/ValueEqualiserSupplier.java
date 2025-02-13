@@ -18,27 +18,54 @@
 
 package org.apache.paimon.utils;
 
-import org.apache.paimon.codegen.CodeGenUtils;
-import org.apache.paimon.codegen.GeneratedClass;
 import org.apache.paimon.codegen.RecordEqualiser;
+import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
 
+import javax.annotation.Nullable;
+
+import java.util.List;
 import java.util.function.Supplier;
+import java.util.stream.IntStream;
+
+import static org.apache.paimon.codegen.CodeGenUtils.newRecordEqualiser;
 
 /** A {@link Supplier} that returns the equaliser for the file store value. */
 public class ValueEqualiserSupplier implements SerializableSupplier<RecordEqualiser> {
 
     private static final long serialVersionUID = 1L;
 
-    private final GeneratedClass<RecordEqualiser> genRecordEqualiser;
+    private final List<DataType> fieldTypes;
+
+    private final int[] projection;
 
     public ValueEqualiserSupplier(RowType keyType) {
-        genRecordEqualiser =
-                CodeGenUtils.generateRecordEqualiser(keyType.getFieldTypes(), "valueEqualiser");
+        this.fieldTypes = keyType.getFieldTypes();
+        this.projection = null;
+    }
+
+    public ValueEqualiserSupplier(RowType keyType, int[] projection) {
+        this.fieldTypes = keyType.getFieldTypes();
+        this.projection = projection;
     }
 
     @Override
     public RecordEqualiser get() {
-        return genRecordEqualiser.newInstance(ValueEqualiserSupplier.class.getClassLoader());
+        return this.projection == null
+                ? newRecordEqualiser(fieldTypes)
+                : newRecordEqualiser(fieldTypes, projection);
+    }
+
+    public static ValueEqualiserSupplier fromIgnoreFields(
+            RowType rowType, @Nullable List<String> ignoreFields) {
+        int[] projection = null;
+        if (ignoreFields != null) {
+            List<String> fieldNames = rowType.getFieldNames();
+            projection =
+                    IntStream.range(0, rowType.getFieldCount())
+                            .filter(idx -> !ignoreFields.contains(fieldNames.get(idx)))
+                            .toArray();
+        }
+        return new ValueEqualiserSupplier(rowType, projection);
     }
 }

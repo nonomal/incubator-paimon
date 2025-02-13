@@ -26,7 +26,6 @@ import org.apache.paimon.utils.SnapshotManager;
 
 import org.apache.flink.core.execution.JobClient;
 import org.apache.flink.core.execution.SavepointFormatType;
-import org.apache.flink.runtime.jobgraph.SavepointConfigOptions;
 import org.apache.flink.types.Row;
 import org.junit.jupiter.api.Test;
 
@@ -34,6 +33,7 @@ import javax.annotation.Nullable;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
 import static org.apache.paimon.CoreOptions.BUCKET;
@@ -53,7 +53,7 @@ public class RescaleBucketITCase extends CatalogITCaseBase {
                 String.format(
                         "CREATE CATALOG `fs_catalog` WITH ('type' = 'paimon', 'warehouse' = '%s')",
                         path),
-                "CREATE TABLE IF NOT EXISTS `fs_catalog`.`default`.`T1` (f0 INT) WITH ('bucket' = '2')");
+                "CREATE TABLE IF NOT EXISTS `fs_catalog`.`default`.`T1` (f0 INT) WITH ('bucket' = '2', 'bucket-key' = 'f0')");
     }
 
     @Test
@@ -68,7 +68,7 @@ public class RescaleBucketITCase extends CatalogITCaseBase {
                 Arrays.asList(
                         "USE CATALOG fs_catalog",
                         "CREATE TEMPORARY TABLE IF NOT EXISTS `S0` (f0 INT) WITH ('connector' = 'datagen')",
-                        "CREATE TABLE IF NOT EXISTS `T3` (f0 INT) WITH ('bucket' = '2')",
+                        "CREATE TABLE IF NOT EXISTS `T3` (f0 INT) WITH ('bucket' = '2', 'bucket-key' = 'f0')",
                         "CREATE TABLE IF NOT EXISTS `T4` (f0 INT)"));
         SchemaManager schemaManager =
                 new SchemaManager(LocalFileIO.create(), getTableDirectory("T3"));
@@ -80,13 +80,11 @@ public class RescaleBucketITCase extends CatalogITCaseBase {
                         + "INSERT INTO `T4` SELECT * FROM `S0`;\n"
                         + "END";
 
-        sEnv.getConfig().getConfiguration().set(SavepointConfigOptions.SAVEPOINT_PATH, path);
-
         // step1: run streaming insert
         JobClient jobClient = startJobAndCommitSnapshot(streamSql, null);
 
         // step2: stop with savepoint
-        stopJobSafely(jobClient);
+        String savepointPath = stopJobSafely(jobClient);
 
         final Snapshot snapshotBeforeRescale = findLatestSnapshot("T3");
         assertThat(snapshotBeforeRescale).isNotNull();
@@ -107,6 +105,10 @@ public class RescaleBucketITCase extends CatalogITCaseBase {
         assertThat(batchSql("SELECT * FROM T3")).containsExactlyInAnyOrderElementsOf(committedData);
 
         // step5: resume streaming job
+        // use config string to stay compatible with flink 1.19-
+        sEnv.getConfig()
+                .getConfiguration()
+                .setString("execution.state-recovery.path", savepointPath);
         JobClient resumedJobClient =
                 startJobAndCommitSnapshot(streamSql, snapshotAfterRescale.id());
         // stop job
@@ -144,11 +146,13 @@ public class RescaleBucketITCase extends CatalogITCaseBase {
         return jobClient;
     }
 
-    private void stopJobSafely(JobClient client) throws ExecutionException, InterruptedException {
-        client.stopWithSavepoint(true, path, SavepointFormatType.DEFAULT);
+    private String stopJobSafely(JobClient client) throws ExecutionException, InterruptedException {
+        CompletableFuture<String> savepointPath =
+                client.stopWithSavepoint(true, path, SavepointFormatType.DEFAULT);
         while (!client.getJobStatus().get().isGloballyTerminalState()) {
             Thread.sleep(2000L);
         }
+        return savepointPath.get();
     }
 
     private void assertLatestSchema(
@@ -194,7 +198,7 @@ public class RescaleBucketITCase extends CatalogITCaseBase {
 
         // check write without rescale
         assertThatThrownBy(() -> batchSql("INSERT INTO %s VALUES (6)", tableName))
-                .getRootCause()
+                .rootCause()
                 .isInstanceOf(RuntimeException.class)
                 .hasMessage(
                         "Try to write table with a new bucket num 4, but the previous bucket num is 2. "

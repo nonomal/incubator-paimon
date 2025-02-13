@@ -23,6 +23,7 @@ import org.apache.paimon.flink.factories.FlinkFactoryUtil.FlinkTableFactoryHelpe
 import org.apache.paimon.flink.log.LogStoreRegister;
 import org.apache.paimon.flink.log.LogStoreTableFactory;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.utils.DateTimeUtils;
 
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.serialization.SerializationSchema;
@@ -40,16 +41,18 @@ import org.apache.flink.table.types.utils.DataTypeUtils;
 import javax.annotation.Nullable;
 
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
+import java.util.TimeZone;
 
 import static org.apache.kafka.clients.consumer.ConsumerConfig.ISOLATION_LEVEL_CONFIG;
 import static org.apache.paimon.CoreOptions.LOG_CHANGELOG_MODE;
 import static org.apache.paimon.CoreOptions.LOG_CONSISTENCY;
 import static org.apache.paimon.CoreOptions.LogConsistency;
+import static org.apache.paimon.CoreOptions.SCAN_TIMESTAMP;
 import static org.apache.paimon.CoreOptions.SCAN_TIMESTAMP_MILLIS;
 import static org.apache.paimon.flink.factories.FlinkFactoryUtil.createFlinkTableFactoryHelper;
 import static org.apache.paimon.flink.kafka.KafkaLogOptions.TOPIC;
+import static org.apache.paimon.options.OptionsUtils.convertToPropertiesPrefixKey;
 
 /** The Kafka {@link LogStoreTableFactory} implementation. */
 public class KafkaLogStoreFactory implements LogStoreTableFactory {
@@ -84,9 +87,17 @@ public class KafkaLogStoreFactory implements LogStoreTableFactory {
                             .createRuntimeDecoder(sourceContext, keyType);
         }
         DeserializationSchema<RowData> valueDeserializer =
-                LogStoreTableFactory.getValueDecodingFormat(helper)
+                LogStoreTableFactory.getValueDecodingFormat(helper, primaryKey.length != 0)
                         .createRuntimeDecoder(sourceContext, physicalType);
         Options options = toOptions(helper.getOptions());
+        Long timestampMills = options.get(SCAN_TIMESTAMP_MILLIS);
+        String timestampString = options.get(SCAN_TIMESTAMP);
+
+        if (timestampMills == null && timestampString != null) {
+            timestampMills =
+                    DateTimeUtils.parseTimestampData(timestampString, 3, TimeZone.getDefault())
+                            .getMillisecond();
+        }
         return new KafkaLogSourceProvider(
                 topic(context),
                 toKafkaProperties(options),
@@ -98,7 +109,7 @@ public class KafkaLogStoreFactory implements LogStoreTableFactory {
                 options.get(LOG_CONSISTENCY),
                 // TODO visit all options through CoreOptions
                 CoreOptions.startupMode(options),
-                options.get(SCAN_TIMESTAMP_MILLIS));
+                timestampMills);
     }
 
     @Override
@@ -116,7 +127,7 @@ public class KafkaLogStoreFactory implements LogStoreTableFactory {
                             .createRuntimeEncoder(sinkContext, keyType);
         }
         SerializationSchema<RowData> valueSerializer =
-                LogStoreTableFactory.getValueEncodingFormat(helper)
+                LogStoreTableFactory.getValueEncodingFormat(helper, primaryKey.length != 0)
                         .createRuntimeEncoder(sinkContext, physicalType);
         Options options = toOptions(helper.getOptions());
         return new KafkaLogSinkProvider(
@@ -143,14 +154,7 @@ public class KafkaLogStoreFactory implements LogStoreTableFactory {
 
     public static Properties toKafkaProperties(Options options) {
         Properties properties = new Properties();
-        Map<String, String> optionMap = options.toMap();
-        optionMap.keySet().stream()
-                .filter(key -> key.startsWith(KAFKA_PREFIX))
-                .forEach(
-                        key ->
-                                properties.put(
-                                        key.substring((KAFKA_PREFIX).length()),
-                                        optionMap.get(key)));
+        properties.putAll(convertToPropertiesPrefixKey(options.toMap(), KAFKA_PREFIX));
 
         // Add read committed for transactional consistency mode.
         if (options.get(LOG_CONSISTENCY) == LogConsistency.TRANSACTIONAL) {

@@ -21,16 +21,29 @@ package org.apache.paimon.format;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.reader.FileRecordReader;
 import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.utils.RoaringBitmap32;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
-import java.io.Serializable;
 
 /** A factory to create {@link RecordReader} for file. */
-public interface FormatReaderFactory extends Serializable {
+public interface FormatReaderFactory {
 
-    RecordReader<InternalRow> createReader(FileIO fileIO, Path file) throws IOException;
+    FileRecordReader<InternalRow> createReader(Context context) throws IOException;
 
-    RecordReader<InternalRow> createReader(FileIO fileIO, Path file, int poolSize)
-            throws IOException;
+    /** Context for creating reader. */
+    interface Context {
+
+        FileIO fileIO();
+
+        Path filePath();
+
+        long fileSize();
+
+        @Nullable
+        RoaringBitmap32 selection();
+    }
 }

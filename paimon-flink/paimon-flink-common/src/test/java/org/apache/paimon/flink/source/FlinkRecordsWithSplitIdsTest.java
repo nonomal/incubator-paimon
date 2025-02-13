@@ -18,11 +18,15 @@
 
 package org.apache.paimon.flink.source;
 
+import org.apache.paimon.flink.source.FileStoreSourceReaderTest.DummyMetricGroup;
+import org.apache.paimon.flink.source.metrics.FileStoreSourceReaderMetrics;
+
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.file.src.reader.BulkFormat;
 import org.apache.flink.connector.file.src.util.ArrayResultIterator;
 import org.apache.flink.connector.file.src.util.CheckpointedPosition;
 import org.apache.flink.connector.file.src.util.SingletonResultIterator;
+import org.apache.flink.connector.testutils.source.reader.TestingReaderContext;
 import org.apache.flink.connector.testutils.source.reader.TestingReaderOutput;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -60,7 +64,13 @@ public class FlinkRecordsWithSplitIdsTest {
 
         BulkFormat.RecordIterator<RowData> iterator = records.nextRecordFromSplit();
         assertThat(iterator).isNotNull();
-        FlinkRecordsWithSplitIds.emitRecord(iterator, output, state);
+        FlinkRecordsWithSplitIds.emitRecord(
+                new TestingReaderContext(),
+                iterator,
+                output,
+                state,
+                new FileStoreSourceReaderMetrics(new DummyMetricGroup()),
+                null);
         assertThat(output.getEmittedRecords()).containsExactly(rows);
         assertThat(state.recordsToSkip()).isEqualTo(2);
         assertThat(records.nextRecordFromSplit()).isNull();

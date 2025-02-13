@@ -18,46 +18,35 @@
 
 package org.apache.paimon.flink.action.cdc.mongodb;
 
-import org.apache.paimon.flink.action.Action;
-import org.apache.paimon.flink.action.ActionFactory;
+import org.apache.paimon.flink.action.cdc.SyncDatabaseActionFactoryBase;
 
-import org.apache.flink.api.java.utils.MultipleParameterTool;
-
-import java.util.Optional;
+import static org.apache.paimon.flink.action.cdc.CdcActionCommonUtils.MONGODB_CONF;
 
 /** Factory to create {@link MongoDBSyncDatabaseAction}. */
-public class MongoDBSyncDatabaseActionFactory implements ActionFactory {
+public class MongoDBSyncDatabaseActionFactory
+        extends SyncDatabaseActionFactoryBase<MongoDBSyncDatabaseAction> {
 
-    public static final String IDENTIFIER = "mongodb-sync-database";
+    public static final String IDENTIFIER = "mongodb_sync_database";
 
     @Override
     public String identifier() {
         return IDENTIFIER;
     }
 
-    public Optional<Action> create(MultipleParameterTool params) {
-        checkRequiredArgument(params, "mongodb-conf");
+    @Override
+    protected String cdcConfigIdentifier() {
+        return MONGODB_CONF;
+    }
 
-        MongoDBSyncDatabaseAction action =
-                new MongoDBSyncDatabaseAction(
-                        getRequiredValue(params, "warehouse"),
-                        getRequiredValue(params, "database"),
-                        optionalConfigMap(params, "catalog-conf"),
-                        optionalConfigMap(params, "mongodb-conf"));
-
-        action.withTableConfig(optionalConfigMap(params, "table-conf"))
-                .withTablePrefix(params.get("table-prefix"))
-                .withTableSuffix(params.get("table-suffix"))
-                .includingTables(params.get("including-tables"))
-                .excludingTables(params.get("excluding-tables"));
-
-        return Optional.of(action);
+    @Override
+    public MongoDBSyncDatabaseAction createAction() {
+        return new MongoDBSyncDatabaseAction(database, catalogConfig, cdcSourceConfig);
     }
 
     @Override
     public void printHelp() {
         System.out.println(
-                "Action \"mongodb-sync-database\" creates a streaming job "
+                "Action \"mongodb_sync_database\" creates a streaming job "
                         + "with a Flink MongoDB CDC source and multiple Paimon table sinks "
                         + "to synchronize a whole MongoDB database into one Paimon database.\n"
                         + "Only MongoDB tables with a primary key that includes `_id` will be taken into consideration."
@@ -66,30 +55,32 @@ public class MongoDBSyncDatabaseActionFactory implements ActionFactory {
 
         System.out.println("Syntax:");
         System.out.println(
-                "  mongodb-sync-database --warehouse <warehouse-path> --database <database-name> "
-                        + "[--table-prefix <paimon-table-prefix>] "
-                        + "[--table-suffix <paimon-table-suffix>] "
-                        + "[--including-tables <mongodb-table-name|name-regular-expr>] "
-                        + "[--excluding-tables <mongodb-table-name|name-regular-expr>] "
-                        + "[--mongodb-conf <mongodb-cdc-source-conf> [--mongodb-conf <mongodb-cdc-source-conf> ...]] "
-                        + "[--catalog-conf <paimon-catalog-conf> [--catalog-conf <paimon-catalog-conf> ...]] "
-                        + "[--table-conf <paimon-table-sink-conf> [--table-conf <paimon-table-sink-conf> ...]]");
+                "  mongodb_sync_database \\\n"
+                        + "--warehouse <warehouse_path> \\\n"
+                        + "--database <database_name> \\\n"
+                        + "[--table_prefix <paimon_table_prefix>] \\\n"
+                        + "[--table_suffix <paimon_table_suffix>] \\\n"
+                        + "[--including_tables <mongodb_table_name|name_regular_expr>] \\\n"
+                        + "[--excluding_tables <mongodb_table_name|name_regular_expr>] \\\n"
+                        + "[--mongodb_conf <mongodb_cdc_source_conf> [--mongodb_conf <mongodb_cdc_source_conf> ...]] \\\n"
+                        + "[--catalog_conf <paimon_catalog_conf> [--catalog_conf <paimon_catalog_conf> ...]] \\\n"
+                        + "[--table_conf <paimon_table_sink_conf> [--table_conf <paimon_table_sink_conf> ...]]");
         System.out.println();
 
         System.out.println(
-                "--table-prefix is the prefix of all Paimon tables to be synchronized. For example, if you want all "
-                        + "synchronized tables to have \"ods_\" as prefix, you can specify `--table-prefix ods_`.");
-        System.out.println("The usage of --table-suffix is same as `--table-prefix`");
+                "--table_prefix is the prefix of all Paimon tables to be synchronized. For example, if you want all "
+                        + "synchronized tables to have \"ods_\" as prefix, you can specify `--table_prefix ods_`.");
+        System.out.println("The usage of --table_suffix is same as `--table_prefix`");
         System.out.println();
 
         System.out.println(
-                "--including-tables is used to specify which source tables are to be synchronized. "
+                "--including_tables is used to specify which source tables are to be synchronized. "
                         + "You must use '|' to separate multiple tables. Regular expression is supported.");
         System.out.println(
-                "--excluding-tables is used to specify which source tables are not to be synchronized. "
-                        + "The usage is same as --including-tables.");
+                "--excluding_tables is used to specify which source tables are not to be synchronized. "
+                        + "The usage is same as --including_tables.");
         System.out.println(
-                "--excluding-tables has higher priority than --including-tables if you specified both.");
+                "--excluding_tables has higher priority than --including_tables if you specified both.");
         System.out.println();
 
         System.out.println("MongoDB CDC source conf syntax:");
@@ -102,7 +93,7 @@ public class MongoDBSyncDatabaseActionFactory implements ActionFactory {
                         + "It can't be a regular expression.");
         System.out.println(
                 "For a complete list of supported configurations, "
-                        + "see https://ververica.github.io/flink-cdc-connectors/master/content/connectors/mongodb-cdc.html#connector-options");
+                        + "see https://nightlies.apache.org/flink/flink-cdc-docs-release-3.1/docs/connectors/flink-sources/mongodb-cdc/#connector-options");
         System.out.println();
 
         System.out.println("Paimon catalog and table sink conf syntax:");
@@ -115,17 +106,17 @@ public class MongoDBSyncDatabaseActionFactory implements ActionFactory {
 
         System.out.println("Examples:");
         System.out.println(
-                "  mongodb-sync-database \\\n"
+                "  mongodb_sync_database \\\n"
                         + "    --warehouse hdfs:///path/to/warehouse \\\n"
                         + "    --database test_db \\\n"
-                        + "    --mongodb-conf hosts=127.0.0.1:27017 \\\n"
-                        + "    --mongodb-conf username=root \\\n"
-                        + "    --mongodb-conf password=123456 \\\n"
-                        + "    --mongodb-conf database=source_db \\\n"
-                        + "    --catalog-conf metastore=hive \\\n"
-                        + "    --catalog-conf uri=thrift://hive-metastore:9083 \\\n"
-                        + "    --table-conf bucket=4 \\\n"
-                        + "    --table-conf changelog-producer=input \\\n"
-                        + "    --table-conf sink.parallelism=4");
+                        + "    --mongodb_conf hosts=127.0.0.1:27017 \\\n"
+                        + "    --mongodb_conf username=root \\\n"
+                        + "    --mongodb_conf password=123456 \\\n"
+                        + "    --mongodb_conf database=source_db \\\n"
+                        + "    --catalog_conf metastore=hive \\\n"
+                        + "    --catalog_conf uri=thrift://hive-metastore:9083 \\\n"
+                        + "    --table_conf bucket=4 \\\n"
+                        + "    --table_conf changelog-producer=input \\\n"
+                        + "    --table_conf sink.parallelism=4");
     }
 }

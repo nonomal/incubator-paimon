@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -44,6 +44,7 @@ public class PaimonInternalRowObjectInspectorTest {
         List<? extends StructField> structFields = oi.getAllStructFieldRefs();
         List<ObjectInspector.Category> expectedOiCategories =
                 Arrays.asList(
+                        ObjectInspector.Category.PRIMITIVE,
                         ObjectInspector.Category.PRIMITIVE,
                         ObjectInspector.Category.PRIMITIVE,
                         ObjectInspector.Category.PRIMITIVE,
@@ -100,6 +101,7 @@ public class PaimonInternalRowObjectInspectorTest {
                                         "f_date:date",
                                         "f_time:string",
                                         "f_timestamp:timestamp",
+                                        "f_timestamp_ltz:timestamp",
                                         "f_list_long:array<bigint>",
                                         "f_map_string_int:map<string,int>"))
                         + ">";

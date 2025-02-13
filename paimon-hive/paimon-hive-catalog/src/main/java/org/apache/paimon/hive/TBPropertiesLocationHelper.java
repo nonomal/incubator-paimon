@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,6 +22,7 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.Table;
 
 import java.io.IOException;
@@ -52,6 +53,16 @@ public final class TBPropertiesLocationHelper implements LocationHelper {
     }
 
     @Override
+    public String getTableLocation(Table table) {
+        String location = table.getParameters().get(LocationKeyExtractor.TBPROPERTIES_LOCATION_KEY);
+        if (location != null) {
+            return location;
+        }
+
+        return table.getSd().getLocation();
+    }
+
+    @Override
     public void specifyDatabaseLocation(Path path, Database database) {
         HashMap<String, String> properties = new HashMap<>();
         if (database.getParameters() != null) {
@@ -59,5 +70,33 @@ public final class TBPropertiesLocationHelper implements LocationHelper {
         }
         properties.put(LocationKeyExtractor.TBPROPERTIES_LOCATION_KEY, path.toString());
         database.setParameters(properties);
+        database.setLocationUri(null);
+    }
+
+    @Override
+    public String getDatabaseLocation(Database database) {
+        String location =
+                database.getParameters().get(LocationKeyExtractor.TBPROPERTIES_LOCATION_KEY);
+        if (location != null) {
+            return location;
+        }
+
+        return database.getLocationUri();
+    }
+
+    @Override
+    public void specifyPartitionLocation(Partition partition, String location) {
+        partition.putToParameters(LocationKeyExtractor.TBPROPERTIES_LOCATION_KEY, location);
+    }
+
+    @Override
+    public String getPartitionLocation(Partition partition) {
+        String location =
+                partition.getParameters().get(LocationKeyExtractor.TBPROPERTIES_LOCATION_KEY);
+        if (location != null) {
+            return location;
+        }
+
+        return partition.getSd().getLocation();
     }
 }

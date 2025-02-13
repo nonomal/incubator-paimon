@@ -39,6 +39,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.io.DataFileTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** base class for Test {@link ManifestFile}. */
@@ -52,6 +53,16 @@ public abstract class ManifestFileMetaTestBase {
     }
 
     protected ManifestEntry makeEntry(boolean isAdd, String fileName, Integer partition) {
+        return makeEntry(isAdd, fileName, partition, 0, Collections.emptyList(), null);
+    }
+
+    protected ManifestEntry makeEntry(
+            boolean isAdd,
+            String fileName,
+            Integer partition,
+            int level,
+            List<String> extraFiles,
+            byte[] embeddedIndex) {
         BinaryRow binaryRow;
         if (partition != null) {
             binaryRow = new BinaryRow(1);
@@ -71,27 +82,25 @@ public abstract class ManifestFileMetaTestBase {
                         fileName,
                         0, // not used
                         0, // not used
-                        binaryRow, // not useds
                         binaryRow, // not used
-                        StatsTestUtils.newEmptyTableStats(), // not used
-                        StatsTestUtils.newEmptyTableStats(), // not used
+                        binaryRow, // not used
+                        StatsTestUtils.newEmptySimpleStats(), // not used
+                        StatsTestUtils.newEmptySimpleStats(), // not used
                         0, // not used
                         0, // not used
                         0, // not used
-                        0, // not used
-                        Collections.emptyList(),
-                        Timestamp.fromEpochMillis(200000)));
+                        level, // not used
+                        extraFiles,
+                        Timestamp.fromEpochMillis(200000),
+                        0L, // not used
+                        embeddedIndex, // not used
+                        FileSource.APPEND,
+                        null,
+                        null));
     }
 
     protected ManifestFileMeta makeManifest(ManifestEntry... entries) {
-        ManifestFileMeta writtenMeta = getManifestFile().write(Arrays.asList(entries)).get(0);
-        return new ManifestFileMeta(
-                writtenMeta.fileName(),
-                entries.length * 100, // for testing purpose
-                writtenMeta.numAddedFiles(),
-                writtenMeta.numDeletedFiles(),
-                writtenMeta.partitionStats(),
-                0);
+        return getManifestFile().write(Arrays.asList(entries)).get(0);
     }
 
     abstract ManifestFile getManifestFile();
@@ -102,16 +111,19 @@ public abstract class ManifestFileMetaTestBase {
             List<ManifestFileMeta> input, List<ManifestFileMeta> merged) {
         List<ManifestEntry> inputEntry =
                 input.stream()
-                        .flatMap(f -> getManifestFile().read(f.fileName()).stream())
+                        .flatMap(f -> getManifestFile().read(f.fileName(), f.fileSize()).stream())
                         .collect(Collectors.toList());
         List<String> entryBeforeMerge =
-                ManifestEntry.mergeEntries(inputEntry).stream()
+                FileEntry.mergeEntries(inputEntry).stream()
+                        .filter(entry -> entry.kind() == FileKind.ADD)
                         .map(entry -> entry.kind() + "-" + entry.file().fileName())
                         .collect(Collectors.toList());
 
         List<String> entryAfterMerge = new ArrayList<>();
         for (ManifestFileMeta manifestFileMeta : merged) {
-            List<ManifestEntry> entries = getManifestFile().read(manifestFileMeta.fileName());
+            List<ManifestEntry> entries =
+                    getManifestFile()
+                            .read(manifestFileMeta.fileName(), manifestFileMeta.fileSize());
             for (ManifestEntry entry : entries) {
                 entryAfterMerge.add(entry.kind() + "-" + entry.file().fileName());
             }
@@ -128,11 +140,19 @@ public abstract class ManifestFileMetaTestBase {
                         new SchemaManager(fileIO, path),
                         getPartitionType(),
                         avro,
+                        "zstd",
                         new FileStorePathFactory(
                                 path,
                                 getPartitionType(),
                                 "default",
-                                CoreOptions.FILE_FORMAT.defaultValue().toString()),
+                                CoreOptions.FILE_FORMAT.defaultValue(),
+                                CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                                CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                                CoreOptions.PARTITION_GENERATE_LEGCY_NAME.defaultValue(),
+                                CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                                CoreOptions.FILE_COMPRESSION.defaultValue(),
+                                null,
+                                null),
                         Long.MAX_VALUE,
                         null)
                 .create();
@@ -142,8 +162,24 @@ public abstract class ManifestFileMetaTestBase {
             List<ManifestFileMeta> mergedMainfest, List<String> expecteded) {
         List<String> actual =
                 mergedMainfest.stream()
-                        .flatMap(file -> getManifestFile().read(file.fileName()).stream())
+                        .flatMap(
+                                file ->
+                                        getManifestFile().read(file.fileName(), file.fileSize())
+                                                .stream())
                         .map(f -> f.kind() + "-" + f.file().fileName())
+                        .collect(Collectors.toList());
+        assertThat(actual).hasSameElementsAs(expecteded);
+    }
+
+    protected void containSameIdentifyEntryFile(
+            List<ManifestFileMeta> mergedManifest, List<FileEntry.Identifier> expecteded) {
+        List<FileEntry.Identifier> actual =
+                mergedManifest.stream()
+                        .flatMap(
+                                file ->
+                                        getManifestFile().read(file.fileName(), file.fileSize())
+                                                .stream())
+                        .map(ManifestEntry::identifier)
                         .collect(Collectors.toList());
         assertThat(actual).hasSameElementsAs(expecteded);
     }
@@ -156,13 +192,13 @@ public abstract class ManifestFileMetaTestBase {
         assertThat(actual.partitionStats()).isEqualTo(expected.partitionStats());
 
         // check content
-        assertThat(manifestFile.read(actual.fileName()))
-                .isEqualTo(manifestFile.read(expected.fileName()));
+        assertThat(manifestFile.read(actual.fileName(), actual.fileSize()))
+                .isEqualTo(manifestFile.read(expected.fileName(), expected.fileSize()));
     }
 
     protected List<ManifestFileMeta> createBaseManifestFileMetas(boolean hasPartition) {
         List<ManifestFileMeta> input = new ArrayList<>();
-        // base with 3 partition ,16 entry each parition
+        // base with 3 partition, 16 entry each partition
         for (int j = 0; j < 3; j++) {
             List<ManifestEntry> entrys = new ArrayList<>();
             for (int i = 0; i < 16; i++) {
@@ -220,5 +256,30 @@ public abstract class ManifestFileMetaTestBase {
                         makeEntry(false, "A2", partition2),
                         makeEntry(false, "B2", partition2),
                         makeEntry(true, "D2", partition2)));
+    }
+
+    public static ManifestEntry makeEntry(
+            FileKind fileKind, int partition, int bucket, long rowCount) {
+        return new ManifestEntry(
+                fileKind,
+                row(partition),
+                bucket,
+                0, // not used
+                new DataFileMeta(
+                        "", // not used
+                        0, // not used
+                        rowCount,
+                        null, // not used
+                        null, // not used
+                        StatsTestUtils.newEmptySimpleStats(), // not used
+                        StatsTestUtils.newEmptySimpleStats(), // not used
+                        0, // not used
+                        0, // not used
+                        0, // not used
+                        0, // not used
+                        0L,
+                        null,
+                        FileSource.APPEND,
+                        null));
     }
 }

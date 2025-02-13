@@ -25,7 +25,7 @@ import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.StreamTableCommit;
 import org.apache.paimon.table.sink.StreamTableWrite;
-import org.apache.paimon.table.source.InnerStreamTableScan;
+import org.apache.paimon.table.source.StreamDataTableScan;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.table.source.TableScan;
 
@@ -43,7 +43,7 @@ public class DefaultValueScannerTest extends ScannerTestBase {
         TableRead read = table.newRead();
         StreamTableWrite write = table.newWrite(commitUser);
         StreamTableCommit commit = table.newCommit(commitUser);
-        InnerStreamTableScan scan = table.newStreamScan();
+        StreamDataTableScan scan = table.newStreamScan();
 
         write.write(rowData(1, 10, 101L));
         commit.commit(0, write.prepareCommit(true, 0));
@@ -75,6 +75,8 @@ public class DefaultValueScannerTest extends ScannerTestBase {
             List<String> result = getResult(read, plan.splits());
             assertThat(result).hasSameElementsAs(Arrays.asList("+I 2|11|200", "+I 2|12|100"));
         }
+        write.close();
+        commit.close();
     }
 
     protected FileStoreTable createFileStoreTable() throws Exception {

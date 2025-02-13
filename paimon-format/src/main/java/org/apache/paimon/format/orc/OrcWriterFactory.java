@@ -18,21 +18,23 @@
 
 package org.apache.paimon.format.orc;
 
-import org.apache.paimon.CoreOptions;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.format.FormatWriterFactory;
 import org.apache.paimon.format.orc.writer.OrcBulkWriter;
-import org.apache.paimon.format.orc.writer.PhysicalWriterImpl;
 import org.apache.paimon.format.orc.writer.Vectorizer;
 import org.apache.paimon.fs.PositionOutputStream;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.Path;
+import org.apache.orc.CompressionKind;
 import org.apache.orc.OrcConf;
 import org.apache.orc.OrcFile;
+import org.apache.orc.impl.PhysicalFsWriter;
 import org.apache.orc.impl.WriterImpl;
+import org.apache.orc.impl.writer.WriterEncryptionVariant;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -54,7 +56,7 @@ public class OrcWriterFactory implements FormatWriterFactory {
     private final Map<String, String> confMap;
 
     private OrcFile.WriterOptions writerOptions;
-    private final CoreOptions coreOptions;
+    private final int writeBatchSize;
 
     /**
      * Creates a new OrcBulkWriterFactory using the provided Vectorizer implementation.
@@ -62,18 +64,9 @@ public class OrcWriterFactory implements FormatWriterFactory {
      * @param vectorizer The vectorizer implementation to convert input record to a
      *     VectorizerRowBatch.
      */
-    public OrcWriterFactory(Vectorizer<InternalRow> vectorizer) {
-        this(vectorizer, new Configuration());
-    }
-
-    /**
-     * Creates a new OrcBulkWriterFactory using the provided Vectorizer, Hadoop Configuration.
-     *
-     * @param vectorizer The vectorizer implementation to convert input record to a
-     *     VectorizerRowBatch.
-     */
-    public OrcWriterFactory(Vectorizer<InternalRow> vectorizer, Configuration configuration) {
-        this(vectorizer, new Properties(), configuration);
+    @VisibleForTesting
+    OrcWriterFactory(Vectorizer<InternalRow> vectorizer) {
+        this(vectorizer, new Properties(), new Configuration(false), 1024);
     }
 
     /**
@@ -87,7 +80,8 @@ public class OrcWriterFactory implements FormatWriterFactory {
     public OrcWriterFactory(
             Vectorizer<InternalRow> vectorizer,
             Properties writerProperties,
-            Configuration configuration) {
+            Configuration configuration,
+            int writeBatchSize) {
         this.vectorizer = checkNotNull(vectorizer);
         this.writerProperties = checkNotNull(writerProperties);
         this.confMap = new HashMap<>();
@@ -96,17 +90,26 @@ public class OrcWriterFactory implements FormatWriterFactory {
         for (Map.Entry<String, String> entry : configuration) {
             confMap.put(entry.getKey(), entry.getValue());
         }
-        coreOptions = new CoreOptions(this.confMap);
+        this.writeBatchSize = writeBatchSize;
     }
 
     @Override
     public FormatWriter create(PositionOutputStream out, String compression) throws IOException {
-        if (null != compression) {
-            writerProperties.setProperty(OrcConf.COMPRESS.getAttribute(), compression);
+        OrcFile.WriterOptions opts = getWriterOptions();
+        if (!writerProperties.containsKey(OrcConf.COMPRESS.getAttribute())) {
+            opts.compress(CompressionKind.valueOf(compression.toUpperCase()));
         }
 
-        OrcFile.WriterOptions opts = getWriterOptions();
-        opts.physicalWriter(new PhysicalWriterImpl(out, opts));
+        opts.physicalWriter(
+                new PhysicalFsWriter(
+                        new FSDataOutputStream(out, null) {
+                            @Override
+                            public void close() throws IOException {
+                                // do nothing
+                            }
+                        },
+                        opts,
+                        new WriterEncryptionVariant[0]));
 
         // The path of the Writer is not used to indicate the destination file
         // in this case since we have used a dedicated physical writer to write
@@ -114,10 +117,7 @@ public class OrcWriterFactory implements FormatWriterFactory {
         // the key of writer in the ORC memory manager, thus we need to make it unique.
         Path unusedPath = new Path(UUID.randomUUID().toString());
         return new OrcBulkWriter(
-                vectorizer,
-                new WriterImpl(null, unusedPath, opts),
-                out,
-                coreOptions.orcWriteBatch());
+                vectorizer, new WriterImpl(null, unusedPath, opts), out, writeBatchSize);
     }
 
     @VisibleForTesting

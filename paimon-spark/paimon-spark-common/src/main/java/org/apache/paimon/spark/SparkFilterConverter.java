@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,6 +24,7 @@ import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowType;
 
 import org.apache.spark.sql.sources.And;
+import org.apache.spark.sql.sources.EqualNullSafe;
 import org.apache.spark.sql.sources.EqualTo;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.sources.GreaterThan;
@@ -35,20 +36,26 @@ import org.apache.spark.sql.sources.LessThan;
 import org.apache.spark.sql.sources.LessThanOrEqual;
 import org.apache.spark.sql.sources.Not;
 import org.apache.spark.sql.sources.Or;
+import org.apache.spark.sql.sources.StringContains;
+import org.apache.spark.sql.sources.StringEndsWith;
 import org.apache.spark.sql.sources.StringStartsWith;
+
+import javax.annotation.Nullable;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.predicate.PredicateBuilder.convertJavaObject;
 
-/** Conversion from {@link Filter} to {@link Predicate}. */
+/** Conversion from {@link Filter} to {@link Predicate}, remove it when Spark 3.2 is dropped. */
 public class SparkFilterConverter {
 
     public static final List<String> SUPPORT_FILTERS =
             Arrays.asList(
                     "EqualTo",
+                    "EqualNullSafe",
                     "GreaterThan",
                     "GreaterThanOrEqual",
                     "LessThan",
@@ -59,7 +66,9 @@ public class SparkFilterConverter {
                     "And",
                     "Or",
                     "Not",
-                    "StringStartsWith");
+                    "StringStartsWith",
+                    "StringEndsWith",
+                    "StringContains");
 
     private final RowType rowType;
     private final PredicateBuilder builder;
@@ -69,6 +78,24 @@ public class SparkFilterConverter {
         this.builder = new PredicateBuilder(rowType);
     }
 
+    @Nullable
+    public Predicate convertIgnoreFailure(Filter filter) {
+        return convert(filter, true);
+    }
+
+    @Nullable
+    public Predicate convert(Filter filter, boolean ignoreFailure) {
+        try {
+            return convert(filter);
+        } catch (Exception e) {
+            if (ignoreFailure) {
+                return null;
+            } else {
+                throw e;
+            }
+        }
+    }
+
     public Predicate convert(Filter filter) {
         if (filter instanceof EqualTo) {
             EqualTo eq = (EqualTo) filter;
@@ -76,6 +103,15 @@ public class SparkFilterConverter {
             int index = fieldIndex(eq.attribute());
             Object literal = convertLiteral(index, eq.value());
             return builder.equal(index, literal);
+        } else if (filter instanceof EqualNullSafe) {
+            EqualNullSafe eq = (EqualNullSafe) filter;
+            int index = fieldIndex(eq.attribute());
+            if (eq.value() == null) {
+                return builder.isNull(index);
+            } else {
+                Object literal = convertLiteral(index, eq.value());
+                return builder.equal(index, literal);
+            }
         } else if (filter instanceof GreaterThan) {
             GreaterThan gt = (GreaterThan) filter;
             int index = fieldIndex(gt.attribute());
@@ -116,23 +152,39 @@ public class SparkFilterConverter {
             return PredicateBuilder.or(convert(or.left()), convert(or.right()));
         } else if (filter instanceof Not) {
             Not not = (Not) filter;
-            return convert(not.child()).negate().orElseThrow(UnsupportedOperationException::new);
+            Optional<Predicate> negate = convert(not.child()).negate();
+            if (negate.isPresent()) {
+                return negate.get();
+            }
         } else if (filter instanceof StringStartsWith) {
             StringStartsWith startsWith = (StringStartsWith) filter;
             int index = fieldIndex(startsWith.attribute());
             Object literal = convertLiteral(index, startsWith.value());
             return builder.startsWith(index, literal);
+        } else if (filter instanceof StringEndsWith) {
+            StringEndsWith endsWith = (StringEndsWith) filter;
+            int index = fieldIndex(endsWith.attribute());
+            Object literal = convertLiteral(index, endsWith.value());
+            return builder.endsWith(index, literal);
+        } else if (filter instanceof StringContains) {
+            StringContains contains = (StringContains) filter;
+            int index = fieldIndex(contains.attribute());
+            Object literal = convertLiteral(index, contains.value());
+            return builder.contains(index, literal);
         }
 
-        // TODO: In, NotIn, AlwaysTrue, AlwaysFalse, EqualNullSafe
+        // TODO: AlwaysTrue, AlwaysFalse
         throw new UnsupportedOperationException(
                 filter + " is unsupported. Support Filters: " + SUPPORT_FILTERS);
     }
 
     public Object convertLiteral(String field, Object value) {
-        int index = fieldIndex(field);
-        DataType type = rowType.getTypeAt(index);
-        return convertJavaObject(type, value);
+        return convertLiteral(fieldIndex(field), value);
+    }
+
+    public String convertString(String field, Object value) {
+        Object literal = convertLiteral(field, value);
+        return literal == null ? null : literal.toString();
     }
 
     private int fieldIndex(String field) {

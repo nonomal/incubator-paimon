@@ -18,10 +18,13 @@
 
 package org.apache.paimon.table.sink;
 
+import org.apache.paimon.options.Options;
 import org.apache.paimon.table.InnerTable;
 import org.apache.paimon.types.RowType;
 
-import java.util.UUID;
+import java.util.Optional;
+
+import static org.apache.paimon.CoreOptions.createCommitUser;
 
 /** Implementation for {@link WriteBuilder}. */
 public class StreamWriteBuilderImpl implements StreamWriteBuilder {
@@ -30,10 +33,11 @@ public class StreamWriteBuilderImpl implements StreamWriteBuilder {
 
     private final InnerTable table;
 
-    private String commitUser = UUID.randomUUID().toString();
+    private String commitUser;
 
     public StreamWriteBuilderImpl(InnerTable table) {
         this.table = table;
+        this.commitUser = createCommitUser(new Options(table.options()));
     }
 
     @Override
@@ -44,6 +48,11 @@ public class StreamWriteBuilderImpl implements StreamWriteBuilder {
     @Override
     public RowType rowType() {
         return table.rowType();
+    }
+
+    @Override
+    public Optional<WriteSelector> newWriteSelector() {
+        return table.newWriteSelector();
     }
 
     @Override

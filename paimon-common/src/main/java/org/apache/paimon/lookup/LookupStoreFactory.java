@@ -18,8 +18,21 @@
 
 package org.apache.paimon.lookup;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.compression.CompressOptions;
+import org.apache.paimon.io.cache.CacheManager;
+import org.apache.paimon.lookup.hash.HashLookupStoreFactory;
+import org.apache.paimon.lookup.sort.SortLookupStoreFactory;
+import org.apache.paimon.memory.MemorySlice;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.utils.BloomFilter;
+
+import javax.annotation.Nullable;
+
 import java.io.File;
 import java.io.IOException;
+import java.util.Comparator;
+import java.util.function.Function;
 
 /**
  * A key-value store for lookup, key-value store should be single binary file written once and ready
@@ -32,7 +45,45 @@ import java.io.IOException;
  */
 public interface LookupStoreFactory {
 
-    LookupStoreWriter createWriter(File file) throws IOException;
+    LookupStoreWriter createWriter(File file, @Nullable BloomFilter.Builder bloomFilter)
+            throws IOException;
 
-    LookupStoreReader createReader(File file) throws IOException;
+    LookupStoreReader createReader(File file, Context context) throws IOException;
+
+    static Function<Long, BloomFilter.Builder> bfGenerator(Options options) {
+        Function<Long, BloomFilter.Builder> bfGenerator = rowCount -> null;
+        if (options.get(CoreOptions.LOOKUP_CACHE_BLOOM_FILTER_ENABLED)) {
+            double bfFpp = options.get(CoreOptions.LOOKUP_CACHE_BLOOM_FILTER_FPP);
+            bfGenerator =
+                    rowCount -> {
+                        if (rowCount > 0) {
+                            return BloomFilter.builder(rowCount, bfFpp);
+                        }
+                        return null;
+                    };
+        }
+        return bfGenerator;
+    }
+
+    static LookupStoreFactory create(
+            CoreOptions options, CacheManager cacheManager, Comparator<MemorySlice> keyComparator) {
+        CompressOptions compression = options.lookupCompressOptions();
+        switch (options.lookupLocalFileType()) {
+            case SORT:
+                return new SortLookupStoreFactory(
+                        keyComparator, cacheManager, options.cachePageSize(), compression);
+            case HASH:
+                return new HashLookupStoreFactory(
+                        cacheManager,
+                        options.cachePageSize(),
+                        options.toConfiguration().get(CoreOptions.LOOKUP_HASH_LOAD_FACTOR),
+                        compression);
+            default:
+                throw new IllegalArgumentException(
+                        "Unsupported lookup local file type: " + options.lookupLocalFileType());
+        }
+    }
+
+    /** Context between writer and reader. */
+    interface Context {}
 }

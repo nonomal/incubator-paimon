@@ -19,9 +19,13 @@
 package org.apache.paimon.compact;
 
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.operation.metrics.CompactionMetrics;
+import org.apache.paimon.operation.metrics.MetricUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -31,16 +35,65 @@ public abstract class CompactTask implements Callable<CompactResult> {
 
     private static final Logger LOG = LoggerFactory.getLogger(CompactTask.class);
 
+    @Nullable private final CompactionMetrics.Reporter metricsReporter;
+
+    public CompactTask(@Nullable CompactionMetrics.Reporter metricsReporter) {
+        this.metricsReporter = metricsReporter;
+    }
+
     @Override
     public CompactResult call() throws Exception {
-        long startMillis = System.currentTimeMillis();
-        CompactResult result = doCompact();
+        MetricUtils.safeCall(this::startTimer, LOG);
+        try {
+            long startMillis = System.currentTimeMillis();
+            CompactResult result = doCompact();
 
-        if (LOG.isDebugEnabled()) {
-            logMetric(startMillis, result.before(), result.after());
+            MetricUtils.safeCall(
+                    () -> {
+                        if (metricsReporter != null) {
+                            metricsReporter.reportCompactionTime(
+                                    System.currentTimeMillis() - startMillis);
+                            metricsReporter.increaseCompactionsCompletedCount();
+                            metricsReporter.reportCompactionInputSize(
+                                    result.before().stream()
+                                            .map(DataFileMeta::fileSize)
+                                            .reduce(Long::sum)
+                                            .orElse(0L));
+                            metricsReporter.reportCompactionOutputSize(
+                                    result.after().stream()
+                                            .map(DataFileMeta::fileSize)
+                                            .reduce(Long::sum)
+                                            .orElse(0L));
+                        }
+                    },
+                    LOG);
+
+            if (LOG.isDebugEnabled()) {
+                logMetric(startMillis, result.before(), result.after());
+            }
+            return result;
+        } finally {
+            MetricUtils.safeCall(this::stopTimer, LOG);
+            MetricUtils.safeCall(this::decreaseCompactionsQueuedCount, LOG);
         }
+    }
 
-        return result;
+    private void decreaseCompactionsQueuedCount() {
+        if (metricsReporter != null) {
+            metricsReporter.decreaseCompactionsQueuedCount();
+        }
+    }
+
+    private void startTimer() {
+        if (metricsReporter != null) {
+            metricsReporter.getCompactTimer().start();
+        }
+    }
+
+    private void stopTimer() {
+        if (metricsReporter != null) {
+            metricsReporter.getCompactTimer().finish();
+        }
     }
 
     protected String logMetric(

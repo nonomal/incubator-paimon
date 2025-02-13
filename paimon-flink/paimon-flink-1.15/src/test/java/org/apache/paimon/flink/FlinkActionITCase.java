@@ -22,7 +22,7 @@ import org.apache.paimon.flink.action.DeleteAction;
 import org.apache.paimon.utils.BlockingIterator;
 
 import org.apache.flink.types.Row;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.List;
@@ -39,7 +39,7 @@ public class FlinkActionITCase extends CatalogITCaseBase {
 
     protected List<String> ddl() {
         return Collections.singletonList(
-                "CREATE TABLE T (k INT, v STRING) WITH ('write-mode'='change-log')");
+                "CREATE TABLE T (k INT, v STRING, PRIMARY KEY (k) NOT ENFORCED)");
     }
 
     @Test
@@ -47,7 +47,8 @@ public class FlinkActionITCase extends CatalogITCaseBase {
         batchSql("INSERT INTO T VALUES (1, 'Hi'), (2, 'Hello'), (3, 'World')");
 
         DeleteAction action =
-                new DeleteAction(path, "default", "T", "k = 1", Collections.emptyMap());
+                new DeleteAction(
+                        "default", "T", "k = 1", Collections.singletonMap("warehouse", path));
 
         BlockingIterator<Row, Row> iterator =
                 BlockingIterator.of(sEnv.executeSql("SELECT * FROM T").collect());

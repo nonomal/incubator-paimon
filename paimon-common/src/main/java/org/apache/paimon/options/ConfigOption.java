@@ -16,10 +16,6 @@
  * limitations under the License.
  */
 
-/* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
- * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
- * additional information regarding copyright ownership. */
-
 package org.apache.paimon.options;
 
 import org.apache.paimon.annotation.Public;
@@ -31,6 +27,10 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.apache.paimon.utils.Preconditions.checkNotNull;
+
+/* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
+ * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
 
 /**
  * A {@code ConfigOption} describes a configuration parameter. It encapsulates the configuration
@@ -70,21 +70,14 @@ public class ConfigOption<T> {
      * <ul>
      *   <li>typeClass == atomic class (e.g. {@code Integer.class}) -> {@code ConfigOption<Integer>}
      *   <li>typeClass == {@code Map.class} -> {@code ConfigOption<Map<String, String>>}
-     *   <li>typeClass == atomic class and isList == true for {@code ConfigOption<List<Integer>>}
      * </ul>
      */
     private final Class<?> clazz;
-
-    private final boolean isList;
 
     // ------------------------------------------------------------------------
 
     Class<?> getClazz() {
         return clazz;
-    }
-
-    boolean isList() {
-        return isList;
     }
 
     /**
@@ -94,8 +87,6 @@ public class ConfigOption<T> {
      * @param clazz describes type of the ConfigOption, see description of the clazz field
      * @param description Description for that option
      * @param defaultValue The default value for this option
-     * @param isList tells if the ConfigOption describes a list option, see description of the clazz
-     *     field
      * @param fallbackKeys The list of fallback keys, in the order to be checked
      */
     ConfigOption(
@@ -103,14 +94,12 @@ public class ConfigOption<T> {
             Class<?> clazz,
             Description description,
             T defaultValue,
-            boolean isList,
             FallbackKey... fallbackKeys) {
         this.key = checkNotNull(key);
         this.description = description;
         this.defaultValue = defaultValue;
         this.fallbackKeys = fallbackKeys == null || fallbackKeys.length == 0 ? EMPTY : fallbackKeys;
         this.clazz = checkNotNull(clazz);
-        this.isList = isList;
     }
 
     // ------------------------------------------------------------------------
@@ -134,32 +123,7 @@ public class ConfigOption<T> {
         // put fallback keys first so that they are prioritized
         final FallbackKey[] mergedAlternativeKeys =
                 Stream.concat(newFallbackKeys, currentAlternativeKeys).toArray(FallbackKey[]::new);
-        return new ConfigOption<>(
-                key, clazz, description, defaultValue, isList, mergedAlternativeKeys);
-    }
-
-    /**
-     * Creates a new config option, using this option's key and default value, and adding the given
-     * deprecated keys.
-     *
-     * <p>When obtaining a value from the configuration via {@link Options#get(ConfigOption)}, the
-     * deprecated keys will be checked in the order provided to this method. The first key for which
-     * a value is found will be used - that value will be returned.
-     *
-     * @param deprecatedKeys The deprecated keys, in the order in which they should be checked.
-     * @return A new config options, with the given deprecated keys.
-     */
-    public ConfigOption<T> withDeprecatedKeys(String... deprecatedKeys) {
-        final Stream<FallbackKey> newDeprecatedKeys =
-                Arrays.stream(deprecatedKeys).map(FallbackKey::createDeprecatedKey);
-        final Stream<FallbackKey> currentAlternativeKeys = Arrays.stream(this.fallbackKeys);
-
-        // put deprecated keys last so that they are de-prioritized
-        final FallbackKey[] mergedAlternativeKeys =
-                Stream.concat(currentAlternativeKeys, newDeprecatedKeys)
-                        .toArray(FallbackKey[]::new);
-        return new ConfigOption<>(
-                key, clazz, description, defaultValue, isList, mergedAlternativeKeys);
+        return new ConfigOption<>(key, clazz, description, defaultValue, mergedAlternativeKeys);
     }
 
     /**
@@ -181,7 +145,7 @@ public class ConfigOption<T> {
      * @return A new config option, with given description.
      */
     public ConfigOption<T> withDescription(final Description description) {
-        return new ConfigOption<>(key, clazz, description, defaultValue, isList, fallbackKeys);
+        return new ConfigOption<>(key, clazz, description, defaultValue, fallbackKeys);
     }
 
     // ------------------------------------------------------------------------

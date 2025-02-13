@@ -21,124 +21,121 @@ package org.apache.paimon.io.cache;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.memory.MemorySegment;
 import org.apache.paimon.options.MemorySize;
+import org.apache.paimon.utils.Preconditions;
 
-import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Cache;
-import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Caffeine;
-import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.RemovalCause;
-import org.apache.paimon.shade.guava30.com.google.common.util.concurrent.MoreExecutors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.util.Objects;
-import java.util.function.Consumer;
+
+import static org.apache.paimon.utils.Preconditions.checkNotNull;
 
 /** Cache manager to cache bytes to paged {@link MemorySegment}s. */
 public class CacheManager {
 
-    private final int pageSize;
-    private final Cache<CacheKey, CacheValue> cache;
+    private static final Logger LOG = LoggerFactory.getLogger(CacheManager.class);
 
-    public CacheManager(int pageSize, MemorySize maxMemorySize) {
-        this.pageSize = pageSize;
-        this.cache =
-                Caffeine.newBuilder()
-                        .weigher(this::weigh)
-                        .maximumWeight(maxMemorySize.getBytes())
-                        .removalListener(this::onRemoval)
-                        .executor(MoreExecutors.directExecutor())
-                        .build();
+    /**
+     * Refreshing the cache comes with some costs, so not every time we visit the CacheManager, but
+     * every 10 visits, refresh the LRU strategy.
+     */
+    public static final int REFRESH_COUNT = 10;
+
+    private final Cache dataCache;
+    private final Cache indexCache;
+
+    private int fileReadCount;
+
+    @VisibleForTesting
+    public CacheManager(MemorySize maxMemorySize) {
+        this(Cache.CacheType.GUAVA, maxMemorySize, 0);
+    }
+
+    public CacheManager(MemorySize dataMaxMemorySize, double highPriorityPoolRatio) {
+        this(Cache.CacheType.GUAVA, dataMaxMemorySize, highPriorityPoolRatio);
+    }
+
+    public CacheManager(
+            Cache.CacheType cacheType, MemorySize maxMemorySize, double highPriorityPoolRatio) {
+        Preconditions.checkArgument(
+                highPriorityPoolRatio >= 0 && highPriorityPoolRatio < 1,
+                "The high priority pool ratio should in the range [0, 1).");
+        MemorySize indexCacheSize =
+                MemorySize.ofBytes((long) (maxMemorySize.getBytes() * highPriorityPoolRatio));
+        MemorySize dataCacheSize =
+                MemorySize.ofBytes((long) (maxMemorySize.getBytes() * (1 - highPriorityPoolRatio)));
+        this.dataCache = CacheBuilder.newBuilder(cacheType).maximumWeight(dataCacheSize).build();
+        if (highPriorityPoolRatio == 0) {
+            this.indexCache = dataCache;
+        } else {
+            this.indexCache =
+                    CacheBuilder.newBuilder(cacheType).maximumWeight(indexCacheSize).build();
+        }
+        this.fileReadCount = 0;
+        LOG.info(
+                "Initialize cache manager with data cache of {} and index cache of {}.",
+                dataCacheSize,
+                indexCacheSize);
     }
 
     @VisibleForTesting
-    Cache<CacheKey, CacheValue> cache() {
-        return cache;
+    public Cache dataCache() {
+        return dataCache;
     }
 
-    public int pageSize() {
-        return pageSize;
+    @VisibleForTesting
+    public Cache indexCache() {
+        return indexCache;
     }
 
-    public MemorySegment getPage(
-            RandomAccessFile file, int pageNumber, Consumer<Integer> cleanCallback) {
-        CacheKey key = new CacheKey(file, pageNumber);
-        CacheValue value = cache.getIfPresent(key);
-        while (value == null || value.isClosed) {
-            try {
-                value = createValue(key, cleanCallback);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            cache.put(key, value);
-        }
-        return value.segment;
+    public MemorySegment getPage(CacheKey key, CacheReader reader, CacheCallback callback) {
+        Cache cache = key.isIndex() ? indexCache : dataCache;
+        Cache.CacheValue value =
+                cache.get(
+                        key,
+                        k -> {
+                            this.fileReadCount++;
+                            try {
+                                return new Cache.CacheValue(
+                                        MemorySegment.wrap(reader.read(key)), callback);
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
+                        });
+        return checkNotNull(value, String.format("Cache result for key(%s) is null", key)).segment;
     }
 
-    public void invalidPage(RandomAccessFile file, int pageNumber) {
-        cache.invalidate(new CacheKey(file, pageNumber));
-    }
-
-    private int weigh(CacheKey cacheKey, CacheValue cacheValue) {
-        return cacheValue.segment.size();
-    }
-
-    private void onRemoval(CacheKey key, CacheValue value, RemovalCause cause) {
-        value.isClosed = true;
-        value.cleanCallback.accept(key.pageNumber);
-    }
-
-    private CacheValue createValue(CacheKey key, Consumer<Integer> cleanCallback)
-            throws IOException {
-        return new CacheValue(key.read(pageSize), cleanCallback);
-    }
-
-    private static class CacheKey {
-
-        private final RandomAccessFile file;
-        private final int pageNumber;
-
-        private CacheKey(RandomAccessFile file, int pageNumber) {
-            this.file = file;
-            this.pageNumber = pageNumber;
-        }
-
-        private MemorySegment read(int pageSize) throws IOException {
-            long length = file.length();
-            long pageAddress = (long) pageNumber * pageSize;
-            int len = (int) Math.min(pageSize, length - pageAddress);
-            byte[] bytes = new byte[len];
-            file.seek(pageAddress);
-            file.readFully(bytes);
-            return MemorySegment.wrap(bytes);
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (o == null || getClass() != o.getClass()) {
-                return false;
-            }
-            CacheKey cacheKey = (CacheKey) o;
-            return pageNumber == cacheKey.pageNumber && Objects.equals(file, cacheKey.file);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(file, pageNumber);
+    public void invalidPage(CacheKey key) {
+        if (key.isIndex()) {
+            indexCache.invalidate(key);
+        } else {
+            dataCache.invalidate(key);
         }
     }
 
-    private static class CacheValue {
+    public int fileReadCount() {
+        return fileReadCount;
+    }
+
+    /** The container for the segment. */
+    public static class SegmentContainer {
 
         private final MemorySegment segment;
-        private final Consumer<Integer> cleanCallback;
 
-        private boolean isClosed = false;
+        private int accessCount;
 
-        private CacheValue(MemorySegment segment, Consumer<Integer> cleanCallback) {
+        public SegmentContainer(MemorySegment segment) {
             this.segment = segment;
-            this.cleanCallback = cleanCallback;
+            this.accessCount = 0;
+        }
+
+        public MemorySegment access() {
+            this.accessCount++;
+            return segment;
+        }
+
+        public int getAccessCount() {
+            return accessCount;
         }
     }
 }

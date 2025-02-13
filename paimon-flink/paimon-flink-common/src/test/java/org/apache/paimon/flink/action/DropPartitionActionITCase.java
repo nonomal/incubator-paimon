@@ -56,17 +56,24 @@ public class DropPartitionActionITCase extends ActionITCaseBase {
         FileStoreTable table = prepareTable(hasPk);
 
         if (ThreadLocalRandom.current().nextBoolean()) {
-            new DropPartitionAction(
+
+            createAction(
+                            DropPartitionAction.class,
+                            "drop_partition",
+                            "--warehouse",
                             warehouse,
+                            "--database",
                             database,
+                            "--table",
                             tableName,
-                            Collections.singletonList(Collections.singletonMap("partKey0", "0")),
-                            Collections.emptyMap())
+                            "--partition",
+                            "partKey0=0")
                     .run();
         } else {
-            callProcedure(
+            executeSQL(
                     String.format(
-                            "CALL drop_partition('%s.%s', 'partKey0 = 0')", database, tableName));
+                            "CALL sys.drop_partition('%s.%s', 'partKey0 = 0')",
+                            database, tableName));
         }
 
         SnapshotManager snapshotManager = getFileStoreTable(tableName).snapshotManager();
@@ -114,17 +121,24 @@ public class DropPartitionActionITCase extends ActionITCaseBase {
         partitions1.put("partKey1", "0");
 
         if (ThreadLocalRandom.current().nextBoolean()) {
-            new DropPartitionAction(
+            createAction(
+                            DropPartitionAction.class,
+                            "drop_partition",
+                            "--warehouse",
                             warehouse,
+                            "--database",
                             database,
+                            "--table",
                             tableName,
-                            Arrays.asList(partitions0, partitions1),
-                            Collections.emptyMap())
+                            "--partition",
+                            "partKey0=0,partKey1=1",
+                            "--partition",
+                            "partKey0=1,partKey1=0")
                     .run();
         } else {
-            callProcedure(
+            executeSQL(
                     String.format(
-                            "CALL drop_partition('%s.%s', 'partKey0=0,partKey1=1', 'partKey0=1,partKey1=0')",
+                            "CALL sys.drop_partition('%s.%s', 'partKey0=0,partKey1=1', 'partKey0=1,partKey1=0')",
                             database, tableName));
         }
 
@@ -169,6 +183,7 @@ public class DropPartitionActionITCase extends ActionITCaseBase {
                         hasPk
                                 ? Arrays.asList("partKey0", "partKey1", "dt")
                                 : Collections.emptyList(),
+                        hasPk ? Collections.emptyList() : Collections.singletonList("dt"),
                         new HashMap<>());
         SnapshotManager snapshotManager = table.snapshotManager();
         StreamWriteBuilder streamWriteBuilder =

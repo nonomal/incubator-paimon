@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -34,40 +34,26 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.apache.paimon.format.parquet.ParquetFileFormat.getParquetConfiguration;
-import static org.apache.paimon.format.parquet.ParquetFileFormatFactory.IDENTIFIER;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link ParquetFileFormatFactory}. */
 public class ParquetFileFormatTest {
-    private static final ConfigOption<String> KEY1 =
-            ConfigOptions.key("k1").stringType().defaultValue("absent");
 
     @Test
-    public void testAbsent() {
+    public void testConfiguration() {
+        ConfigOption<String> parquetKey =
+                ConfigOptions.key("parquet.mykey").stringType().noDefaultValue();
+        ConfigOption<String> otherKey = ConfigOptions.key("other").stringType().noDefaultValue();
+
         Options options = new Options();
-        ParquetFileFormat parquet =
-                new ParquetFileFormatFactory().create(new FormatContext(options, 1024));
-        assertThat(parquet.formatOptions().getString(KEY1)).isEqualTo("absent");
-    }
+        options.set(parquetKey, "hello");
+        options.set(otherKey, "test");
+        FormatContext context = new FormatContext(options, 1024, 1024, 2, null);
 
-    @Test
-    public void testPresent() {
-        Options options = new Options();
-        options.setString(KEY1.key(), "v1");
-        ParquetFileFormat parquet =
-                new ParquetFileFormatFactory().create(new FormatContext(options, 1024));
-        assertThat(parquet.formatOptions().getString(KEY1)).isEqualTo("v1");
-    }
-
-    @Test
-    public void testDefaultCompressionCodecName() {
-        // no parquet.compression and no file.compression
-        Options conf = new Options();
-        RowDataParquetBuilder builder =
-                new RowDataParquetBuilder(
-                        new RowType(new ArrayList<>()), getParquetConfiguration(conf));
-        assertThat(builder.getCompression(null)).isEqualTo(CompressionCodec.SNAPPY.name());
+        Options actual = new ParquetFileFormat(context).getOptions();
+        assertThat(actual.get(parquetKey)).isEqualTo("hello");
+        assertThat(actual.contains(otherKey)).isFalse();
+        assertThat(actual.get("parquet.compression.codec.zstd.level")).isEqualTo("2");
     }
 
     @Test
@@ -78,15 +64,15 @@ public class ParquetFileFormatTest {
         RowDataParquetBuilder builder =
                 new RowDataParquetBuilder(
                         new RowType(new ArrayList<>()),
-                        getParquetConfiguration(conf.removePrefix(IDENTIFIER + ".")));
+                        new ParquetFileFormat(new FormatContext(conf, 1024, 1024)).getOptions());
         assertThat(builder.getCompression(null)).isEqualTo(lz4);
-        assertThat(builder.getCompression("SNAPPY")).isEqualTo(CompressionCodec.SNAPPY.name());
+        assertThat(builder.getCompression("SNAPPY")).isEqualTo(lz4);
     }
 
     @Test
     public void testSupportedDataFields() {
         ParquetFileFormat parquet =
-                new ParquetFileFormatFactory().create(new FormatContext(new Options(), 1024));
+                new ParquetFileFormatFactory().create(new FormatContext(new Options(), 1024, 1024));
 
         int index = 0;
         List<DataField> dataFields = new ArrayList<DataField>();

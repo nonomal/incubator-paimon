@@ -18,48 +18,34 @@
 
 package org.apache.paimon.mergetree.compact.aggregate;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryString;
-import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.utils.StringUtils;
 
 /** listagg aggregate a field of a row. */
 public class FieldListaggAgg extends FieldAggregator {
 
-    public static final String NAME = "listagg";
+    private static final long serialVersionUID = 1L;
 
-    // TODO: make it configurable by with clause
-    public static final String DELIMITER = ",";
+    private final String delimiter;
 
-    public FieldListaggAgg(DataType dataType) {
-        super(dataType);
+    public FieldListaggAgg(String name, VarCharType dataType, CoreOptions options, String field) {
+        super(name, dataType);
+        this.delimiter = options.fieldListAggDelimiter(field);
     }
 
     @Override
-    String name() {
-        return NAME;
-    }
-
-    @Override
-    Object agg(Object accumulator, Object inputField) {
-        Object concatenate;
-
-        if (inputField == null || accumulator == null) {
-            concatenate = (inputField == null) ? accumulator : inputField;
-        } else {
-            // ordered by type root definition
-            switch (fieldType.getTypeRoot()) {
-                case VARCHAR:
-                    // TODO: ensure not VARCHAR(n)
-                    BinaryString mergeFieldSD = (BinaryString) accumulator;
-                    BinaryString inFieldSD = (BinaryString) inputField;
-                    concatenate =
-                            StringUtils.concat(
-                                    mergeFieldSD, BinaryString.fromString(DELIMITER), inFieldSD);
-                    break;
-                default:
-                    throw new IllegalArgumentException();
-            }
+    public Object agg(Object accumulator, Object inputField) {
+        if (accumulator == null || inputField == null) {
+            return accumulator == null ? inputField : accumulator;
         }
-        return concatenate;
+        // ordered by type root definition
+
+        // TODO: ensure not VARCHAR(n)
+        BinaryString mergeFieldSD = (BinaryString) accumulator;
+        BinaryString inFieldSD = (BinaryString) inputField;
+
+        return StringUtils.concat(mergeFieldSD, BinaryString.fromString(delimiter), inFieldSD);
     }
 }
