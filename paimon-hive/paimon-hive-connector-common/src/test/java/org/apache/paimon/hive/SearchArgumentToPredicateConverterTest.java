@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -75,6 +75,12 @@ public class SearchArgumentToPredicateConverterTest {
                 java.sql.Timestamp.valueOf("2022-05-17 16:25:53"),
                 DataTypes.TIMESTAMP(3),
                 Timestamp.fromSQLTimestamp(java.sql.Timestamp.valueOf("2022-05-17 16:25:53")));
+        testLiteral(
+                PredicateLeaf.Type.TIMESTAMP,
+                java.sql.Timestamp.valueOf("2022-05-17 16:25:53"),
+                DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(3),
+                Timestamp.fromInstant(
+                        java.sql.Timestamp.valueOf("2022-05-17 16:25:53").toInstant()));
     }
 
     private void testLiteral(

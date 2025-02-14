@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +19,6 @@
 package org.apache.paimon.hive;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Decimal;
@@ -29,7 +28,6 @@ import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.hive.mapred.PaimonOutputFormat;
 import org.apache.paimon.hive.objectinspector.PaimonObjectInspectorFactory;
-import org.apache.paimon.hive.runner.PaimonEmbeddedHiveRunner;
 import org.apache.paimon.options.CatalogOptions;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.Table;
@@ -45,20 +43,14 @@ import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.StringUtils;
 
-import com.klarna.hiverunner.HiveShell;
-import com.klarna.hiverunner.annotations.HiveSQL;
 import org.apache.hadoop.hive.common.type.HiveDecimal;
 import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.AbstractPrimitiveJavaObjectInspector;
-import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
-import org.junit.ClassRule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
-import org.junit.runner.RunWith;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -75,17 +67,10 @@ import static org.apache.paimon.hive.RandomGenericRowDataGenerator.randomBigDeci
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** IT cases for {@link PaimonStorageHandler} and {@link PaimonOutputFormat}. */
-@RunWith(PaimonEmbeddedHiveRunner.class)
-public class HiveWriteITCase {
-
-    @ClassRule public static TemporaryFolder folder = new TemporaryFolder();
-
-    @HiveSQL(files = {})
-    private static HiveShell hiveShell;
+public class HiveWriteITCase extends HiveTestBase {
 
     private static String engine;
 
-    private String commitUser;
     private long commitIdentifier;
 
     @BeforeClass
@@ -96,18 +81,8 @@ public class HiveWriteITCase {
 
     @Before
     public void before() {
-        hiveShell.execute("SET hive.execution.engine=mr");
-
-        hiveShell.execute("CREATE DATABASE IF NOT EXISTS test_db");
-        hiveShell.execute("USE test_db");
-
-        commitUser = UUID.randomUUID().toString();
+        hiveShell.execute("SET hive.execution.engine=" + engine);
         commitIdentifier = 0;
-    }
-
-    @After
-    public void after() {
-        hiveShell.execute("DROP DATABASE IF EXISTS test_db CASCADE");
     }
 
     private String createChangelogExternalTable(
@@ -130,11 +105,11 @@ public class HiveWriteITCase {
         String path = folder.newFolder().toURI().toString();
         String tableNameNotNull =
                 StringUtils.isNullOrWhitespaceOnly(tableName) ? TABLE_NAME : tableName;
-        String tablePath = String.format("%s/default.db/%s", path, tableNameNotNull);
+        String tablePath = String.format("%s/test_db.db/%s", path, tableNameNotNull);
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, path);
         conf.set(CoreOptions.BUCKET, 2);
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
+        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_AVRO);
         Identifier identifier = Identifier.create(DATABASE_NAME, tableNameNotNull);
         Table table =
                 FileStoreTestUtils.createFileStoreTable(
@@ -154,12 +129,10 @@ public class HiveWriteITCase {
         String path = folder.newFolder().toURI().toString();
         String tableNameNotNull =
                 StringUtils.isNullOrWhitespaceOnly(tableName) ? TABLE_NAME : tableName;
-        String tablePath = String.format("%s/default.db/%s", path, tableNameNotNull);
+        String tablePath = String.format("%s/test_db.db/%s", path, tableNameNotNull);
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, path);
-        conf.set(CoreOptions.BUCKET, 2);
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.APPEND_ONLY);
+        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_AVRO);
         Identifier identifier = Identifier.create(DATABASE_NAME, tableNameNotNull);
         Table table =
                 FileStoreTestUtils.createFileStoreTable(
@@ -182,8 +155,9 @@ public class HiveWriteITCase {
         commit.commit(commitIdentifier, write.prepareCommit(true, commitIdentifier));
         commitIdentifier++;
         write.close();
+        commit.close();
 
-        String tableName = "test_table_" + (UUID.randomUUID().toString().substring(0, 4));
+        String tableName = "test_table_" + UUID.randomUUID().toString().replace('-', '_');
         hiveShell.execute(
                 String.join(
                         "\n",
@@ -224,12 +198,11 @@ public class HiveWriteITCase {
         String innerName = "hive_test_table_output";
 
         String path = folder.newFolder().toURI().toString();
-        String tablePath = String.format("%s/default.db/%s", path, innerName);
+        String tablePath = String.format("%s/test_db.db/%s", path, innerName);
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, path);
         conf.set(CoreOptions.BUCKET, 1);
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.CHANGE_LOG);
+        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_AVRO);
         Identifier identifier = Identifier.create(DATABASE_NAME, innerName);
         Table table =
                 FileStoreTestUtils.createFileStoreTable(
@@ -269,12 +242,10 @@ public class HiveWriteITCase {
         String innerName = "hive_test_table_output";
         int maxCompact = 3;
         String path = folder.newFolder().toURI().toString();
-        String tablePath = String.format("%s/default.db/%s", path, innerName);
+        String tablePath = String.format("%s/test_db.db/%s", path, innerName);
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, path);
-        conf.set(CoreOptions.BUCKET, 1);
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
-        conf.set(CoreOptions.WRITE_MODE, WriteMode.APPEND_ONLY);
+        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_AVRO);
         conf.set(CoreOptions.COMPACTION_MAX_FILE_NUM, maxCompact);
         Identifier identifier = Identifier.create(DATABASE_NAME, innerName);
         Table table =
@@ -614,10 +585,11 @@ public class HiveWriteITCase {
     public void testInsertAllSupportedTypes() throws Exception {
 
         String root = folder.newFolder().toString();
-        String tablePath = String.format("%s/default.db/hive_test_table", root);
+        String tablePath = String.format("%s/test_db.db/hive_test_table", root);
         Options conf = new Options();
         conf.set(CatalogOptions.WAREHOUSE, root);
-        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FileFormatType.AVRO);
+        conf.set(CoreOptions.FILE_FORMAT, CoreOptions.FILE_FORMAT_AVRO);
+        conf.set("bucket", "1");
         Table table =
                 FileStoreTestUtils.createFileStoreTable(
                         conf,
@@ -646,6 +618,7 @@ public class HiveWriteITCase {
         }
         commit.commit(0, write.prepareCommit(true, 0));
         write.close();
+        commit.close();
 
         hiveShell.execute(
                 String.join(

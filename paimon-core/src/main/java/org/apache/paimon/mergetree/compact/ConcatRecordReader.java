@@ -18,12 +18,14 @@
 
 package org.apache.paimon.mergetree.compact;
 
+import org.apache.paimon.reader.ReaderSupplier;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.utils.Preconditions;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
@@ -39,15 +41,21 @@ public class ConcatRecordReader<T> implements RecordReader<T> {
 
     private RecordReader<T> current;
 
-    protected ConcatRecordReader(List<ReaderSupplier<T>> readerFactories) {
+    protected ConcatRecordReader(List<? extends ReaderSupplier<T>> readerFactories) {
         readerFactories.forEach(
                 supplier ->
                         Preconditions.checkNotNull(supplier, "Reader factory must not be null."));
         this.queue = new LinkedList<>(readerFactories);
     }
 
-    public static <R> RecordReader<R> create(List<ReaderSupplier<R>> readers) throws IOException {
+    public static <R> RecordReader<R> create(List<? extends ReaderSupplier<R>> readers)
+            throws IOException {
         return readers.size() == 1 ? readers.get(0).get() : new ConcatRecordReader<>(readers);
+    }
+
+    public static <R> RecordReader<R> create(ReaderSupplier<R> reader1, ReaderSupplier<R> reader2)
+            throws IOException {
+        return create(Arrays.asList(reader1, reader2));
     }
 
     @Nullable
@@ -74,11 +82,5 @@ public class ConcatRecordReader<T> implements RecordReader<T> {
         if (current != null) {
             current.close();
         }
-    }
-
-    /** Supplier to get {@link RecordReader}. */
-    @FunctionalInterface
-    public interface ReaderSupplier<T> {
-        RecordReader<T> get() throws IOException;
     }
 }

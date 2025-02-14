@@ -18,24 +18,47 @@
 
 package org.apache.paimon.manifest;
 
+import org.apache.paimon.annotation.Public;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.index.DeletionVectorMeta;
 import org.apache.paimon.index.IndexFileMeta;
+import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TinyIntType;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Arrays;
 import java.util.Objects;
 
 import static org.apache.paimon.utils.Preconditions.checkArgument;
 import static org.apache.paimon.utils.SerializationUtils.newBytesType;
 import static org.apache.paimon.utils.SerializationUtils.newStringType;
 
-/** Manifest entry for index file. */
+/**
+ * Manifest entry for index file.
+ *
+ * @since 0.9.0
+ */
+@Public
 public class IndexManifestEntry {
+
+    public static final RowType SCHEMA =
+            new RowType(
+                    false,
+                    Arrays.asList(
+                            new DataField(0, "_KIND", new TinyIntType(false)),
+                            new DataField(1, "_PARTITION", newBytesType(false)),
+                            new DataField(2, "_BUCKET", new IntType(false)),
+                            new DataField(3, "_INDEX_TYPE", newStringType(false)),
+                            new DataField(4, "_FILE_NAME", newStringType(false)),
+                            new DataField(5, "_FILE_SIZE", new BigIntType(false)),
+                            new DataField(6, "_ROW_COUNT", new BigIntType(false)),
+                            new DataField(
+                                    7,
+                                    "_DELETIONS_VECTORS_RANGES",
+                                    new ArrayType(true, DeletionVectorMeta.SCHEMA))));
 
     private final FileKind kind;
     private final BinaryRow partition;
@@ -71,22 +94,6 @@ public class IndexManifestEntry {
         return indexFile;
     }
 
-    public static RowType schema() {
-        List<DataField> fields = new ArrayList<>();
-        fields.add(new DataField(0, "_KIND", new TinyIntType(false)));
-        fields.add(new DataField(1, "_PARTITION", newBytesType(false)));
-        fields.add(new DataField(2, "_BUCKET", new IntType(false)));
-        fields.add(new DataField(3, "_INDEX_TYPE", newStringType(false)));
-        fields.add(new DataField(4, "_FILE_NAME", newStringType(false)));
-        fields.add(new DataField(5, "_FILE_SIZE", new BigIntType(false)));
-        fields.add(new DataField(6, "_ROW_COUNT", new BigIntType(false)));
-        return new RowType(fields);
-    }
-
-    public Identifier identifier() {
-        return new Identifier(partition, bucket, indexFile.indexType());
-    }
-
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -119,56 +126,5 @@ public class IndexManifestEntry {
                 + ", indexFile="
                 + indexFile
                 + '}';
-    }
-
-    /** The {@link Identifier} of a {@link IndexFileMeta}. */
-    public static class Identifier {
-
-        public final BinaryRow partition;
-        public final int bucket;
-        public final String indexType;
-
-        private Integer hash;
-
-        private Identifier(BinaryRow partition, int bucket, String indexType) {
-            this.partition = partition;
-            this.bucket = bucket;
-            this.indexType = indexType;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (o == null || getClass() != o.getClass()) {
-                return false;
-            }
-            Identifier that = (Identifier) o;
-            return bucket == that.bucket
-                    && Objects.equals(partition, that.partition)
-                    && Objects.equals(indexType, that.indexType);
-        }
-
-        @Override
-        public int hashCode() {
-            if (hash == null) {
-                hash = Objects.hash(partition, bucket, indexType);
-            }
-            return hash;
-        }
-
-        @Override
-        public String toString() {
-            return "Identifier{"
-                    + "partition="
-                    + partition
-                    + ", bucket="
-                    + bucket
-                    + ", indexType='"
-                    + indexType
-                    + '\''
-                    + '}';
-        }
     }
 }

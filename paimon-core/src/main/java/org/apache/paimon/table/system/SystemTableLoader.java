@@ -18,70 +18,72 @@
 
 package org.apache.paimon.table.system;
 
-import org.apache.paimon.fs.FileIO;
-import org.apache.paimon.fs.Path;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
 
+import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
+
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 
+import static org.apache.paimon.table.system.AggregationFieldsTable.AGGREGATION_FIELDS;
 import static org.apache.paimon.table.system.AllTableOptionsTable.ALL_TABLE_OPTIONS;
 import static org.apache.paimon.table.system.AuditLogTable.AUDIT_LOG;
+import static org.apache.paimon.table.system.BinlogTable.BINLOG;
+import static org.apache.paimon.table.system.BranchesTable.BRANCHES;
+import static org.apache.paimon.table.system.BucketsTable.BUCKETS;
 import static org.apache.paimon.table.system.CatalogOptionsTable.CATALOG_OPTIONS;
 import static org.apache.paimon.table.system.ConsumersTable.CONSUMERS;
 import static org.apache.paimon.table.system.FilesTable.FILES;
 import static org.apache.paimon.table.system.ManifestsTable.MANIFESTS;
 import static org.apache.paimon.table.system.OptionsTable.OPTIONS;
 import static org.apache.paimon.table.system.PartitionsTable.PARTITIONS;
+import static org.apache.paimon.table.system.ReadOptimizedTable.READ_OPTIMIZED;
 import static org.apache.paimon.table.system.SchemasTable.SCHEMAS;
 import static org.apache.paimon.table.system.SnapshotsTable.SNAPSHOTS;
+import static org.apache.paimon.table.system.StatisticTable.STATISTICS;
+import static org.apache.paimon.table.system.TableIndexesTable.TABLE_INDEXES;
 import static org.apache.paimon.table.system.TagsTable.TAGS;
 
 /** Loader to load system {@link Table}s. */
 public class SystemTableLoader {
 
-    @Nullable
-    public static Table load(String type, FileIO fileIO, FileStoreTable dataTable) {
-        Path location = dataTable.location();
-        switch (type.toLowerCase()) {
-            case MANIFESTS:
-                return new ManifestsTable(fileIO, location, dataTable);
-            case SNAPSHOTS:
-                return new SnapshotsTable(fileIO, location, dataTable);
-            case OPTIONS:
-                return new OptionsTable(fileIO, location);
-            case SCHEMAS:
-                return new SchemasTable(fileIO, location);
-            case PARTITIONS:
-                return new PartitionsTable(dataTable);
-            case AUDIT_LOG:
-                return new AuditLogTable(dataTable);
-            case FILES:
-                return new FilesTable(dataTable);
-            case TAGS:
-                return new TagsTable(fileIO, location);
-            case CONSUMERS:
-                return new ConsumersTable(fileIO, location);
-            default:
-                return null;
-        }
-    }
+    public static final Map<String, Function<FileStoreTable, Table>> SYSTEM_TABLE_LOADERS =
+            new ImmutableMap.Builder<String, Function<FileStoreTable, Table>>()
+                    .put(MANIFESTS, ManifestsTable::new)
+                    .put(SNAPSHOTS, SnapshotsTable::new)
+                    .put(OPTIONS, OptionsTable::new)
+                    .put(SCHEMAS, SchemasTable::new)
+                    .put(PARTITIONS, PartitionsTable::new)
+                    .put(BUCKETS, BucketsTable::new)
+                    .put(AUDIT_LOG, AuditLogTable::new)
+                    .put(FILES, FilesTable::new)
+                    .put(TAGS, TagsTable::new)
+                    .put(BRANCHES, BranchesTable::new)
+                    .put(CONSUMERS, ConsumersTable::new)
+                    .put(READ_OPTIMIZED, ReadOptimizedTable::new)
+                    .put(AGGREGATION_FIELDS, AggregationFieldsTable::new)
+                    .put(STATISTICS, StatisticTable::new)
+                    .put(BINLOG, BinlogTable::new)
+                    .put(TABLE_INDEXES, TableIndexesTable::new)
+                    .build();
+
+    public static final List<String> SYSTEM_TABLES = new ArrayList<>(SYSTEM_TABLE_LOADERS.keySet());
 
     @Nullable
-    public static Table loadGlobal(
-            String tableName,
-            FileIO fileIO,
-            Map<String, Map<String, Path>> allTablePaths,
-            Map<String, String> catalogOptions) {
-        switch (tableName.toLowerCase()) {
-            case ALL_TABLE_OPTIONS:
-                return new AllTableOptionsTable(fileIO, allTablePaths);
-            case CATALOG_OPTIONS:
-                return new CatalogOptionsTable(catalogOptions);
-            default:
-                return null;
-        }
+    public static Table load(String type, FileStoreTable dataTable) {
+        return Optional.ofNullable(SYSTEM_TABLE_LOADERS.get(type.toLowerCase()))
+                .map(f -> f.apply(dataTable))
+                .orElse(null);
+    }
+
+    public static List<String> loadGlobalTableNames() {
+        return Arrays.asList(ALL_TABLE_OPTIONS, CATALOG_OPTIONS);
     }
 }

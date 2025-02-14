@@ -21,7 +21,7 @@ package org.apache.paimon.manifest;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.io.CompactIncrement;
 import org.apache.paimon.io.DataFileMeta;
-import org.apache.paimon.io.NewFilesIncrement;
+import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.CommitMessageImpl;
 
@@ -35,7 +35,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.paimon.mergetree.compact.MergeTreeCompactManagerTest.row;
-import static org.apache.paimon.stats.StatsTestUtils.newTableStats;
+import static org.apache.paimon.stats.StatsTestUtils.newSimpleStats;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link ManifestCommittableSerializer}. */
@@ -73,23 +73,24 @@ public class ManifestCommittableSerializerTest {
         List<CommitMessage> commitMessages = new ArrayList<>();
         int length = ThreadLocalRandom.current().nextInt(10) + 1;
         for (int i = 0; i < length; i++) {
-            NewFilesIncrement newFilesIncrement = randomNewFilesIncrement();
+            DataIncrement dataIncrement = randomNewFilesIncrement();
             CompactIncrement compactIncrement = randomCompactIncrement();
             CommitMessage commitMessage =
-                    new CommitMessageImpl(partition, bucket, newFilesIncrement, compactIncrement);
+                    new CommitMessageImpl(partition, bucket, dataIncrement, compactIncrement);
             commitMessages.add(commitMessage);
             committable.addFileCommittable(commitMessage);
         }
 
         if (!committable.logOffsets().containsKey(bucket)) {
             int offset = ID.incrementAndGet();
-            committable.addLogOffset(bucket, offset);
+            committable.addLogOffset(bucket, offset, false);
             assertThat(committable.logOffsets().get(bucket)).isEqualTo(offset);
         }
     }
 
-    public static NewFilesIncrement randomNewFilesIncrement() {
-        return new NewFilesIncrement(
+    public static DataIncrement randomNewFilesIncrement() {
+        return new DataIncrement(
+                Arrays.asList(newFile(ID.incrementAndGet(), 0), newFile(ID.incrementAndGet(), 0)),
                 Arrays.asList(newFile(ID.incrementAndGet(), 0), newFile(ID.incrementAndGet(), 0)),
                 Arrays.asList(newFile(ID.incrementAndGet(), 0), newFile(ID.incrementAndGet(), 0)));
     }
@@ -108,11 +109,15 @@ public class ManifestCommittableSerializerTest {
                 1,
                 row(0),
                 row(0),
-                newTableStats(0, 1),
-                newTableStats(0, 1),
+                newSimpleStats(0, 1),
+                newSimpleStats(0, 1),
                 0,
                 1,
                 0,
-                level);
+                level,
+                0L,
+                null,
+                FileSource.APPEND,
+                null);
     }
 }

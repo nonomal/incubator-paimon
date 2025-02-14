@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,18 +24,19 @@ import org.apache.paimon.utils.JsonSerdeUtil;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonCreator;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonGetter;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.exc.MismatchedInputException;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Optional;
-import java.util.concurrent.TimeUnit;
 
 /** Consumer which contains next snapshot. */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Consumer {
 
     private static final String FIELD_NEXT_SNAPSHOT = "nextSnapshot";
-
-    private static final int READ_CONSUMER_RETRY_NUM = 3;
-    private static final int READ_CONSUMER_RETRY_INTERVAL = 100;
 
     private final long nextSnapshot;
 
@@ -58,31 +59,24 @@ public class Consumer {
     }
 
     public static Optional<Consumer> fromPath(FileIO fileIO, Path path) {
-        // Consumer updating uses FileIO.newOutputStream(..., overwrite).
-        // But this API may have some intermediate state, the file maybe empty
-        // So retry here to avoid exception when the file is intermediate state
         int retryNumber = 0;
-        Exception exception = null;
-        while (retryNumber++ < READ_CONSUMER_RETRY_NUM) {
+        MismatchedInputException exception = null;
+        while (retryNumber++ < 10) {
             try {
-                if (!fileIO.exists(path)) {
-                    return Optional.empty();
-                }
-
-                String json = fileIO.readFileUtf8(path);
-                return Optional.of(Consumer.fromJson(json));
-            } catch (Exception e) {
+                return fileIO.readOverwrittenFileUtf8(path).map(Consumer::fromJson);
+            } catch (MismatchedInputException e) {
+                // retry
                 exception = e;
-            }
-
-            try {
-                TimeUnit.MILLISECONDS.sleep(READ_CONSUMER_RETRY_INTERVAL);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException(e);
+                try {
+                    Thread.sleep(1_000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(ie);
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
             }
         }
-
-        throw new RuntimeException("Fails to read snapshot from path " + path, exception);
+        throw new UncheckedIOException(exception);
     }
 }

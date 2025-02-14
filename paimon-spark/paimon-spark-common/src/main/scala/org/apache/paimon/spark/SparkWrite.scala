@@ -15,6 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.paimon.spark
 
 import org.apache.paimon.options.Options
@@ -33,5 +34,9 @@ class SparkWrite(val table: FileStoreTable, saveMode: SaveMode, options: Options
       {
         WriteIntoPaimonTable(table, saveMode, data, options).run(data.sparkSession)
       }
+  }
+
+  override def toString: String = {
+    s"table: ${table.fullName()}, saveMode: $saveMode, options: ${options.toMap}"
   }
 }

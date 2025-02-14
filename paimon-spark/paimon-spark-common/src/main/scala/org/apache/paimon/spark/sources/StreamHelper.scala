@@ -15,16 +15,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.paimon.spark.sources
 
 import org.apache.paimon.CoreOptions
 import org.apache.paimon.data.BinaryRow
 import org.apache.paimon.spark.SparkTypeUtils
 import org.apache.paimon.table.DataTable
-import org.apache.paimon.table.source.{DataSplit, InnerStreamTableScan}
+import org.apache.paimon.table.source.{DataSplit, StreamDataTableScan}
 import org.apache.paimon.table.source.TableScan.Plan
 import org.apache.paimon.table.source.snapshot.StartingContext
-import org.apache.paimon.utils.{RowDataPartitionComputer, TypeUtils}
+import org.apache.paimon.utils.{InternalRowPartitionComputer, TypeUtils}
 
 import org.apache.spark.sql.connector.read.streaming.ReadLimit
 import org.apache.spark.sql.execution.datasources.PartitioningUtils
@@ -35,7 +36,7 @@ import scala.collection.mutable
 
 case class IndexedDataSplit(snapshotId: Long, index: Long, entry: DataSplit)
 
-trait StreamHelper {
+private[spark] trait StreamHelper {
 
   def table: DataTable
 
@@ -43,16 +44,21 @@ trait StreamHelper {
 
   var lastTriggerMillis: Long
 
-  private lazy val streamScan: InnerStreamTableScan = table.newStreamScan()
+  private lazy val streamScan: StreamDataTableScan =
+    table.newStreamScan().dropStats().asInstanceOf[StreamDataTableScan]
 
   private lazy val partitionSchema: StructType =
     SparkTypeUtils.fromPaimonRowType(TypeUtils.project(table.rowType(), table.partitionKeys()))
 
-  private lazy val partitionComputer: RowDataPartitionComputer = new RowDataPartitionComputer(
-    new CoreOptions(table.options).partitionDefaultName,
-    TypeUtils.project(table.rowType(), table.partitionKeys()),
-    table.partitionKeys().asScala.toArray
-  )
+  private lazy val partitionComputer: InternalRowPartitionComputer = {
+    val options = new CoreOptions(table.options)
+    new InternalRowPartitionComputer(
+      options.partitionDefaultName,
+      TypeUtils.project(table.rowType(), table.partitionKeys()),
+      table.partitionKeys().asScala.toArray,
+      options.legacyPartitionName()
+    )
+  }
 
   // Used to get the initial offset.
   lazy val streamScanStartingContext: StartingContext = streamScan.startingContext()

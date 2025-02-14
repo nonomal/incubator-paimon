@@ -23,6 +23,8 @@ import org.apache.paimon.codegen.RecordEqualiser;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.utils.Preconditions;
 
+import javax.annotation.Nullable;
+
 /**
  * Wrapper for {@link MergeFunction}s to produce changelog during a full compaction.
  *
@@ -39,8 +41,7 @@ public class FullChangelogMergeFunctionWrapper implements MergeFunctionWrapper<C
 
     private final MergeFunction<KeyValue> mergeFunction;
     private final int maxLevel;
-    private final RecordEqualiser valueEqualiser;
-    private final boolean changelogRowDeduplicate;
+    @Nullable private final RecordEqualiser valueEqualiser;
 
     // only full compaction will write files into maxLevel, see UniversalCompaction class
     private KeyValue topLevelKv;
@@ -54,16 +55,10 @@ public class FullChangelogMergeFunctionWrapper implements MergeFunctionWrapper<C
     public FullChangelogMergeFunctionWrapper(
             MergeFunction<KeyValue> mergeFunction,
             int maxLevel,
-            RecordEqualiser valueEqualiser,
-            boolean changelogRowDeduplicate) {
-        Preconditions.checkArgument(
-                !(mergeFunction instanceof ValueCountMergeFunction),
-                "Value count merge function does not need to produce changelog from full compaction. "
-                        + "Please set changelog producer to 'input'.");
+            @Nullable RecordEqualiser valueEqualiser) {
         this.mergeFunction = mergeFunction;
         this.maxLevel = maxLevel;
         this.valueEqualiser = valueEqualiser;
-        this.changelogRowDeduplicate = changelogRowDeduplicate;
     }
 
     @Override
@@ -104,13 +99,13 @@ public class FullChangelogMergeFunctionWrapper implements MergeFunctionWrapper<C
         if (isInitialized) {
             KeyValue merged = mergeFunction.getResult();
             if (topLevelKv == null) {
-                if (merged != null && isAdd(merged)) {
+                if (merged.isAdd()) {
                     reusedResult.addChangelog(replace(reusedAfter, RowKind.INSERT, merged));
                 }
             } else {
-                if (merged == null || !isAdd(merged)) {
+                if (!merged.isAdd()) {
                     reusedResult.addChangelog(replace(reusedBefore, RowKind.DELETE, topLevelKv));
-                } else if (!changelogRowDeduplicate
+                } else if (valueEqualiser == null
                         || !valueEqualiser.equals(topLevelKv.value(), merged.value())) {
                     reusedResult
                             .addChangelog(replace(reusedBefore, RowKind.UPDATE_BEFORE, topLevelKv))
@@ -119,7 +114,7 @@ public class FullChangelogMergeFunctionWrapper implements MergeFunctionWrapper<C
             }
             return reusedResult.setResultIfNotRetract(merged);
         } else {
-            if (topLevelKv == null && isAdd(initialKv)) {
+            if (topLevelKv == null && initialKv.isAdd()) {
                 reusedResult.addChangelog(replace(reusedAfter, RowKind.INSERT, initialKv));
             }
             // either topLevelKv is not null, but there is only one kv,
@@ -132,9 +127,5 @@ public class FullChangelogMergeFunctionWrapper implements MergeFunctionWrapper<C
 
     private KeyValue replace(KeyValue reused, RowKind valueKind, KeyValue from) {
         return reused.replace(from.key(), from.sequenceNumber(), valueKind, from.value());
-    }
-
-    private boolean isAdd(KeyValue kv) {
-        return kv.valueKind() == RowKind.INSERT || kv.valueKind() == RowKind.UPDATE_AFTER;
     }
 }

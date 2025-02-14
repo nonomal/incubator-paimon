@@ -19,6 +19,7 @@
 package org.apache.paimon.table.system;
 
 import org.apache.paimon.CoreOptions;
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.annotation.Experimental;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericRow;
@@ -28,23 +29,29 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataFileMetaSerializer;
+import org.apache.paimon.manifest.IndexManifestEntry;
+import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.ManifestFileMeta;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.table.DataTable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.ReadonlyTable;
 import org.apache.paimon.table.source.DataSplit;
-import org.apache.paimon.table.source.InnerStreamTableScan;
+import org.apache.paimon.table.source.DataTableScan;
 import org.apache.paimon.table.source.InnerTableRead;
-import org.apache.paimon.table.source.InnerTableScan;
 import org.apache.paimon.table.source.Split;
+import org.apache.paimon.table.source.StreamDataTableScan;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.BranchManager;
 import org.apache.paimon.utils.IteratorRecordReader;
+import org.apache.paimon.utils.SimpleFileReader;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.TagManager;
 
@@ -53,6 +60,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 
 import static org.apache.paimon.CoreOptions.SCAN_BOUNDED_WATERMARK;
 import static org.apache.paimon.CoreOptions.STREAM_SCAN_MODE;
@@ -90,6 +98,31 @@ public class FileMonitorTable implements DataTable, ReadonlyTable {
     }
 
     @Override
+    public OptionalLong latestSnapshotId() {
+        return wrapped.latestSnapshotId();
+    }
+
+    @Override
+    public Snapshot snapshot(long snapshotId) {
+        return wrapped.snapshot(snapshotId);
+    }
+
+    @Override
+    public SimpleFileReader<ManifestFileMeta> manifestListReader() {
+        return wrapped.manifestListReader();
+    }
+
+    @Override
+    public SimpleFileReader<ManifestEntry> manifestFileReader() {
+        return wrapped.manifestFileReader();
+    }
+
+    @Override
+    public SimpleFileReader<IndexManifestEntry> indexManifestFileReader() {
+        return wrapped.indexManifestFileReader();
+    }
+
+    @Override
     public Path location() {
         return wrapped.location();
     }
@@ -100,8 +133,23 @@ public class FileMonitorTable implements DataTable, ReadonlyTable {
     }
 
     @Override
+    public SchemaManager schemaManager() {
+        return wrapped.schemaManager();
+    }
+
+    @Override
     public TagManager tagManager() {
         return wrapped.tagManager();
+    }
+
+    @Override
+    public BranchManager branchManager() {
+        return wrapped.branchManager();
+    }
+
+    @Override
+    public DataTable switchToBranch(String branchName) {
+        return new FileMonitorTable(wrapped.switchToBranch(branchName));
     }
 
     @Override
@@ -130,12 +178,12 @@ public class FileMonitorTable implements DataTable, ReadonlyTable {
     }
 
     @Override
-    public InnerTableScan newScan() {
+    public DataTableScan newScan() {
         return wrapped.newScan();
     }
 
     @Override
-    public InnerStreamTableScan newStreamScan() {
+    public StreamDataTableScan newStreamScan() {
         return wrapped.newStreamScan();
     }
 
@@ -169,11 +217,6 @@ public class FileMonitorTable implements DataTable, ReadonlyTable {
         public InnerTableRead withFilter(Predicate predicate) {
             // filter is done by scan
             return this;
-        }
-
-        @Override
-        public InnerTableRead withProjection(int[][] projection) {
-            throw new UnsupportedOperationException("BucketsRead does not support projection");
         }
 
         @Override

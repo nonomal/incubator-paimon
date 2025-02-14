@@ -23,13 +23,12 @@ import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.util.AbstractTestBase;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
-import org.apache.paimon.table.Table;
+import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.utils.BlockingIterator;
 import org.apache.paimon.utils.SnapshotManager;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableList;
 
-import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.config.ExecutionConfigOptions;
 import org.apache.flink.table.api.internal.TableEnvironmentImpl;
@@ -43,20 +42,21 @@ import org.apache.flink.table.operations.Operation;
 import org.apache.flink.table.operations.ddl.CreateCatalogOperation;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
+import org.assertj.core.api.Assertions;
+import org.assertj.core.api.ListAssert;
 import org.junit.jupiter.api.BeforeEach;
 
 import javax.annotation.Nullable;
 
 import java.io.File;
 import java.io.IOException;
-import java.time.Duration;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
-
-import static org.apache.flink.streaming.api.environment.ExecutionCheckpointingOptions.CHECKPOINTING_INTERVAL;
 
 /** ITCase for catalog. */
 public abstract class CatalogITCaseBase extends AbstractTestBase {
@@ -67,7 +67,7 @@ public abstract class CatalogITCaseBase extends AbstractTestBase {
 
     @BeforeEach
     public void before() throws IOException {
-        tEnv = TableEnvironment.create(EnvironmentSettings.newInstance().inBatchMode().build());
+        tEnv = tableEnvironmentBuilder().batchMode().build();
         String catalog = "PAIMON";
         path = getTempDirPath();
         String inferScan =
@@ -75,7 +75,9 @@ public abstract class CatalogITCaseBase extends AbstractTestBase {
 
         Map<String, String> options = new HashMap<>(catalogOptions());
         options.put("type", "paimon");
-        options.put("warehouse", toWarehouse(path));
+        if (supportDefineWarehouse()) {
+            options.put("warehouse", toWarehouse(path));
+        }
         tEnv.executeSql(
                 String.format(
                         "CREATE CATALOG %s WITH (" + "%s" + inferScan + ")",
@@ -85,8 +87,7 @@ public abstract class CatalogITCaseBase extends AbstractTestBase {
                                 .collect(Collectors.joining(","))));
         tEnv.useCatalog(catalog);
 
-        sEnv = TableEnvironment.create(EnvironmentSettings.newInstance().inStreamingMode().build());
-        sEnv.getConfig().getConfiguration().set(CHECKPOINTING_INTERVAL, Duration.ofMillis(100));
+        sEnv = tableEnvironmentBuilder().streamingMode().checkpointIntervalMs(100).build();
         sEnv.registerCatalog(catalog, tEnv.getCatalog(catalog).get());
         sEnv.useCatalog(catalog);
 
@@ -96,6 +97,10 @@ public abstract class CatalogITCaseBase extends AbstractTestBase {
 
     protected Map<String, String> catalogOptions() {
         return Collections.emptyMap();
+    }
+
+    protected boolean supportDefineWarehouse() {
+        return true;
     }
 
     protected boolean inferScanParallelism() {
@@ -144,6 +149,26 @@ public abstract class CatalogITCaseBase extends AbstractTestBase {
         }
     }
 
+    protected void sqlAssertWithRetry(
+            String query, Consumer<ListAssert<Row>> checker, Object... args) {
+        long start = System.currentTimeMillis();
+        while (true) {
+            try (CloseableIterator<Row> iter =
+                    tEnv.executeSql(String.format(query, args)).collect()) {
+                try {
+                    checker.accept(Assertions.assertThat(ImmutableList.copyOf(iter)));
+                    return;
+                } catch (AssertionError e) {
+                    if (System.currentTimeMillis() - start >= 3 * 60 * 1000) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
     protected CloseableIterator<Row> streamSqlIter(String query, Object... args) {
         return sEnv.executeSql(String.format(query, args)).collect();
     }
@@ -159,13 +184,14 @@ public abstract class CatalogITCaseBase extends AbstractTestBase {
         return (CatalogTable) table;
     }
 
-    protected Table paimonTable(String tableName)
+    protected FileStoreTable paimonTable(String tableName)
             throws org.apache.paimon.catalog.Catalog.TableNotExistException {
         org.apache.paimon.catalog.Catalog catalog = flinkCatalog().catalog();
-        return catalog.getTable(Identifier.create(tEnv.getCurrentDatabase(), tableName));
+        return (FileStoreTable)
+                catalog.getTable(Identifier.create(tEnv.getCurrentDatabase(), tableName));
     }
 
-    private FlinkCatalog flinkCatalog() {
+    protected FlinkCatalog flinkCatalog() {
         return (FlinkCatalog) tEnv.getCatalog(tEnv.getCurrentCatalog()).get();
     }
 
@@ -193,5 +219,11 @@ public abstract class CatalogITCaseBase extends AbstractTestBase {
 
     protected String toWarehouse(String path) {
         return path;
+    }
+
+    protected List<Row> queryAndSort(String sql) {
+        return sql(sql).stream()
+                .sorted(Comparator.comparingInt(r -> r.getFieldAs(0)))
+                .collect(Collectors.toList());
     }
 }

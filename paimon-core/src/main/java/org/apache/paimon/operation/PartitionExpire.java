@@ -19,17 +19,22 @@
 package org.apache.paimon.operation;
 
 import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.data.BinaryRow;
-import org.apache.paimon.manifest.ManifestEntry;
-import org.apache.paimon.partition.PartitionTimeExtractor;
-import org.apache.paimon.types.RowType;
-import org.apache.paimon.utils.RowDataToObjectArrayConverter;
+import org.apache.paimon.manifest.PartitionEntry;
+import org.apache.paimon.partition.PartitionExpireStrategy;
+import org.apache.paimon.partition.PartitionValuesTimeExpireStrategy;
+import org.apache.paimon.table.PartitionHandler;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.LinkedHashMap;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -37,41 +42,82 @@ import java.util.stream.Collectors;
 /** Expire partitions. */
 public class PartitionExpire {
 
-    private final List<String> partitionKeys;
-    private final RowDataToObjectArrayConverter toObjectArrayConverter;
+    private static final Logger LOG = LoggerFactory.getLogger(PartitionExpire.class);
+
+    private static final String DELIMITER = ",";
+
     private final Duration expirationTime;
     private final Duration checkInterval;
-    private final PartitionTimeExtractor timeExtractor;
     private final FileStoreScan scan;
     private final FileStoreCommit commit;
-
+    @Nullable private final PartitionHandler partitionHandler;
     private LocalDateTime lastCheck;
+    private final PartitionExpireStrategy strategy;
+    private final boolean endInputCheckPartitionExpire;
+    private int maxExpireNum;
 
     public PartitionExpire(
-            RowType partitionType,
             Duration expirationTime,
             Duration checkInterval,
-            String timePattern,
-            String timeFormatter,
+            PartitionExpireStrategy strategy,
             FileStoreScan scan,
-            FileStoreCommit commit) {
-        this.partitionKeys = partitionType.getFieldNames();
-        this.toObjectArrayConverter = new RowDataToObjectArrayConverter(partitionType);
+            FileStoreCommit commit,
+            @Nullable PartitionHandler partitionHandler,
+            boolean endInputCheckPartitionExpire,
+            int maxExpireNum) {
         this.expirationTime = expirationTime;
         this.checkInterval = checkInterval;
-        this.timeExtractor = new PartitionTimeExtractor(timePattern, timeFormatter);
+        this.strategy = strategy;
         this.scan = scan;
         this.commit = commit;
+        this.partitionHandler = partitionHandler;
         this.lastCheck = LocalDateTime.now();
+        this.endInputCheckPartitionExpire = endInputCheckPartitionExpire;
+        this.maxExpireNum = maxExpireNum;
     }
 
-    public PartitionExpire withLock(Lock lock) {
-        this.commit.withLock(lock);
+    public PartitionExpire(
+            Duration expirationTime,
+            Duration checkInterval,
+            PartitionExpireStrategy strategy,
+            FileStoreScan scan,
+            FileStoreCommit commit,
+            @Nullable PartitionHandler partitionHandler,
+            int maxExpireNum) {
+        this(
+                expirationTime,
+                checkInterval,
+                strategy,
+                scan,
+                commit,
+                partitionHandler,
+                false,
+                maxExpireNum);
+    }
+
+    public PartitionExpire withMaxExpireNum(int maxExpireNum) {
+        this.maxExpireNum = maxExpireNum;
         return this;
     }
 
-    public void expire(long commitIdentifier) {
-        expire(LocalDateTime.now(), commitIdentifier);
+    public List<Map<String, String>> expire(long commitIdentifier) {
+        return expire(LocalDateTime.now(), commitIdentifier);
+    }
+
+    public boolean isValueExpiration() {
+        return strategy instanceof PartitionValuesTimeExpireStrategy;
+    }
+
+    public boolean isValueAllExpired(Collection<BinaryRow> partitions) {
+        PartitionValuesTimeExpireStrategy valuesStrategy =
+                (PartitionValuesTimeExpireStrategy) strategy;
+        LocalDateTime expireDateTime = LocalDateTime.now().minus(expirationTime);
+        for (BinaryRow partition : partitions) {
+            if (!valuesStrategy.isExpired(expireDateTime, partition)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @VisibleForTesting
@@ -80,44 +126,54 @@ public class PartitionExpire {
     }
 
     @VisibleForTesting
-    void expire(LocalDateTime now, long commitIdentifier) {
-        if (now.isAfter(lastCheck.plus(checkInterval))) {
-            doExpire(now.minus(expirationTime), commitIdentifier);
+    List<Map<String, String>> expire(LocalDateTime now, long commitIdentifier) {
+        if (checkInterval.isZero()
+                || now.isAfter(lastCheck.plus(checkInterval))
+                || (endInputCheckPartitionExpire && Long.MAX_VALUE == commitIdentifier)) {
+            List<Map<String, String>> expired =
+                    doExpire(now.minus(expirationTime), commitIdentifier);
             lastCheck = now;
+            return expired;
         }
+        return null;
     }
 
-    private void doExpire(LocalDateTime expireDateTime, long commitIdentifier) {
-        List<BinaryRow> partitions = readPartitions();
+    private List<Map<String, String>> doExpire(
+            LocalDateTime expireDateTime, long commitIdentifier) {
+        List<PartitionEntry> partitionEntries =
+                strategy.selectExpiredPartitions(scan, expireDateTime);
+        List<List<String>> expiredPartValues = new ArrayList<>(partitionEntries.size());
+        for (PartitionEntry partition : partitionEntries) {
+            Object[] array = strategy.convertPartition(partition.partition());
+            expiredPartValues.add(strategy.toPartitionValue(array));
+        }
+
         List<Map<String, String>> expired = new ArrayList<>();
-        for (BinaryRow partition : partitions) {
-            Object[] array = toObjectArrayConverter.convert(partition);
-            LocalDateTime partTime = timeExtractor.extract(partitionKeys, Arrays.asList(array));
-            if (expireDateTime.isAfter(partTime)) {
-                expired.add(toPartitionString(array));
+        if (!expiredPartValues.isEmpty()) {
+            // convert partition value to partition string, and limit the partition num
+            expired = convertToPartitionString(expiredPartValues);
+            LOG.info("Expire Partitions: {}", expired);
+            if (partitionHandler != null) {
+                try {
+                    partitionHandler.dropPartitions(expired);
+                } catch (Catalog.TableNotExistException e) {
+                    throw new RuntimeException(e);
+                }
+            } else {
+                commit.dropPartitions(expired, commitIdentifier);
             }
         }
-
-        if (expired.size() > 0) {
-            commit.dropPartitions(expired, commitIdentifier);
-        }
+        return expired;
     }
 
-    private Map<String, String> toPartitionString(Object[] array) {
-        Map<String, String> map = new LinkedHashMap<>();
-        for (int i = 0; i < partitionKeys.size(); i++) {
-            map.put(partitionKeys.get(i), array[i].toString());
-        }
-        return map;
-    }
-
-    private List<BinaryRow> readPartitions() {
-        // TODO optimize this to read partition only
-        // NOTE: avro projection push down can't reach expected cause row-oriented design, see pull
-        // request #1114
-        return scan.plan().files().stream()
-                .map(ManifestEntry::partition)
-                .distinct()
+    private List<Map<String, String>> convertToPartitionString(
+            List<List<String>> expiredPartValues) {
+        return expiredPartValues.stream()
+                .map(values -> String.join(DELIMITER, values))
+                .sorted()
+                .map(s -> s.split(DELIMITER))
+                .map(strategy::toPartitionString)
+                .limit(Math.min(expiredPartValues.size(), maxExpireNum))
                 .collect(Collectors.toList());
     }
 }

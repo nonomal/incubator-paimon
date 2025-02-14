@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,7 +18,11 @@
 
 package org.apache.paimon.format;
 
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
+
+import javax.annotation.Nullable;
 
 /** Factory to create {@link FileFormat}. */
 public interface FileFormatFactory {
@@ -29,20 +33,50 @@ public interface FileFormatFactory {
 
     /** the format context. */
     class FormatContext {
-        private final Options formatOptions;
-        private final int readBatchSize;
 
-        public FormatContext(Options formatOptions, int readBatchSize) {
-            this.formatOptions = formatOptions;
-            this.readBatchSize = readBatchSize;
+        private final Options options;
+        private final int readBatchSize;
+        private final int writeBatchSize;
+        private final int zstdLevel;
+        @Nullable private final MemorySize blockSize;
+
+        @VisibleForTesting
+        public FormatContext(Options options, int readBatchSize, int writeBatchSize) {
+            this(options, readBatchSize, writeBatchSize, 1, null);
         }
 
-        public Options formatOptions() {
-            return formatOptions;
+        public FormatContext(
+                Options options,
+                int readBatchSize,
+                int writeBatchSize,
+                int zstdLevel,
+                @Nullable MemorySize blockSize) {
+            this.options = options;
+            this.readBatchSize = readBatchSize;
+            this.writeBatchSize = writeBatchSize;
+            this.zstdLevel = zstdLevel;
+            this.blockSize = blockSize;
+        }
+
+        public Options options() {
+            return options;
         }
 
         public int readBatchSize() {
             return readBatchSize;
+        }
+
+        public int writeBatchSize() {
+            return writeBatchSize;
+        }
+
+        public int zstdLevel() {
+            return zstdLevel;
+        }
+
+        @Nullable
+        public MemorySize blockSize() {
+            return blockSize;
         }
     }
 }

@@ -22,24 +22,31 @@ import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.table.Table;
 
+import org.apache.flink.table.annotation.ArgumentHint;
+import org.apache.flink.table.annotation.DataTypeHint;
+import org.apache.flink.table.annotation.ProcedureHint;
 import org.apache.flink.table.procedure.ProcedureContext;
 
 /**
  * Delete tag procedure. Usage:
  *
  * <pre><code>
- *  CALL delete_tag('tableId', 'tagName')
+ *  CALL sys.delete_tag('tableId', 'tagName')
  * </code></pre>
  */
 public class DeleteTagProcedure extends ProcedureBase {
 
     public static final String IDENTIFIER = "delete_tag";
 
-    public String[] call(ProcedureContext procedureContext, String tableId, String tagName)
+    @ProcedureHint(
+            argument = {
+                @ArgumentHint(name = "table", type = @DataTypeHint("STRING")),
+                @ArgumentHint(name = "tag", type = @DataTypeHint("STRING"))
+            })
+    public String[] call(ProcedureContext procedureContext, String tableId, String tagNameStr)
             throws Catalog.TableNotExistException {
         Table table = catalog.getTable(Identifier.fromString(tableId));
-        table.deleteTag(tagName);
-
+        table.deleteTags(tagNameStr);
         return new String[] {"Success"};
     }
 

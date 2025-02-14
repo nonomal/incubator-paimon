@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.sorter;
 
+import org.apache.paimon.compression.CompressOptions;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
@@ -61,7 +62,11 @@ public class SortOperatorTest {
                         rowType,
                         MemorySize.parse("10 mb").getBytes(),
                         (int) MemorySize.parse("16 kb").getBytes(),
-                        128) {};
+                        128,
+                        CompressOptions.defaultOptions(),
+                        1,
+                        MemorySize.MAX_VALUE,
+                        true) {};
 
         OneInputStreamOperatorTestHarness harness = createTestHarness(sortOperator);
         harness.open();
@@ -88,7 +93,7 @@ public class SortOperatorTest {
     }
 
     @Test
-    public void testCloseSortOprator() throws Exception {
+    public void testCloseSortOperator() throws Exception {
         RowType keyRowType =
                 new RowType(
                         Collections.singletonList(
@@ -107,7 +112,11 @@ public class SortOperatorTest {
                         rowType,
                         MemorySize.parse("10 mb").getBytes(),
                         (int) MemorySize.parse("16 kb").getBytes(),
-                        128) {};
+                        128,
+                        CompressOptions.defaultOptions(),
+                        1,
+                        MemorySize.MAX_VALUE,
+                        true) {};
         OneInputStreamOperatorTestHarness harness = createTestHarness(sortOperator);
         harness.open();
         File[] files = harness.getEnvironment().getIOManager().getSpillingDirectories();

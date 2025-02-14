@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,46 +18,69 @@
 
 package org.apache.paimon.table;
 
-import org.apache.paimon.lineage.LineageMeta;
-import org.apache.paimon.metastore.MetastoreClient;
-import org.apache.paimon.operation.Lock;
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.catalog.CatalogLoader;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.catalog.SnapshotCommit;
+import org.apache.paimon.utils.SnapshotManager;
 
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
 
-/**
- * Catalog environment in table which contains log factory, metastore client factory and lineage
- * meta.
- */
+/** Catalog environment in table which contains log factory, metastore client factory. */
 public class CatalogEnvironment implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    private final Lock.Factory lockFactory;
-    @Nullable private final MetastoreClient.Factory metastoreClientFactory;
-    @Nullable private final LineageMeta lineageMeta;
+    @Nullable private final Identifier identifier;
+    @Nullable private final String uuid;
+    @Nullable private final CatalogLoader catalogLoader;
+    @Nullable private final SnapshotCommit.Factory commitFactory;
 
     public CatalogEnvironment(
-            Lock.Factory lockFactory,
-            @Nullable MetastoreClient.Factory metastoreClientFactory,
-            @Nullable LineageMeta lineageMeta) {
-        this.lockFactory = lockFactory;
-        this.metastoreClientFactory = metastoreClientFactory;
-        this.lineageMeta = lineageMeta;
+            @Nullable Identifier identifier,
+            @Nullable String uuid,
+            @Nullable CatalogLoader catalogLoader,
+            @Nullable SnapshotCommit.Factory commitFactory) {
+        this.identifier = identifier;
+        this.uuid = uuid;
+        this.catalogLoader = catalogLoader;
+        this.commitFactory = commitFactory;
     }
 
-    public Lock.Factory lockFactory() {
-        return lockFactory;
-    }
-
-    @Nullable
-    public MetastoreClient.Factory metastoreClientFactory() {
-        return metastoreClientFactory;
+    public static CatalogEnvironment empty() {
+        return new CatalogEnvironment(null, null, null, null);
     }
 
     @Nullable
-    public LineageMeta lineageMeta() {
-        return lineageMeta;
+    public Identifier identifier() {
+        return identifier;
+    }
+
+    @Nullable
+    public String uuid() {
+        return uuid;
+    }
+
+    @Nullable
+    public SnapshotCommit snapshotCommit(SnapshotManager snapshotManager) {
+        if (commitFactory == null) {
+            return null;
+        }
+        return commitFactory.create(identifier, snapshotManager);
+    }
+
+    @Nullable
+    public PartitionHandler partitionHandler() {
+        if (catalogLoader == null) {
+            return null;
+        }
+        return PartitionHandler.create(catalogLoader.load(), identifier);
+    }
+
+    @VisibleForTesting
+    public SnapshotCommit.Factory commitFactory() {
+        return commitFactory;
     }
 }

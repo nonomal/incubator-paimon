@@ -23,14 +23,19 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.index.IndexFileHandler;
-import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.io.DataFilePathFactory;
+import org.apache.paimon.manifest.ExpireFileEntry;
 import org.apache.paimon.manifest.ManifestFile;
 import org.apache.paimon.manifest.ManifestList;
+import org.apache.paimon.stats.StatsFileHandler;
+import org.apache.paimon.utils.DataFilePathFactories;
 import org.apache.paimon.utils.FileStorePathFactory;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -40,7 +45,7 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 /** Delete tag files. */
-public class TagDeletion extends FileDeletionBase {
+public class TagDeletion extends FileDeletionBase<Snapshot> {
 
     private static final Logger LOG = LoggerFactory.getLogger(TagDeletion.class);
 
@@ -49,54 +54,60 @@ public class TagDeletion extends FileDeletionBase {
             FileStorePathFactory pathFactory,
             ManifestFile manifestFile,
             ManifestList manifestList,
-            IndexFileHandler indexFileHandler) {
-        super(fileIO, pathFactory, manifestFile, manifestList, indexFileHandler);
+            IndexFileHandler indexFileHandler,
+            StatsFileHandler statsFileHandler,
+            boolean cleanEmptyDirectories,
+            int deleteFileThreadNum) {
+        super(
+                fileIO,
+                pathFactory,
+                manifestFile,
+                manifestList,
+                indexFileHandler,
+                statsFileHandler,
+                cleanEmptyDirectories,
+                deleteFileThreadNum);
     }
 
     @Override
-    public void cleanUnusedDataFiles(Snapshot taggedSnapshot, Predicate<ManifestEntry> skipper) {
-        cleanUnusedDataFiles(tryReadDataManifests(taggedSnapshot), skipper);
-    }
+    public void cleanUnusedDataFiles(Snapshot taggedSnapshot, Predicate<ExpireFileEntry> skipper) {
+        Collection<ExpireFileEntry> manifestEntries;
+        try {
+            manifestEntries = readMergedDataFiles(taggedSnapshot);
+        } catch (IOException e) {
+            LOG.info("Skip data file clean for the tag of id {}.", taggedSnapshot.id(), e);
+            return;
+        }
 
-    @Override
-    public void cleanUnusedManifests(Snapshot taggedSnapshot, Set<String> skippingSet) {
-        // doesn't clean changelog files because they are handled by SnapshotDeletion
-        cleanUnusedManifests(taggedSnapshot, skippingSet, false);
-    }
-
-    private void cleanUnusedDataFiles(
-            List<String> manifestFileNames, Predicate<ManifestEntry> skipper) {
         Set<Path> dataFileToDelete = new HashSet<>();
-        for (String manifest : manifestFileNames) {
-            List<ManifestEntry> manifestEntries;
-            try {
-                manifestEntries = manifestFile.read(manifest);
-            } catch (Exception e) {
-                // We want to delete the data file, so just ignore the unavailable files
-                LOG.info("Failed to read manifest " + manifest + ". Ignore it.", e);
-                continue;
-            }
-
-            for (ManifestEntry entry : manifestEntries) {
-                if (!skipper.test(entry)) {
-                    Path bucketPath = pathFactory.bucketPath(entry.partition(), entry.bucket());
-                    dataFileToDelete.add(new Path(bucketPath, entry.file().fileName()));
-                    for (String file : entry.file().extraFiles()) {
-                        dataFileToDelete.add(new Path(bucketPath, file));
-                    }
-
-                    recordDeletionBuckets(entry);
+        DataFilePathFactories factories = new DataFilePathFactories(pathFactory);
+        for (ExpireFileEntry entry : manifestEntries) {
+            DataFilePathFactory dataFilePathFactory =
+                    factories.get(entry.partition(), entry.bucket());
+            if (!skipper.test(entry)) {
+                dataFileToDelete.add(dataFilePathFactory.toPath(entry));
+                for (String file : entry.extraFiles()) {
+                    dataFileToDelete.add(dataFilePathFactory.toAlignedPath(file, entry));
                 }
+
+                recordDeletionBuckets(entry);
             }
         }
         deleteFiles(dataFileToDelete, fileIO::deleteQuietly);
     }
 
-    public Predicate<ManifestEntry> dataFileSkipper(Snapshot fromSnapshot) throws Exception {
+    @Override
+    public void cleanUnusedManifests(Snapshot taggedSnapshot, Set<String> skippingSet) {
+        // doesn't clean changelog files because they are handled by SnapshotDeletion
+        cleanUnusedManifests(taggedSnapshot, skippingSet, true, false);
+    }
+
+    public Predicate<ExpireFileEntry> dataFileSkipper(Snapshot fromSnapshot) throws Exception {
         return dataFileSkipper(Collections.singletonList(fromSnapshot));
     }
 
-    public Predicate<ManifestEntry> dataFileSkipper(List<Snapshot> fromSnapshots) throws Exception {
+    public Predicate<ExpireFileEntry> dataFileSkipper(List<Snapshot> fromSnapshots)
+            throws Exception {
         Map<BinaryRow, Map<Integer, Set<String>>> skipped = new HashMap<>();
         for (Snapshot snapshot : fromSnapshots) {
             addMergedDataFiles(skipped, snapshot);

@@ -196,7 +196,7 @@ public class MongoDBSyncDatabaseActionITCase extends MongoDBActionITCaseBase {
                         .withTableConfig(getBasicTableConfig())
                         .withCatalogConfig(
                                 Collections.singletonMap(
-                                        CatalogOptions.METASTORE.key(), "test-case-insensitive"))
+                                        CatalogOptions.CASE_SENSITIVE.key(), "false"))
                         .build();
         runActionWithDefaultEnv(action);
 
@@ -258,6 +258,7 @@ public class MongoDBSyncDatabaseActionITCase extends MongoDBActionITCaseBase {
                         new String[] {"_id", "name", "description", "weight"}),
                 Collections.emptyList(),
                 Collections.singletonList("_id"),
+                Collections.emptyList(),
                 Collections.emptyMap());
 
         // try synchronization

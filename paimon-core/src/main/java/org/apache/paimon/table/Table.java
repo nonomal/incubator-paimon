@@ -18,17 +18,26 @@
 
 package org.apache.paimon.table;
 
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.annotation.Experimental;
 import org.apache.paimon.annotation.Public;
+import org.apache.paimon.manifest.IndexManifestEntry;
+import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.ManifestFileMeta;
+import org.apache.paimon.stats.Statistics;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
 import org.apache.paimon.table.sink.StreamWriteBuilder;
 import org.apache.paimon.table.source.ReadBuilder;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.SimpleFileReader;
 
 import java.io.Serializable;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * A table provides basic abstraction for table type and table scan and table read.
@@ -42,6 +51,19 @@ public interface Table extends Serializable {
 
     /** A name to identify this table. */
     String name();
+
+    /** Full name of the table, default is database.tableName. */
+    default String fullName() {
+        return name();
+    }
+
+    /**
+     * UUID of the table, metastore can provide the true UUID of this table, default is the full
+     * name.
+     */
+    default String uuid() {
+        return fullName();
+    }
 
     /** Returns the row type of this table. */
     RowType rowType();
@@ -58,10 +80,34 @@ public interface Table extends Serializable {
     /** Optional comment of this table. */
     Optional<String> comment();
 
+    /** Optional statistics of this table. */
+    @Experimental
+    Optional<Statistics> statistics();
+
     // ================= Table Operations ====================
 
     /** Copy this table with adding dynamic options. */
     Table copy(Map<String, String> dynamicOptions);
+
+    /** Get the latest snapshot id for this table, or empty if there are no snapshots. */
+    @Experimental
+    OptionalLong latestSnapshotId();
+
+    /** Get the {@link Snapshot} from snapshot id. */
+    @Experimental
+    Snapshot snapshot(long snapshotId);
+
+    /** Reader to read manifest file meta from manifest list file. */
+    @Experimental
+    SimpleFileReader<ManifestFileMeta> manifestListReader();
+
+    /** Reader to read manifest entry from manifest file. */
+    @Experimental
+    SimpleFileReader<ManifestEntry> manifestFileReader();
+
+    /** Reader to read index manifest entry from index manifest file. */
+    @Experimental
+    SimpleFileReader<IndexManifestEntry> indexManifestFileReader();
 
     /** Rollback table's state to a specific snapshot. */
     @Experimental
@@ -71,13 +117,71 @@ public interface Table extends Serializable {
     @Experimental
     void createTag(String tagName, long fromSnapshotId);
 
+    @Experimental
+    void createTag(String tagName, long fromSnapshotId, Duration timeRetained);
+
+    /** Create a tag from latest snapshot. */
+    @Experimental
+    void createTag(String tagName);
+
+    @Experimental
+    void createTag(String tagName, Duration timeRetained);
+
+    @Experimental
+    void renameTag(String tagName, String targetTagName);
+
+    /** Replace a tag with new snapshot id and new time retained. */
+    @Experimental
+    void replaceTag(String tagName, Long fromSnapshotId, Duration timeRetained);
+
     /** Delete a tag by name. */
     @Experimental
     void deleteTag(String tagName);
 
+    /** Delete tags, tags are separated by commas. */
+    @Experimental
+    default void deleteTags(String tagStr) {
+        String[] tagNames =
+                Arrays.stream(tagStr.split(",")).map(String::trim).toArray(String[]::new);
+        for (String tagName : tagNames) {
+            deleteTag(tagName);
+        }
+    }
+
     /** Rollback table's state to a specific tag. */
     @Experimental
     void rollbackTo(String tagName);
+
+    /** Create an empty branch. */
+    @Experimental
+    void createBranch(String branchName);
+
+    /** Create a branch from given tag. */
+    @Experimental
+    void createBranch(String branchName, String tagName);
+
+    /** Delete a branch by branchName. */
+    @Experimental
+    void deleteBranch(String branchName);
+
+    /** Delete branches, branches are separated by commas. */
+    @Experimental
+    default void deleteBranches(String branchNames) {
+        for (String branch : branchNames.split(",")) {
+            deleteBranch(branch);
+        }
+    }
+
+    /** Merge a branch to main branch. */
+    @Experimental
+    void fastForward(String branchName);
+
+    /** Manually expire snapshots, parameters can be controlled independently of table options. */
+    @Experimental
+    ExpireSnapshots newExpireSnapshots();
+
+    @Experimental
+    ExpireSnapshots newExpireChangelog();
 
     // =============== Read & Write Operations ==================
 

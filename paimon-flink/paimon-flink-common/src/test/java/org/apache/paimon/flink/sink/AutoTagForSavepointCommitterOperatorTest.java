@@ -32,10 +32,11 @@ import org.apache.flink.runtime.checkpoint.CheckpointType;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.runtime.checkpoint.SavepointType;
 import org.apache.flink.runtime.state.StateInitializationContext;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -81,16 +82,17 @@ public class AutoTagForSavepointCommitterOperatorTest extends CommitterOperatorT
 
         // notify checkpoint success and tag for savepoint-2
         testHarness.notifyOfCompletedCheckpoint(checkpointId);
+        testHarness.close();
         assertThat(table.snapshotManager().snapshotCount()).isEqualTo(3);
         assertThat(table.tagManager().tagCount()).isEqualTo(1);
 
         Snapshot snapshot = table.snapshotManager().snapshot(2);
         assertThat(snapshot).isNotNull();
         assertThat(snapshot.id()).isEqualTo(2);
-        Map<Snapshot, String> tags = table.tagManager().tags();
+        Map<Snapshot, List<String>> tags = table.tagManager().tags();
         assertThat(tags).containsOnlyKeys(snapshot);
         assertThat(tags.get(snapshot))
-                .isEqualTo(AutoTagForSavepointCommitterOperator.SAVEPOINT_TAG_PREFIX + 2);
+                .containsOnly(AutoTagForSavepointCommitterOperator.SAVEPOINT_TAG_PREFIX + 2);
     }
 
     @Test
@@ -116,6 +118,7 @@ public class AutoTagForSavepointCommitterOperatorTest extends CommitterOperatorT
                         .getJobManagerOwnedState();
         assertThat(table.snapshotManager().latestSnapshot()).isNull();
         assertThat(table.tagManager().tagCount()).isEqualTo(0);
+        testHarness.close();
 
         testHarness = createRecoverableTestHarness(table);
         try {
@@ -131,14 +134,16 @@ public class AutoTagForSavepointCommitterOperatorTest extends CommitterOperatorT
                                     + "By restarting the job we hope that "
                                     + "writers can start writing based on these new commits.");
         }
+        testHarness.close();
+
         Snapshot snapshot = table.snapshotManager().latestSnapshot();
         assertThat(snapshot).isNotNull();
         assertThat(snapshot.id()).isEqualTo(checkpointId);
 
-        Map<Snapshot, String> tags = table.tagManager().tags();
+        Map<Snapshot, List<String>> tags = table.tagManager().tags();
         assertThat(tags).containsOnlyKeys(snapshot);
         assertThat(tags.get(snapshot))
-                .isEqualTo(
+                .containsOnly(
                         AutoTagForSavepointCommitterOperator.SAVEPOINT_TAG_PREFIX + checkpointId);
     }
 
@@ -170,6 +175,8 @@ public class AutoTagForSavepointCommitterOperatorTest extends CommitterOperatorT
 
         // abort savepoint 1
         testHarness.getOneInputOperator().notifyCheckpointAborted(1);
+        testHarness.close();
+
         assertThat(table.snapshotManager().snapshotCount()).isEqualTo(2);
         assertThat(table.tagManager().tagCount()).isEqualTo(0);
     }
@@ -191,30 +198,37 @@ public class AutoTagForSavepointCommitterOperatorTest extends CommitterOperatorT
     }
 
     @Override
-    protected OneInputStreamOperator<Committable, Committable> createCommitterOperator(
-            FileStoreTable table,
-            String commitUser,
-            CommittableStateManager<ManifestCommittable> committableStateManager) {
-        return new AutoTagForSavepointCommitterOperator<>(
-                (CommitterOperator<Committable, ManifestCommittable>)
-                        super.createCommitterOperator(table, commitUser, committableStateManager),
+    protected OneInputStreamOperatorFactory<Committable, Committable>
+            createCommitterOperatorFactory(
+                    FileStoreTable table,
+                    String commitUser,
+                    CommittableStateManager<ManifestCommittable> committableStateManager) {
+        return new AutoTagForSavepointCommitterOperatorFactory<>(
+                (CommitterOperatorFactory<Committable, ManifestCommittable>)
+                        super.createCommitterOperatorFactory(
+                                table, commitUser, committableStateManager),
                 table::snapshotManager,
                 table::tagManager,
-                () -> table.store().newTagDeletion());
+                () -> table.store().newTagDeletion(),
+                () -> table.store().createTagCallbacks(),
+                table.store().options().tagDefaultTimeRetained());
     }
 
     @Override
-    protected OneInputStreamOperator<Committable, Committable> createCommitterOperator(
-            FileStoreTable table,
-            String commitUser,
-            CommittableStateManager<ManifestCommittable> committableStateManager,
-            ThrowingConsumer<StateInitializationContext, Exception> initializeFunction) {
-        return new AutoTagForSavepointCommitterOperator<>(
-                (CommitterOperator<Committable, ManifestCommittable>)
-                        super.createCommitterOperator(
+    protected OneInputStreamOperatorFactory<Committable, Committable>
+            createCommitterOperatorFactory(
+                    FileStoreTable table,
+                    String commitUser,
+                    CommittableStateManager<ManifestCommittable> committableStateManager,
+                    ThrowingConsumer<StateInitializationContext, Exception> initializeFunction) {
+        return new AutoTagForSavepointCommitterOperatorFactory<>(
+                (CommitterOperatorFactory<Committable, ManifestCommittable>)
+                        super.createCommitterOperatorFactory(
                                 table, commitUser, committableStateManager, initializeFunction),
                 table::snapshotManager,
                 table::tagManager,
-                () -> table.store().newTagDeletion());
+                () -> table.store().newTagDeletion(),
+                () -> table.store().createTagCallbacks(),
+                table.store().options().tagDefaultTimeRetained());
     }
 }

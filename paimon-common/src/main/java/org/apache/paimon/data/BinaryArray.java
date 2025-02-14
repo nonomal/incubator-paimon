@@ -19,6 +19,7 @@
 package org.apache.paimon.data;
 
 import org.apache.paimon.annotation.Public;
+import org.apache.paimon.data.variant.Variant;
 import org.apache.paimon.memory.MemorySegment;
 import org.apache.paimon.memory.MemorySegmentUtils;
 import org.apache.paimon.types.DataType;
@@ -83,6 +84,7 @@ public final class BinaryArray extends BinarySection implements InternalArray, D
             case MULTISET:
             case MAP:
             case ROW:
+            case VARIANT:
                 // long and double are 8 bytes;
                 // otherwise it stores the length and offset of the variable-length part for types
                 // such as is string, map, etc.
@@ -232,6 +234,14 @@ public final class BinaryArray extends BinarySection implements InternalArray, D
         int fieldOffset = getElementOffset(pos, 8);
         final long offsetAndSize = MemorySegmentUtils.getLong(segments, fieldOffset);
         return MemorySegmentUtils.readBinary(segments, offset, fieldOffset, offsetAndSize);
+    }
+
+    @Override
+    public Variant getVariant(int pos) {
+        assertIndexIsValid(pos);
+        int fieldOffset = getElementOffset(pos, 8);
+        final long offsetAndLen = MemorySegmentUtils.getLong(segments, fieldOffset);
+        return MemorySegmentUtils.readVariant(segments, offset, offsetAndLen);
     }
 
     @Override
@@ -566,5 +576,38 @@ public final class BinaryArray extends BinarySection implements InternalArray, D
         BinaryArray result = new BinaryArray();
         result.pointTo(MemorySegment.wrap(data), 0, (int) totalSize);
         return result;
+    }
+
+    public static BinaryArray fromLongArray(Long[] arr) {
+        BinaryArray array = new BinaryArray();
+        BinaryArrayWriter writer = new BinaryArrayWriter(array, arr.length, 8);
+        for (int i = 0; i < arr.length; i++) {
+            Long v = arr[i];
+            if (v == null) {
+                writer.setNullLong(i);
+            } else {
+                writer.writeLong(i, v);
+            }
+        }
+        writer.complete();
+        return array;
+    }
+
+    public static BinaryArray fromLongArray(InternalArray arr) {
+        if (arr instanceof BinaryArray) {
+            return (BinaryArray) arr;
+        }
+
+        BinaryArray array = new BinaryArray();
+        BinaryArrayWriter writer = new BinaryArrayWriter(array, arr.size(), 8);
+        for (int i = 0; i < arr.size(); i++) {
+            if (arr.isNullAt(i)) {
+                writer.setNullLong(i);
+            } else {
+                writer.writeLong(i, arr.getLong(i));
+            }
+        }
+        writer.complete();
+        return array;
     }
 }

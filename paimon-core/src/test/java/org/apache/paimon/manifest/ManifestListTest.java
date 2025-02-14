@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -104,7 +104,15 @@ public class ManifestListTest {
                         path,
                         TestKeyValueGenerator.DEFAULT_PART_TYPE,
                         "default",
-                        CoreOptions.FILE_FORMAT.defaultValue().toString());
-        return new ManifestList.Factory(FileIOFinder.find(path), avro, pathFactory, null).create();
+                        CoreOptions.FILE_FORMAT.defaultValue().toString(),
+                        CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                        CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                        CoreOptions.PARTITION_GENERATE_LEGCY_NAME.defaultValue(),
+                        CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                        CoreOptions.FILE_COMPRESSION.defaultValue(),
+                        null,
+                        null);
+        return new ManifestList.Factory(FileIOFinder.find(path), avro, "zstd", pathFactory, null)
+                .create();
     }
 }

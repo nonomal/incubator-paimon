@@ -18,12 +18,10 @@
 
 package org.apache.paimon.table;
 
-import org.apache.paimon.CoreOptions;
-import org.apache.paimon.WriteMode;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
-import org.apache.paimon.stats.BinaryTableStats;
+import org.apache.paimon.stats.SimpleStats;
 
 import org.junit.jupiter.api.BeforeEach;
 
@@ -35,7 +33,6 @@ public class AppendOnlyTableColumnTypeFileMetaTest extends ColumnTypeFileMetaTes
     @BeforeEach
     public void before() throws Exception {
         super.before();
-        tableConfig.set(CoreOptions.WRITE_MODE, WriteMode.APPEND_ONLY);
     }
 
     @Override
@@ -43,14 +40,14 @@ public class AppendOnlyTableColumnTypeFileMetaTest extends ColumnTypeFileMetaTes
         SchemaManager schemaManager = new TestingSchemaManager(tablePath, tableSchemas);
         return new AppendOnlyFileStoreTable(fileIO, tablePath, schemaManager.latest().get()) {
             @Override
-            protected SchemaManager schemaManager() {
+            public SchemaManager schemaManager() {
                 return schemaManager;
             }
         };
     }
 
     @Override
-    protected BinaryTableStats getTableValueStats(DataFileMeta fileMeta) {
+    protected SimpleStats getTableValueStats(DataFileMeta fileMeta) {
         return fileMeta.valueStats();
     }
 }

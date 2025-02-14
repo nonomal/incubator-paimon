@@ -18,28 +18,37 @@
 
 package org.apache.paimon.flink.action;
 
+import javax.annotation.Nullable;
+
+import java.time.Duration;
 import java.util.Map;
 
 /** Create tag action for Flink. */
 public class CreateTagAction extends TableActionBase {
 
     private final String tagName;
-    private final long snapshotId;
+    private final @Nullable Long snapshotId;
+    private final @Nullable Duration timeRetained;
 
     public CreateTagAction(
-            String warehouse,
             String databaseName,
             String tableName,
             Map<String, String> catalogConfig,
             String tagName,
-            long snapshotId) {
-        super(warehouse, databaseName, tableName, catalogConfig);
+            @Nullable Long snapshotId,
+            @Nullable Duration timeRetained) {
+        super(databaseName, tableName, catalogConfig);
         this.tagName = tagName;
+        this.timeRetained = timeRetained;
         this.snapshotId = snapshotId;
     }
 
     @Override
     public void run() throws Exception {
-        table.createTag(tagName, snapshotId);
+        if (snapshotId == null) {
+            table.createTag(tagName, timeRetained);
+        } else {
+            table.createTag(tagName, snapshotId, timeRetained);
+        }
     }
 }

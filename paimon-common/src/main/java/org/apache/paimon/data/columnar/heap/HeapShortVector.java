@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -40,6 +40,13 @@ public class HeapShortVector extends AbstractHeapVector implements WritableShort
     }
 
     @Override
+    void reserveForHeapVector(int newCapacity) {
+        if (vector.length < newCapacity) {
+            vector = Arrays.copyOf(vector, newCapacity);
+        }
+    }
+
+    @Override
     public short getShort(int i) {
         if (dictionary == null) {
             return vector[i];
@@ -56,5 +63,15 @@ public class HeapShortVector extends AbstractHeapVector implements WritableShort
     @Override
     public void fill(short value) {
         Arrays.fill(vector, value);
+    }
+
+    @Override
+    public void reset() {
+        super.reset();
+        if (vector.length != capacity) {
+            vector = new short[capacity];
+        } else {
+            Arrays.fill(vector, (short) 0);
+        }
     }
 }

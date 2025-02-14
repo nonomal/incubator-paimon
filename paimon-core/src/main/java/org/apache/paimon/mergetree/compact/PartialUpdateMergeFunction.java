@@ -22,27 +22,41 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.KeyValue;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.mergetree.compact.aggregate.FieldAggregator;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldAggregatorFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldLastNonNullValueAggFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldPrimaryKeyAggFactory;
 import org.apache.paimon.options.Options;
-import org.apache.paimon.table.sink.SequenceGenerator;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.FieldsComparator;
+import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.Projection;
+import org.apache.paimon.utils.UserDefinedSeqComparator;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static org.apache.paimon.CoreOptions.FIELDS_PREFIX;
+import static org.apache.paimon.CoreOptions.FIELDS_SEPARATOR;
+import static org.apache.paimon.CoreOptions.PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE;
+import static org.apache.paimon.CoreOptions.PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP;
 import static org.apache.paimon.utils.InternalRowUtils.createFieldGetters;
+import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /**
  * A {@link MergeFunction} where key is primary key (unique) and value is the partial record, update
@@ -54,59 +68,82 @@ public class PartialUpdateMergeFunction implements MergeFunction<KeyValue> {
 
     private final InternalRow.FieldGetter[] getters;
     private final boolean ignoreDelete;
-    private final Map<Integer, SequenceGenerator> fieldSequences;
+    private final Map<Integer, FieldsComparator> fieldSeqComparators;
+    private final boolean fieldSequenceEnabled;
+    private final Map<Integer, FieldAggregator> fieldAggregators;
+    private final boolean removeRecordOnDelete;
+    private final Set<Integer> sequenceGroupPartialDelete;
 
     private InternalRow currentKey;
     private long latestSequenceNumber;
-    private boolean isEmpty;
     private GenericRow row;
     private KeyValue reused;
+    private boolean currentDeleteRow;
 
     protected PartialUpdateMergeFunction(
             InternalRow.FieldGetter[] getters,
             boolean ignoreDelete,
-            Map<Integer, SequenceGenerator> fieldSequences) {
+            Map<Integer, FieldsComparator> fieldSeqComparators,
+            Map<Integer, FieldAggregator> fieldAggregators,
+            boolean fieldSequenceEnabled,
+            boolean removeRecordOnDelete,
+            Set<Integer> sequenceGroupPartialDelete) {
         this.getters = getters;
         this.ignoreDelete = ignoreDelete;
-        this.fieldSequences = fieldSequences;
+        this.fieldSeqComparators = fieldSeqComparators;
+        this.fieldAggregators = fieldAggregators;
+        this.fieldSequenceEnabled = fieldSequenceEnabled;
+        this.removeRecordOnDelete = removeRecordOnDelete;
+        this.sequenceGroupPartialDelete = sequenceGroupPartialDelete;
     }
 
     @Override
     public void reset() {
         this.currentKey = null;
         this.row = new GenericRow(getters.length);
-        this.isEmpty = true;
+        fieldAggregators.values().forEach(FieldAggregator::reset);
     }
 
     @Override
     public void add(KeyValue kv) {
         // refresh key object to avoid reference overwritten
         currentKey = kv.key();
+        currentDeleteRow = false;
 
-        // ignore delete?
         if (kv.valueKind().isRetract()) {
+            // In 0.7- versions, the delete records might be written into data file even when
+            // ignore-delete configured, so ignoreDelete still needs to be checked
             if (ignoreDelete) {
                 return;
             }
 
-            if (fieldSequences.size() > 1) {
+            if (fieldSequenceEnabled) {
                 retractWithSequenceGroup(kv);
+                return;
+            }
+
+            if (removeRecordOnDelete) {
+                if (kv.valueKind() == RowKind.DELETE) {
+                    currentDeleteRow = true;
+                    row = new GenericRow(getters.length);
+                }
                 return;
             }
 
             String msg =
                     String.join(
+                            "\n",
                             "By default, Partial update can not accept delete records,"
                                     + " you can choose one of the following solutions:",
-                            "1. Configure 'partial-update.ignore-delete' to ignore delete records.",
-                            "2. Configure 'sequence-group's to retract partial columns.");
+                            "1. Configure 'ignore-delete' to ignore delete records.",
+                            "2. Configure 'partial-update.remove-record-on-delete' to remove the whole row when receiving delete records.",
+                            "3. Configure 'sequence-group's to retract partial columns.");
 
             throw new IllegalArgumentException(msg);
         }
 
         latestSequenceNumber = kv.sequenceNumber();
-        isEmpty = false;
-        if (fieldSequences.isEmpty()) {
+        if (fieldSeqComparators.isEmpty()) {
             updateNonNullFields(kv);
         } else {
             updateWithSequenceGroup(kv);
@@ -125,59 +162,120 @@ public class PartialUpdateMergeFunction implements MergeFunction<KeyValue> {
     private void updateWithSequenceGroup(KeyValue kv) {
         for (int i = 0; i < getters.length; i++) {
             Object field = getters[i].getFieldOrNull(kv.value());
-            SequenceGenerator sequenceGen = fieldSequences.get(i);
-            if (sequenceGen == null) {
-                if (field != null) {
+            FieldsComparator seqComparator = fieldSeqComparators.get(i);
+            FieldAggregator aggregator = fieldAggregators.get(i);
+            Object accumulator = getters[i].getFieldOrNull(row);
+            if (seqComparator == null) {
+                if (aggregator != null) {
+                    row.setField(i, aggregator.agg(accumulator, field));
+                } else if (field != null) {
                     row.setField(i, field);
                 }
             } else {
-                Long currentSeq = sequenceGen.generateNullable(kv.value());
-                if (currentSeq != null) {
-                    Long previousSeq = sequenceGen.generateNullable(row);
-                    if (previousSeq == null || currentSeq >= previousSeq) {
-                        row.setField(i, field);
+                if (isEmptySequenceGroup(kv, seqComparator)) {
+                    // skip null sequence group
+                    continue;
+                }
+
+                if (seqComparator.compare(kv.value(), row) >= 0) {
+                    int index = i;
+
+                    // Multiple sequence fields should be updated at once.
+                    if (Arrays.stream(seqComparator.compareFields())
+                            .anyMatch(seqIndex -> seqIndex == index)) {
+                        for (int fieldIndex : seqComparator.compareFields()) {
+                            row.setField(
+                                    fieldIndex, getters[fieldIndex].getFieldOrNull(kv.value()));
+                        }
+                        continue;
                     }
+                    row.setField(
+                            i, aggregator == null ? field : aggregator.agg(accumulator, field));
+                } else if (aggregator != null) {
+                    row.setField(i, aggregator.aggReversed(accumulator, field));
                 }
             }
         }
     }
 
+    private boolean isEmptySequenceGroup(KeyValue kv, FieldsComparator comparator) {
+        for (int fieldIndex : comparator.compareFields()) {
+            if (getters[fieldIndex].getFieldOrNull(kv.value()) != null) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private void retractWithSequenceGroup(KeyValue kv) {
+        Set<Integer> updatedSequenceFields = new HashSet<>();
+
         for (int i = 0; i < getters.length; i++) {
-            SequenceGenerator sequenceGen = fieldSequences.get(i);
-            if (sequenceGen != null) {
-                Long currentSeq = sequenceGen.generateNullable(kv.value());
-                if (currentSeq != null) {
-                    Long previousSeq = sequenceGen.generateNullable(row);
-                    if (previousSeq == null || currentSeq >= previousSeq) {
-                        if (sequenceGen.index() == i) {
-                            // update sequence field
-                            row.setField(i, getters[i].getFieldOrNull(kv.value()));
-                        } else {
-                            // retract normal field
+            FieldsComparator seqComparator = fieldSeqComparators.get(i);
+            if (seqComparator != null) {
+                FieldAggregator aggregator = fieldAggregators.get(i);
+                if (isEmptySequenceGroup(kv, seqComparator)) {
+                    // skip null sequence group
+                    continue;
+                }
+
+                if (seqComparator.compare(kv.value(), row) >= 0) {
+                    int index = i;
+
+                    // Multiple sequence fields should be updated at once.
+                    if (Arrays.stream(seqComparator.compareFields())
+                            .anyMatch(field -> field == index)) {
+                        for (int field : seqComparator.compareFields()) {
+                            if (!updatedSequenceFields.contains(field)) {
+                                if (kv.valueKind() == RowKind.DELETE
+                                        && sequenceGroupPartialDelete.contains(field)) {
+                                    currentDeleteRow = true;
+                                    row = new GenericRow(getters.length);
+                                    return;
+                                } else {
+                                    row.setField(field, getters[field].getFieldOrNull(kv.value()));
+                                    updatedSequenceFields.add(field);
+                                }
+                            }
+                        }
+                    } else {
+                        // retract normal field
+                        if (aggregator == null) {
                             row.setField(i, null);
+                        } else {
+                            // retract agg field
+                            Object accumulator = getters[i].getFieldOrNull(row);
+                            row.setField(
+                                    i,
+                                    aggregator.retract(
+                                            accumulator, getters[i].getFieldOrNull(kv.value())));
                         }
                     }
+                } else if (aggregator != null) {
+                    // retract agg field for old sequence
+                    Object accumulator = getters[i].getFieldOrNull(row);
+                    row.setField(
+                            i,
+                            aggregator.retract(accumulator, getters[i].getFieldOrNull(kv.value())));
                 }
             }
         }
     }
 
     @Override
-    @Nullable
     public KeyValue getResult() {
-        if (isEmpty) {
-            return null;
-        }
-
         if (reused == null) {
             reused = new KeyValue();
         }
-        return reused.replace(currentKey, latestSequenceNumber, RowKind.INSERT, row);
+
+        RowKind rowKind = currentDeleteRow ? RowKind.DELETE : RowKind.INSERT;
+        return reused.replace(currentKey, latestSequenceNumber, rowKind, row);
     }
 
-    public static MergeFunctionFactory<KeyValue> factory(Options options, RowType rowType) {
-        return new Factory(options, rowType);
+    public static MergeFunctionFactory<KeyValue> factory(
+            Options options, RowType rowType, List<String> primaryKeys) {
+        return new Factory(options, rowType, primaryKeys);
     }
 
     private static class Factory implements MergeFunctionFactory<KeyValue> {
@@ -185,94 +283,189 @@ public class PartialUpdateMergeFunction implements MergeFunction<KeyValue> {
         private static final long serialVersionUID = 1L;
 
         private final boolean ignoreDelete;
-        private final List<DataType> tableTypes;
-        private final Map<Integer, SequenceGenerator> fieldSequences;
+        private final RowType rowType;
 
-        private Factory(Options options, RowType rowType) {
-            this.ignoreDelete = options.get(CoreOptions.PARTIAL_UPDATE_IGNORE_DELETE);
+        private final List<DataType> tableTypes;
+
+        private final Map<Integer, Supplier<FieldsComparator>> fieldSeqComparators;
+
+        private final Map<Integer, Supplier<FieldAggregator>> fieldAggregators;
+
+        private final boolean removeRecordOnDelete;
+
+        private final String removeRecordOnSequenceGroup;
+
+        private Set<Integer> sequenceGroupPartialDelete;
+
+        private Factory(Options options, RowType rowType, List<String> primaryKeys) {
+            this.ignoreDelete = options.get(CoreOptions.IGNORE_DELETE);
+            this.rowType = rowType;
             this.tableTypes = rowType.getFieldTypes();
+            this.removeRecordOnSequenceGroup =
+                    options.get(PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP);
+            this.sequenceGroupPartialDelete = new HashSet<>();
 
             List<String> fieldNames = rowType.getFieldNames();
-            this.fieldSequences = new HashMap<>();
+            this.fieldSeqComparators = new HashMap<>();
+            Map<String, Integer> sequenceGroupMap = new HashMap<>();
+            List<String> allSequenceFields = new ArrayList<>();
             for (Map.Entry<String, String> entry : options.toMap().entrySet()) {
                 String k = entry.getKey();
                 String v = entry.getValue();
                 if (k.startsWith(FIELDS_PREFIX) && k.endsWith(SEQUENCE_GROUP)) {
-                    String sequenceFieldName =
-                            k.substring(
-                                    FIELDS_PREFIX.length() + 1,
-                                    k.length() - SEQUENCE_GROUP.length() - 1);
-                    SequenceGenerator sequenceGen =
-                            new SequenceGenerator(sequenceFieldName, rowType);
-                    Arrays.stream(v.split(","))
+                    List<String> sequenceFields =
+                            Arrays.stream(
+                                            k.substring(
+                                                            FIELDS_PREFIX.length() + 1,
+                                                            k.length()
+                                                                    - SEQUENCE_GROUP.length()
+                                                                    - 1)
+                                                    .split(FIELDS_SEPARATOR))
+                                    .map(fieldName -> validateFieldName(fieldName, fieldNames))
+                                    .collect(Collectors.toList());
+                    allSequenceFields.addAll(sequenceFields);
+
+                    Supplier<FieldsComparator> userDefinedSeqComparator =
+                            () -> UserDefinedSeqComparator.create(rowType, sequenceFields, true);
+                    Arrays.stream(v.split(FIELDS_SEPARATOR))
                             .map(
-                                    fieldName -> {
-                                        int field = fieldNames.indexOf(fieldName);
-                                        if (field == -1) {
-                                            throw new IllegalArgumentException(
-                                                    String.format(
-                                                            "Field %s can not be found in table schema",
-                                                            fieldName));
-                                        }
-                                        return field;
-                                    })
+                                    fieldName ->
+                                            fieldNames.indexOf(
+                                                    validateFieldName(fieldName, fieldNames)))
                             .forEach(
                                     field -> {
-                                        if (fieldSequences.containsKey(field)) {
+                                        if (fieldSeqComparators.containsKey(field)) {
                                             throw new IllegalArgumentException(
                                                     String.format(
                                                             "Field %s is defined repeatedly by multiple groups: %s",
                                                             fieldNames.get(field), k));
                                         }
-                                        fieldSequences.put(field, sequenceGen);
+                                        fieldSeqComparators.put(field, userDefinedSeqComparator);
                                     });
 
                     // add self
-                    fieldSequences.put(sequenceGen.index(), sequenceGen);
+                    sequenceFields.forEach(
+                            fieldName -> {
+                                int index = fieldNames.indexOf(fieldName);
+                                fieldSeqComparators.put(index, userDefinedSeqComparator);
+                                sequenceGroupMap.put(fieldName, index);
+                            });
                 }
+            }
+            this.fieldAggregators =
+                    createFieldAggregators(
+                            rowType, primaryKeys, allSequenceFields, new CoreOptions(options));
+
+            removeRecordOnDelete = options.get(PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE);
+
+            Preconditions.checkState(
+                    !(removeRecordOnDelete && ignoreDelete),
+                    String.format(
+                            "%s and %s have conflicting behavior so should not be enabled at the same time.",
+                            CoreOptions.IGNORE_DELETE, PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE));
+            Preconditions.checkState(
+                    !removeRecordOnDelete || fieldSeqComparators.isEmpty(),
+                    String.format(
+                            "sequence group and %s have conflicting behavior so should not be enabled at the same time.",
+                            PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE));
+
+            if (removeRecordOnSequenceGroup != null) {
+                String[] sequenceGroupArr = removeRecordOnSequenceGroup.split(FIELDS_SEPARATOR);
+                Preconditions.checkState(
+                        sequenceGroupMap.keySet().containsAll(Arrays.asList(sequenceGroupArr)),
+                        String.format(
+                                "field '%s' defined in '%s' option must be part of sequence groups",
+                                removeRecordOnSequenceGroup,
+                                PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP.key()));
+                sequenceGroupPartialDelete =
+                        Arrays.stream(sequenceGroupArr)
+                                .filter(sequenceGroupMap::containsKey)
+                                .map(sequenceGroupMap::get)
+                                .collect(Collectors.toSet());
             }
         }
 
         @Override
         public MergeFunction<KeyValue> create(@Nullable int[][] projection) {
             if (projection != null) {
-                Map<Integer, SequenceGenerator> projectedSequences = new HashMap<>();
+                Map<Integer, FieldsComparator> projectedSeqComparators = new HashMap<>();
+                Map<Integer, FieldAggregator> projectedAggregators = new HashMap<>();
                 int[] projects = Projection.of(projection).toTopLevelIndexes();
                 Map<Integer, Integer> indexMap = new HashMap<>();
+                List<DataField> dataFields = rowType.getFields();
+                List<DataType> newDataTypes = new ArrayList<>();
+
                 for (int i = 0; i < projects.length; i++) {
                     indexMap.put(projects[i], i);
+                    newDataTypes.add(dataFields.get(projects[i]).type());
                 }
-                fieldSequences.forEach(
-                        (field, sequence) -> {
+                RowType newRowType = RowType.builder().fields(newDataTypes).build();
+
+                fieldSeqComparators.forEach(
+                        (field, comparatorSupplier) -> {
+                            FieldsComparator comparator = comparatorSupplier.get();
                             int newField = indexMap.getOrDefault(field, -1);
                             if (newField != -1) {
-                                int newSequenceId = indexMap.getOrDefault(sequence.index(), -1);
-                                if (newSequenceId == -1) {
-                                    throw new RuntimeException(
-                                            String.format(
-                                                    "Can not find new sequence field for new field. new field index is %s",
-                                                    newField));
-                                } else {
-                                    projectedSequences.put(
-                                            newField,
-                                            new SequenceGenerator(
-                                                    newSequenceId, sequence.fieldType()));
-                                }
+                                int[] newSequenceFields =
+                                        Arrays.stream(comparator.compareFields())
+                                                .map(
+                                                        index -> {
+                                                            int newIndex =
+                                                                    indexMap.getOrDefault(
+                                                                            index, -1);
+                                                            if (newIndex == -1) {
+                                                                throw new RuntimeException(
+                                                                        String.format(
+                                                                                "Can not find new sequence field "
+                                                                                        + "for new field. new field "
+                                                                                        + "index is %s",
+                                                                                newField));
+                                                            } else {
+                                                                return newIndex;
+                                                            }
+                                                        })
+                                                .toArray();
+                                projectedSeqComparators.put(
+                                        newField,
+                                        UserDefinedSeqComparator.create(
+                                                newRowType, newSequenceFields, true));
                             }
                         });
+                for (int i = 0; i < projects.length; i++) {
+                    if (fieldAggregators.containsKey(projects[i])) {
+                        projectedAggregators.put(i, fieldAggregators.get(projects[i]).get());
+                    }
+                }
+
                 return new PartialUpdateMergeFunction(
                         createFieldGetters(Projection.of(projection).project(tableTypes)),
                         ignoreDelete,
-                        projectedSequences);
+                        projectedSeqComparators,
+                        projectedAggregators,
+                        !fieldSeqComparators.isEmpty(),
+                        removeRecordOnDelete,
+                        sequenceGroupPartialDelete);
             } else {
+                Map<Integer, FieldsComparator> fieldSeqComparators = new HashMap<>();
+                this.fieldSeqComparators.forEach(
+                        (f, supplier) -> fieldSeqComparators.put(f, supplier.get()));
+                Map<Integer, FieldAggregator> fieldAggregators = new HashMap<>();
+                this.fieldAggregators.forEach(
+                        (f, supplier) -> fieldAggregators.put(f, supplier.get()));
                 return new PartialUpdateMergeFunction(
-                        createFieldGetters(tableTypes), ignoreDelete, fieldSequences);
+                        createFieldGetters(tableTypes),
+                        ignoreDelete,
+                        fieldSeqComparators,
+                        fieldAggregators,
+                        !fieldSeqComparators.isEmpty(),
+                        removeRecordOnDelete,
+                        sequenceGroupPartialDelete);
             }
         }
 
         @Override
         public AdjustedProjection adjustProjection(@Nullable int[][] projection) {
-            if (fieldSequences.isEmpty()) {
+            if (fieldSeqComparators.isEmpty()) {
                 return new AdjustedProjection(projection, null);
             }
 
@@ -283,9 +476,16 @@ public class PartialUpdateMergeFunction implements MergeFunction<KeyValue> {
             int[] topProjects = Projection.of(projection).toTopLevelIndexes();
             Set<Integer> indexSet = Arrays.stream(topProjects).boxed().collect(Collectors.toSet());
             for (int index : topProjects) {
-                SequenceGenerator generator = fieldSequences.get(index);
-                if (generator != null && !indexSet.contains(generator.index())) {
-                    extraFields.add(generator.index());
+                Supplier<FieldsComparator> comparatorSupplier = fieldSeqComparators.get(index);
+                if (comparatorSupplier == null) {
+                    continue;
+                }
+
+                FieldsComparator comparator = comparatorSupplier.get();
+                for (int field : comparator.compareFields()) {
+                    if (!indexSet.contains(field)) {
+                        extraFields.add(field);
+                    }
                 }
             }
 
@@ -294,11 +494,82 @@ public class PartialUpdateMergeFunction implements MergeFunction<KeyValue> {
                             .mapToInt(Integer::intValue)
                             .toArray();
 
-            int[][] pushdown = Projection.of(allProjects).toNestedIndexes();
+            int[][] pushDown = Projection.of(allProjects).toNestedIndexes();
             int[][] outer =
                     Projection.of(IntStream.range(0, topProjects.length).toArray())
                             .toNestedIndexes();
-            return new AdjustedProjection(pushdown, outer);
+            return new AdjustedProjection(pushDown, outer);
+        }
+
+        private String validateFieldName(String fieldName, List<String> fieldNames) {
+            int field = fieldNames.indexOf(fieldName);
+            if (field == -1) {
+                throw new IllegalArgumentException(
+                        String.format("Field %s can not be found in table schema", fieldName));
+            }
+
+            return fieldName;
+        }
+
+        /**
+         * Creating aggregation function for the columns.
+         *
+         * @return The aggregators for each column.
+         */
+        private Map<Integer, Supplier<FieldAggregator>> createFieldAggregators(
+                RowType rowType,
+                List<String> primaryKeys,
+                List<String> allSequenceFields,
+                CoreOptions options) {
+
+            List<String> fieldNames = rowType.getFieldNames();
+            List<DataType> fieldTypes = rowType.getFieldTypes();
+            Map<Integer, Supplier<FieldAggregator>> fieldAggregators = new HashMap<>();
+            for (int i = 0; i < fieldNames.size(); i++) {
+                String fieldName = fieldNames.get(i);
+                DataType fieldType = fieldTypes.get(i);
+
+                if (allSequenceFields.contains(fieldName)) {
+                    // no agg for sequence fields
+                    continue;
+                }
+
+                if (primaryKeys.contains(fieldName)) {
+                    // aggregate by primary keys, so they do not aggregate
+                    fieldAggregators.put(
+                            i,
+                            () ->
+                                    FieldAggregatorFactory.create(
+                                            fieldType,
+                                            fieldName,
+                                            FieldPrimaryKeyAggFactory.NAME,
+                                            options));
+                    continue;
+                }
+
+                String aggFuncName = getAggFuncName(options, fieldName);
+                if (aggFuncName != null) {
+                    // last_non_null_value doesn't require sequence group
+                    checkArgument(
+                            aggFuncName.equals(FieldLastNonNullValueAggFactory.NAME)
+                                    || fieldSeqComparators.containsKey(
+                                            fieldNames.indexOf(fieldName)),
+                            "Must use sequence group for aggregation functions but not found for field %s.",
+                            fieldName);
+                    fieldAggregators.put(
+                            i,
+                            () ->
+                                    FieldAggregatorFactory.create(
+                                            fieldType, fieldName, aggFuncName, options));
+                }
+            }
+            return fieldAggregators;
+        }
+
+        @Nullable
+        private String getAggFuncName(CoreOptions options, String fieldName) {
+            String aggFunc = options.fieldAggFunc(fieldName);
+            return aggFunc == null ? options.fieldsDefaultFunc() : aggFunc;
         }
     }
 }

@@ -28,6 +28,8 @@ import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.NestedRow;
 import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.data.variant.GenericVariant;
+import org.apache.paimon.data.variant.Variant;
 import org.apache.paimon.io.DataOutputView;
 import org.apache.paimon.utils.MurmurHashUtils;
 
@@ -43,7 +45,7 @@ public class MemorySegmentUtils {
 
     private static final int ADDRESS_BITS_PER_WORD = 3;
 
-    private static final int BIT_BYTE_INDEX_MASK = 7;
+    public static final int BIT_BYTE_INDEX_MASK = 7;
 
     private static final int MAX_BYTES_LENGTH = 1024 * 64;
 
@@ -455,7 +457,7 @@ public class MemorySegmentUtils {
      * @param bitIndex the bit index.
      * @return the byte index.
      */
-    private static int byteIndex(int bitIndex) {
+    public static int byteIndex(int bitIndex) {
         return bitIndex >>> ADDRESS_BITS_PER_WORD;
     }
 
@@ -1119,6 +1121,16 @@ public class MemorySegmentUtils {
                 return BinaryString.fromAddress(segments, fieldOffset + 1, len);
             }
         }
+    }
+
+    public static Variant readVariant(MemorySegment[] segments, int baseOffset, long offsetAndLen) {
+        int offset = baseOffset + (int) (offsetAndLen >> 32);
+        int totalSize = (int) offsetAndLen;
+        int valueSize = getInt(segments, offset);
+        int metadataSize = totalSize - 4 - valueSize;
+        byte[] value = copyToBytes(segments, offset + 4, valueSize);
+        byte[] metadata = copyToBytes(segments, offset + 4 + valueSize, metadataSize);
+        return new GenericVariant(value, metadata);
     }
 
     /** Gets an instance of {@link InternalMap} from underlying {@link MemorySegment}. */

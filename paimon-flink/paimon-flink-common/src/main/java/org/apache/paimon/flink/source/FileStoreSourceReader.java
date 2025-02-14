@@ -18,56 +18,50 @@
 
 package org.apache.paimon.flink.source;
 
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.flink.NestedProjectedRowData;
 import org.apache.paimon.flink.source.metrics.FileStoreSourceReaderMetrics;
+import org.apache.paimon.flink.utils.TableScanUtils;
 import org.apache.paimon.table.source.TableRead;
 
 import org.apache.flink.api.connector.source.SourceReader;
 import org.apache.flink.api.connector.source.SourceReaderContext;
-import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.SingleThreadMultiplexSourceReaderBase;
-import org.apache.flink.connector.base.source.reader.synchronization.FutureCompletingBlockingQueue;
 import org.apache.flink.connector.file.src.reader.BulkFormat.RecordIterator;
 import org.apache.flink.table.data.RowData;
 
 import javax.annotation.Nullable;
 
 import java.util.Map;
+import java.util.Optional;
 
 /** A {@link SourceReader} that read records from {@link FileStoreSourceSplit}. */
 public class FileStoreSourceReader
         extends SingleThreadMultiplexSourceReaderBase<
                 RecordIterator<RowData>, RowData, FileStoreSourceSplit, FileStoreSourceSplitState> {
 
-    public FileStoreSourceReader(
-            SourceReaderContext readerContext,
-            TableRead tableRead,
-            @Nullable Long limit,
-            @Nullable FileStoreSourceReaderMetrics sourceReaderMetrics) {
-        // limiter is created in SourceReader, it can be shared in all split readers
-        super(
-                () ->
-                        new FileStoreSourceSplitReader(
-                                tableRead, RecordLimiter.create(limit), sourceReaderMetrics),
-                FlinkRecordsWithSplitIds::emitRecord,
-                readerContext.getConfiguration(),
-                readerContext);
-    }
+    private final IOManager ioManager;
+
+    private long lastConsumeSnapshotId = Long.MIN_VALUE;
 
     public FileStoreSourceReader(
             SourceReaderContext readerContext,
             TableRead tableRead,
+            FileStoreSourceReaderMetrics metrics,
+            IOManager ioManager,
             @Nullable Long limit,
-            FutureCompletingBlockingQueue<RecordsWithSplitIds<RecordIterator<RowData>>>
-                    elementsQueue,
-            @Nullable FileStoreSourceReaderMetrics sourceReaderMetrics) {
+            @Nullable NestedProjectedRowData rowData) {
+        // limiter is created in SourceReader, it can be shared in all split readers
         super(
-                elementsQueue,
                 () ->
                         new FileStoreSourceSplitReader(
-                                tableRead, RecordLimiter.create(limit), sourceReaderMetrics),
-                FlinkRecordsWithSplitIds::emitRecord,
+                                tableRead, RecordLimiter.create(limit), metrics),
+                (element, output, state) ->
+                        FlinkRecordsWithSplitIds.emitRecord(
+                                readerContext, element, output, state, metrics, rowData),
                 readerContext.getConfiguration(),
                 readerContext);
+        this.ioManager = ioManager;
     }
 
     @Override
@@ -86,6 +80,20 @@ public class FileStoreSourceReader
         if (getNumberOfCurrentlyAssignedSplits() == 0) {
             context.sendSplitRequest();
         }
+
+        long maxFinishedSplits =
+                finishedSplitIds.values().stream()
+                        .map(splitState -> TableScanUtils.getSnapshotId(splitState.toSourceSplit()))
+                        .filter(Optional::isPresent)
+                        .mapToLong(Optional::get)
+                        .max()
+                        .orElse(Long.MIN_VALUE);
+
+        if (lastConsumeSnapshotId < maxFinishedSplits) {
+            lastConsumeSnapshotId = maxFinishedSplits;
+            context.sendSourceEventToCoordinator(
+                    new ReaderConsumeProgressEvent(lastConsumeSnapshotId));
+        }
     }
 
     @Override
@@ -97,5 +105,11 @@ public class FileStoreSourceReader
     protected FileStoreSourceSplit toSplitType(
             String splitId, FileStoreSourceSplitState splitState) {
         return splitState.toSourceSplit();
+    }
+
+    @Override
+    public void close() throws Exception {
+        super.close();
+        ioManager.close();
     }
 }

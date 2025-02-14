@@ -18,9 +18,10 @@
 
 package org.apache.paimon.flink.sink;
 
-import org.apache.paimon.append.AppendOnlyCompactionTask;
+import org.apache.paimon.append.UnawareAppendCompactionTask;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.manifest.FileSource;
 import org.apache.paimon.table.sink.CompactionTaskSerializer;
 
 import org.junit.jupiter.api.Test;
@@ -31,7 +32,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.apache.paimon.mergetree.compact.MergeTreeCompactManagerTest.row;
-import static org.apache.paimon.stats.StatsTestUtils.newTableStats;
+import static org.apache.paimon.stats.StatsTestUtils.newSimpleStats;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link CompactionTaskSimpleSerializer}. */
@@ -48,8 +49,9 @@ public class CompactionTaskSimpleSerializerTest {
     @Test
     public void testSerializer() throws IOException {
 
-        AppendOnlyCompactionTask task1 = new AppendOnlyCompactionTask(partition, newFiles(20));
-        AppendOnlyCompactionTask task2 = serializer.deserialize(2, serializer.serialize(task1));
+        UnawareAppendCompactionTask task1 =
+                new UnawareAppendCompactionTask(partition, newFiles(20));
+        UnawareAppendCompactionTask task2 = serializer.deserialize(2, serializer.serialize(task1));
 
         assertThat(task1).isEqualTo(task2);
     }
@@ -69,11 +71,15 @@ public class CompactionTaskSimpleSerializerTest {
                 1,
                 row(0),
                 row(0),
-                newTableStats(0, 1),
-                newTableStats(0, 1),
+                newSimpleStats(0, 1),
+                newSimpleStats(0, 1),
                 0,
                 1,
                 0,
-                0);
+                0,
+                0L,
+                null,
+                FileSource.APPEND,
+                null);
     }
 }

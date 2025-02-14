@@ -19,19 +19,27 @@
 package org.apache.paimon.table.sink;
 
 import org.apache.paimon.data.serializer.VersionedSerializer;
+import org.apache.paimon.index.IndexFileMeta;
+import org.apache.paimon.index.IndexFileMeta09Serializer;
 import org.apache.paimon.index.IndexFileMetaSerializer;
 import org.apache.paimon.io.CompactIncrement;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataFileMeta08Serializer;
+import org.apache.paimon.io.DataFileMeta09Serializer;
+import org.apache.paimon.io.DataFileMeta10LegacySerializer;
 import org.apache.paimon.io.DataFileMetaSerializer;
+import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.io.DataInputDeserializer;
 import org.apache.paimon.io.DataInputView;
 import org.apache.paimon.io.DataOutputView;
 import org.apache.paimon.io.DataOutputViewStreamWrapper;
 import org.apache.paimon.io.IndexIncrement;
-import org.apache.paimon.io.NewFilesIncrement;
+import org.apache.paimon.utils.IOExceptionSupplier;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import static org.apache.paimon.utils.SerializationUtils.deserializeBinaryRow;
@@ -40,10 +48,15 @@ import static org.apache.paimon.utils.SerializationUtils.serializeBinaryRow;
 /** {@link VersionedSerializer} for {@link CommitMessage}. */
 public class CommitMessageSerializer implements VersionedSerializer<CommitMessage> {
 
-    private static final int CURRENT_VERSION = 2;
+    private static final int CURRENT_VERSION = 6;
 
     private final DataFileMetaSerializer dataFileSerializer;
     private final IndexFileMetaSerializer indexEntrySerializer;
+
+    private DataFileMeta10LegacySerializer dataFileMeta10LegacySerializer;
+    private DataFileMeta09Serializer dataFile09Serializer;
+    private DataFileMeta08Serializer dataFile08Serializer;
+    private IndexFileMeta09Serializer indexEntry09Serializer;
 
     public CommitMessageSerializer() {
         this.dataFileSerializer = new DataFileMetaSerializer();
@@ -75,53 +88,78 @@ public class CommitMessageSerializer implements VersionedSerializer<CommitMessag
         serializeBinaryRow(obj.partition(), view);
         view.writeInt(obj.bucket());
         dataFileSerializer.serializeList(message.newFilesIncrement().newFiles(), view);
+        dataFileSerializer.serializeList(message.newFilesIncrement().deletedFiles(), view);
         dataFileSerializer.serializeList(message.newFilesIncrement().changelogFiles(), view);
         dataFileSerializer.serializeList(message.compactIncrement().compactBefore(), view);
         dataFileSerializer.serializeList(message.compactIncrement().compactAfter(), view);
         dataFileSerializer.serializeList(message.compactIncrement().changelogFiles(), view);
         indexEntrySerializer.serializeList(message.indexIncrement().newIndexFiles(), view);
+        indexEntrySerializer.serializeList(message.indexIncrement().deletedIndexFiles(), view);
     }
 
     @Override
     public CommitMessage deserialize(int version, byte[] serialized) throws IOException {
-        checkVersion(version);
         DataInputDeserializer view = new DataInputDeserializer(serialized);
-        return deserialize(view);
+        return deserialize(version, view);
     }
 
     public List<CommitMessage> deserializeList(int version, DataInputView view) throws IOException {
-        checkVersion(version);
         int length = view.readInt();
         List<CommitMessage> list = new ArrayList<>(length);
         for (int i = 0; i < length; i++) {
-            list.add(deserialize(view));
+            list.add(deserialize(version, view));
         }
         return list;
     }
 
-    private void checkVersion(int version) {
-        if (version != CURRENT_VERSION) {
-            throw new UnsupportedOperationException(
-                    "Expecting FileCommittable version to be "
-                            + CURRENT_VERSION
-                            + ", but found "
-                            + version
-                            + ".\nFileCommittable is not a compatible data structure. "
-                            + "Please restart the job afresh (do not recover from savepoint).");
-        }
-    }
+    private CommitMessage deserialize(int version, DataInputView view) throws IOException {
+        IOExceptionSupplier<List<DataFileMeta>> fileDeserializer = fileDeserializer(version, view);
+        IOExceptionSupplier<List<IndexFileMeta>> indexEntryDeserializer =
+                indexEntryDeserializer(version, view);
 
-    private CommitMessage deserialize(DataInputView view) throws IOException {
         return new CommitMessageImpl(
                 deserializeBinaryRow(view),
                 view.readInt(),
-                new NewFilesIncrement(
-                        dataFileSerializer.deserializeList(view),
-                        dataFileSerializer.deserializeList(view)),
+                new DataIncrement(
+                        fileDeserializer.get(), fileDeserializer.get(), fileDeserializer.get()),
                 new CompactIncrement(
-                        dataFileSerializer.deserializeList(view),
-                        dataFileSerializer.deserializeList(view),
-                        dataFileSerializer.deserializeList(view)),
-                new IndexIncrement(indexEntrySerializer.deserializeList(view)));
+                        fileDeserializer.get(), fileDeserializer.get(), fileDeserializer.get()),
+                new IndexIncrement(
+                        indexEntryDeserializer.get(),
+                        version <= 2 ? Collections.emptyList() : indexEntryDeserializer.get()));
+    }
+
+    private IOExceptionSupplier<List<DataFileMeta>> fileDeserializer(
+            int version, DataInputView view) {
+        if (version >= 6) {
+            return () -> dataFileSerializer.deserializeList(view);
+        } else if (version == 4 || version == 5) {
+            if (dataFileMeta10LegacySerializer == null) {
+                dataFileMeta10LegacySerializer = new DataFileMeta10LegacySerializer();
+            }
+            return () -> dataFileMeta10LegacySerializer.deserializeList(view);
+        } else if (version == 3) {
+            if (dataFile09Serializer == null) {
+                dataFile09Serializer = new DataFileMeta09Serializer();
+            }
+            return () -> dataFile09Serializer.deserializeList(view);
+        } else {
+            if (dataFile08Serializer == null) {
+                dataFile08Serializer = new DataFileMeta08Serializer();
+            }
+            return () -> dataFile08Serializer.deserializeList(view);
+        }
+    }
+
+    private IOExceptionSupplier<List<IndexFileMeta>> indexEntryDeserializer(
+            int version, DataInputView view) {
+        if (version >= 5) {
+            return () -> indexEntrySerializer.deserializeList(view);
+        } else {
+            if (indexEntry09Serializer == null) {
+                indexEntry09Serializer = new IndexFileMeta09Serializer();
+            }
+            return () -> indexEntry09Serializer.deserializeList(view);
+        }
     }
 }

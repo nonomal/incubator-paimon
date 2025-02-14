@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,17 +18,27 @@
 
 package org.apache.paimon.flink.shuffle;
 
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.data.DataGetters;
+import org.apache.paimon.flink.FlinkRowWrapper;
+import org.apache.paimon.types.InternalRowToSizeVisitor;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.SerializableSupplier;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.functions.Partitioner;
+import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.typeutils.ListTypeInfo;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.InputSelectable;
@@ -58,6 +68,8 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Random;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
 /**
  * RangeShuffle Util to shuffle the input stream by the sampling range. See `rangeShuffleBykey`
@@ -78,41 +90,47 @@ public class RangeShuffle {
      *     -----------------------------BATCH-[ARange,n]-PARTITION->[RRange,m]->
      * }</pre>
      *
-     * <p>The streams except the sample and histogram process stream will been blocked, so the the
-     * sample and histogram process stream does not care about requiredExchangeMode.
+     * <p>The streams except the sample and histogram process stream will be blocked, so the sample
+     * and histogram process stream does not care about requiredExchangeMode.
      */
     public static <T> DataStream<Tuple2<T, RowData>> rangeShuffleByKey(
             DataStream<Tuple2<T, RowData>> inputDataStream,
             SerializableSupplier<Comparator<T>> keyComparator,
             TypeInformation<T> keyTypeInformation,
-            int sampleSize,
+            int localSampleSize,
+            int globalSampleSize,
             int rangeNum,
-            int outParallelism) {
+            int outParallelism,
+            RowType valueRowType,
+            boolean isSortBySize) {
         Transformation<Tuple2<T, RowData>> input = inputDataStream.getTransformation();
 
-        OneInputTransformation<Tuple2<T, RowData>, T> keyInput =
+        OneInputTransformation<Tuple2<T, RowData>, Tuple2<T, Integer>> keyInput =
                 new OneInputTransformation<>(
                         input,
-                        "ABSTRACT KEY",
-                        new StreamMap<>(a -> a.f0),
-                        keyTypeInformation,
+                        "ABSTRACT KEY AND SIZE",
+                        new StreamMap<>(new KeyAndSizeExtractor<>(valueRowType, isSortBySize)),
+                        new TupleTypeInfo<>(keyTypeInformation, BasicTypeInfo.INT_TYPE_INFO),
                         input.getParallelism());
 
         // 1. Fixed size sample in each partitions.
-        OneInputTransformation<T, Tuple2<Double, T>> localSample =
+        OneInputTransformation<Tuple2<T, Integer>, Tuple3<Double, T, Integer>> localSample =
                 new OneInputTransformation<>(
                         keyInput,
                         "LOCAL SAMPLE",
-                        new LocalSampleOperator<>(sampleSize),
-                        new TupleTypeInfo<>(BasicTypeInfo.DOUBLE_TYPE_INFO, keyTypeInformation),
+                        new LocalSampleOperator<>(localSampleSize),
+                        new TupleTypeInfo<>(
+                                BasicTypeInfo.DOUBLE_TYPE_INFO,
+                                keyTypeInformation,
+                                BasicTypeInfo.INT_TYPE_INFO),
                         keyInput.getParallelism());
 
         // 2. Collect all the samples and gather them into a sorted key range.
-        OneInputTransformation<Tuple2<Double, T>, List<T>> sampleAndHistogram =
+        OneInputTransformation<Tuple3<Double, T, Integer>, List<T>> sampleAndHistogram =
                 new OneInputTransformation<>(
                         localSample,
                         "GLOBAL SAMPLE",
-                        new GlobalSampleOperator<>(sampleSize, keyComparator, rangeNum),
+                        new GlobalSampleOperator<>(globalSampleSize, keyComparator, rangeNum),
                         new ListTypeInfo<>(keyTypeInformation),
                         1);
 
@@ -147,10 +165,61 @@ public class RangeShuffle {
                                         new AssignRangeIndexOperator.RangePartitioner(rangeNum),
                                         new AssignRangeIndexOperator.Tuple2KeySelector<>()),
                                 StreamExchangeMode.BATCH),
-                        "REMOVE KEY",
+                        "REMOVE RANGE INDEX",
                         new RemoveRangeIndexOperator<>(),
                         input.getOutputType(),
                         outParallelism));
+    }
+
+    /** KeyAndSizeExtractor is responsible for extracting the sort key and row size. */
+    public static class KeyAndSizeExtractor<T>
+            extends RichMapFunction<Tuple2<T, RowData>, Tuple2<T, Integer>> {
+        private final RowType rowType;
+        private final boolean isSortBySize;
+        private transient List<BiFunction<DataGetters, Integer, Integer>> fieldSizeCalculator;
+
+        public KeyAndSizeExtractor(RowType rowType, boolean isSortBySize) {
+            this.rowType = rowType;
+            this.isSortBySize = isSortBySize;
+        }
+
+        /**
+         * Do not annotate with <code>@override</code> here to maintain compatibility with Flink
+         * 1.18-.
+         */
+        public void open(OpenContext openContext) throws Exception {
+            open(new Configuration());
+        }
+
+        /**
+         * Do not annotate with <code>@override</code> here to maintain compatibility with Flink
+         * 2.0+.
+         */
+        public void open(Configuration parameters) throws Exception {
+            InternalRowToSizeVisitor internalRowToSizeVisitor = new InternalRowToSizeVisitor();
+            fieldSizeCalculator =
+                    rowType.getFieldTypes().stream()
+                            .map(dataType -> dataType.accept(internalRowToSizeVisitor))
+                            .collect(Collectors.toList());
+        }
+
+        @Override
+        public Tuple2<T, Integer> map(Tuple2<T, RowData> keyAndRowData) throws Exception {
+            if (isSortBySize) {
+                int size = 0;
+                for (int i = 0; i < fieldSizeCalculator.size(); i++) {
+                    size +=
+                            fieldSizeCalculator
+                                    .get(i)
+                                    .apply(new FlinkRowWrapper(keyAndRowData.f1), i);
+                }
+                return new Tuple2<>(keyAndRowData.f0, size);
+            } else {
+                // when basing on quantity, we don't need the size of the data, so setting it to a
+                // constant of 1 would be sufficient.
+                return new Tuple2<>(keyAndRowData.f0, 1);
+            }
+        }
     }
 
     /**
@@ -160,15 +229,17 @@ public class RangeShuffle {
      * <p>See {@link Sampler}.
      */
     @Internal
-    public static class LocalSampleOperator<T> extends TableStreamOperator<Tuple2<Double, T>>
-            implements OneInputStreamOperator<T, Tuple2<Double, T>>, BoundedOneInput {
+    public static class LocalSampleOperator<T>
+            extends TableStreamOperator<Tuple3<Double, T, Integer>>
+            implements OneInputStreamOperator<Tuple2<T, Integer>, Tuple3<Double, T, Integer>>,
+                    BoundedOneInput {
 
         private static final long serialVersionUID = 1L;
 
         private final int numSample;
 
-        private transient Collector<Tuple2<Double, T>> collector;
-        private transient Sampler<T> sampler;
+        private transient Collector<Tuple3<Double, T, Integer>> collector;
+        private transient Sampler<Tuple2<T, Integer>> sampler;
 
         public LocalSampleOperator(int numSample) {
             this.numSample = numSample;
@@ -182,15 +253,17 @@ public class RangeShuffle {
         }
 
         @Override
-        public void processElement(StreamRecord<T> streamRecord) throws Exception {
+        public void processElement(StreamRecord<Tuple2<T, Integer>> streamRecord) throws Exception {
             sampler.collect(streamRecord.getValue());
         }
 
         @Override
-        public void endInput() throws Exception {
-            Iterator<Tuple2<Double, T>> sampled = sampler.sample();
+        public void endInput() {
+            Iterator<Tuple2<Double, Tuple2<T, Integer>>> sampled = sampler.sample();
             while (sampled.hasNext()) {
-                collector.collect(sampled.next());
+                Tuple2<Double, Tuple2<T, Integer>> next = sampled.next();
+
+                collector.collect(new Tuple3<>(next.f0, next.f1.f0, next.f1.f1));
             }
         }
     }
@@ -201,7 +274,8 @@ public class RangeShuffle {
      * <p>See {@link Sampler}.
      */
     private static class GlobalSampleOperator<T> extends TableStreamOperator<List<T>>
-            implements OneInputStreamOperator<Tuple2<Double, T>, List<T>>, BoundedOneInput {
+            implements OneInputStreamOperator<Tuple3<Double, T, Integer>, List<T>>,
+                    BoundedOneInput {
 
         private static final long serialVersionUID = 1L;
 
@@ -211,7 +285,7 @@ public class RangeShuffle {
 
         private transient Comparator<T> keyComparator;
         private transient Collector<List<T>> collector;
-        private transient Sampler<T> sampler;
+        private transient Sampler<Tuple2<T, Integer>> sampler;
 
         public GlobalSampleOperator(
                 int numSample,
@@ -231,40 +305,38 @@ public class RangeShuffle {
         }
 
         @Override
-        public void processElement(StreamRecord<Tuple2<Double, T>> record) throws Exception {
-            Tuple2<Double, T> tuple = record.getValue();
-            sampler.collect(tuple.f0, tuple.f1);
+        public void processElement(StreamRecord<Tuple3<Double, T, Integer>> record)
+                throws Exception {
+            Tuple3<Double, T, Integer> tuple = record.getValue();
+            sampler.collect(tuple.f0, new Tuple2<>(tuple.f1, tuple.f2));
         }
 
         @Override
-        public void endInput() throws Exception {
-            Iterator<Tuple2<Double, T>> sampled = sampler.sample();
+        public void endInput() {
+            Iterator<Tuple2<Double, Tuple2<T, Integer>>> sampled = sampler.sample();
 
-            List<T> sampledData = new ArrayList<>();
+            List<Tuple2<T, Integer>> sampledData = new ArrayList<>();
+
             while (sampled.hasNext()) {
                 sampledData.add(sampled.next().f1);
             }
 
-            sampledData.sort(keyComparator);
+            sampledData.sort((o1, o2) -> keyComparator.compare(o1.f0, o2.f0));
 
-            int boundarySize = rangesNum - 1;
-            @SuppressWarnings("unchecked")
-            T[] boundaries = (T[]) new Object[boundarySize];
-            if (sampledData.size() > 0) {
-                double avgRange = sampledData.size() / (double) rangesNum;
-                for (int i = 1; i < rangesNum; i++) {
-                    T record = sampledData.get((int) (i * avgRange));
-                    boundaries[i - 1] = record;
-                }
+            List<T> range;
+            if (sampledData.isEmpty()) {
+                range = new ArrayList<>();
+            } else {
+                range = Arrays.asList(allocateRangeBaseSize(sampledData, rangesNum));
             }
 
-            collector.collect(Arrays.asList(boundaries));
+            collector.collect(range);
         }
     }
 
     /**
-     * This two-input-operator require a input with RangeBoundaries as broadcast input, and generate
-     * Tuple2 which includes range index and record from the other input itself as output.
+     * This two-input-operator require an input with RangeBoundaries as broadcast input, and
+     * generate Tuple2 which includes range index and record from the other input itself as output.
      */
     private static class AssignRangeIndexOperator<T>
             extends TableStreamOperator<Tuple2<Integer, Tuple2<T, RowData>>>
@@ -276,7 +348,7 @@ public class RangeShuffle {
 
         private final SerializableSupplier<Comparator<T>> keyComparatorSupplier;
 
-        private transient List<T> boundaries;
+        private transient List<Pair<T, RandomList>> keyIndex;
         private transient Collector<Tuple2<Integer, Tuple2<T, RowData>>> collector;
         private transient Comparator<T> keyComparator;
 
@@ -293,42 +365,66 @@ public class RangeShuffle {
 
         @Override
         public void processElement1(StreamRecord<List<T>> streamRecord) {
-            this.boundaries = streamRecord.getValue();
+            keyIndex = new ArrayList<>();
+
+            T last = null;
+            int index = 0;
+            for (T t : streamRecord.getValue()) {
+                if (last != null && keyComparator.compare(last, t) == 0) {
+                    keyIndex.get(keyIndex.size() - 1).getRight().add(index++);
+                } else {
+                    Pair<T, RandomList> pair = Pair.of(t, new RandomList());
+                    pair.getRight().add(index++);
+                    keyIndex.add(pair);
+
+                    last = t;
+                }
+            }
         }
 
         @Override
         public void processElement2(StreamRecord<Tuple2<T, RowData>> streamRecord) {
-            if (boundaries == null) {
+            if (keyIndex == null) {
                 throw new RuntimeException("There should be one data from the first input.");
             }
-            Tuple2<T, RowData> row = streamRecord.getValue();
-            collector.collect(new Tuple2<>(binarySearch(row.f0), row));
+            // If the range number is 1, the range index will be 0 for all records.
+            if (keyIndex.isEmpty()) {
+                collector.collect(new Tuple2<>(0, streamRecord.getValue()));
+            } else {
+                Tuple2<T, RowData> row = streamRecord.getValue();
+                collector.collect(new Tuple2<>(binarySearch(row.f0), row));
+            }
         }
 
         @Override
         public InputSelection nextSelection() {
-            return boundaries == null ? InputSelection.FIRST : InputSelection.ALL;
+            return keyIndex == null ? InputSelection.FIRST : InputSelection.ALL;
         }
 
         private int binarySearch(T key) {
+            int lastIndex = this.keyIndex.size() - 1;
             int low = 0;
-            int high = this.boundaries.size() - 1;
+            int high = lastIndex;
 
             while (low <= high) {
                 final int mid = (low + high) >>> 1;
-                final int result = keyComparator.compare(key, this.boundaries.get(mid));
+                final Pair<T, RandomList> indexPair = keyIndex.get(mid);
+                final int result = keyComparator.compare(key, indexPair.getLeft());
 
                 if (result > 0) {
                     low = mid + 1;
                 } else if (result < 0) {
                     high = mid - 1;
                 } else {
-                    return mid;
+                    return indexPair.getRight().get();
                 }
             }
+
             // key not found, but the low index is the target
             // bucket, since the boundaries are the upper bound
-            return low;
+            return low > lastIndex
+                    ? (keyIndex.get(lastIndex).getRight().get() + 1)
+                    : keyIndex.get(low).getRight().get();
         }
 
         /** A {@link KeySelector} to select by f0 of tuple2. */
@@ -357,8 +453,8 @@ public class RangeShuffle {
             @Override
             public int partition(Integer key, int numPartitions) {
                 Preconditions.checkArgument(
-                        numPartitions < totalRangeNum,
-                        "Num of subPartitions should < totalRangeNum: " + totalRangeNum);
+                        numPartitions <= totalRangeNum,
+                        "Num of subPartitions should <= totalRangeNum: " + totalRangeNum);
                 int partition = key / (totalRangeNum / numPartitions);
                 return Math.min(numPartitions - 1, partition);
             }
@@ -448,5 +544,57 @@ public class RangeShuffle {
         Iterator<Tuple2<Double, T>> sample() {
             return queue.iterator();
         }
+    }
+
+    /** Contains integers and randomly get one. */
+    private static class RandomList {
+
+        private static final Random RANDOM = new Random();
+
+        private final List<Integer> list = new ArrayList<>();
+
+        public void add(int i) {
+            list.add(i);
+        }
+
+        public int get() {
+            return list.get(RANDOM.nextInt(list.size()));
+        }
+    }
+
+    @VisibleForTesting
+    static <T> T[] allocateRangeBaseSize(List<Tuple2<T, Integer>> sampledData, int rangesNum) {
+        int sampeNum = sampledData.size();
+        int boundarySize = rangesNum - 1;
+        @SuppressWarnings("unchecked")
+        T[] boundaries = (T[]) new Object[boundarySize];
+
+        if (!sampledData.isEmpty()) {
+            long restSize = sampledData.stream().mapToLong(t -> (long) t.f1).sum();
+            double stepRange = restSize / (double) rangesNum;
+
+            int currentWeight = 0;
+            int index = 0;
+
+            for (int i = 0; i < boundarySize; i++) {
+                while (currentWeight < stepRange && index < sampeNum) {
+                    boundaries[i] = sampledData.get(Math.min(index, sampeNum - 1)).f0;
+                    int sampleWeight = sampledData.get(index++).f1;
+                    currentWeight += sampleWeight;
+                    restSize -= sampleWeight;
+                }
+
+                currentWeight = 0;
+                stepRange = restSize / (double) (rangesNum - i - 1);
+            }
+        }
+
+        for (int i = 0; i < boundarySize; i++) {
+            if (boundaries[i] == null) {
+                boundaries[i] = sampledData.get(sampeNum - 1).f0;
+            }
+        }
+
+        return boundaries;
     }
 }

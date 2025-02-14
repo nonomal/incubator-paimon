@@ -26,8 +26,17 @@ import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
-import org.apache.paimon.manifest.FileKind;
-import org.apache.paimon.operation.FileStoreScan;
+import org.apache.paimon.predicate.And;
+import org.apache.paimon.predicate.CompoundPredicate;
+import org.apache.paimon.predicate.Equal;
+import org.apache.paimon.predicate.GreaterOrEqual;
+import org.apache.paimon.predicate.GreaterThan;
+import org.apache.paimon.predicate.InPredicateVisitor;
+import org.apache.paimon.predicate.LeafPredicate;
+import org.apache.paimon.predicate.LeafPredicateExtractor;
+import org.apache.paimon.predicate.LessOrEqual;
+import org.apache.paimon.predicate.LessThan;
+import org.apache.paimon.predicate.Or;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.FileStoreTable;
@@ -36,11 +45,11 @@ import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.InnerTableRead;
 import org.apache.paimon.table.source.InnerTableScan;
 import org.apache.paimon.table.source.ReadOnceTableScan;
+import org.apache.paimon.table.source.SingletonSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.DataField;
-import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TimestampType;
 import org.apache.paimon.utils.IteratorRecordReader;
@@ -54,12 +63,14 @@ import java.io.IOException;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 import static org.apache.paimon.catalog.Catalog.SYSTEM_TABLE_SPLITTER;
 
@@ -69,7 +80,6 @@ public class SnapshotsTable implements ReadonlyTable {
     private static final long serialVersionUID = 1L;
 
     public static final String SNAPSHOTS = "snapshots";
-
     public static final RowType TABLE_TYPE =
             new RowType(
                     Arrays.asList(
@@ -96,18 +106,16 @@ public class SnapshotsTable implements ReadonlyTable {
                             new DataField(9, "total_record_count", new BigIntType(true)),
                             new DataField(10, "delta_record_count", new BigIntType(true)),
                             new DataField(11, "changelog_record_count", new BigIntType(true)),
-                            new DataField(12, "added_file_count", new IntType(true)),
-                            new DataField(13, "delete_file_count", new IntType(true)),
-                            new DataField(14, "watermark", new BigIntType(true))));
+                            new DataField(12, "watermark", new BigIntType(true))));
 
     private final FileIO fileIO;
     private final Path location;
 
     private final FileStoreTable dataTable;
 
-    public SnapshotsTable(FileIO fileIO, Path location, FileStoreTable dataTable) {
-        this.fileIO = fileIO;
-        this.location = location;
+    public SnapshotsTable(FileStoreTable dataTable) {
+        this.fileIO = dataTable.fileIO();
+        this.location = dataTable.location();
         this.dataTable = dataTable;
     }
 
@@ -133,47 +141,36 @@ public class SnapshotsTable implements ReadonlyTable {
 
     @Override
     public InnerTableRead newRead() {
-        return new SnapshotsRead(fileIO, dataTable);
+        return new SnapshotsRead(fileIO);
     }
 
     @Override
     public Table copy(Map<String, String> dynamicOptions) {
-        return new SnapshotsTable(fileIO, location, dataTable.copy(dynamicOptions));
+        return new SnapshotsTable(dataTable.copy(dynamicOptions));
     }
 
     private class SnapshotsScan extends ReadOnceTableScan {
 
         @Override
         public InnerTableScan withFilter(Predicate predicate) {
-            // TODO
+            // do filter in read
             return this;
         }
 
         @Override
         public Plan innerPlan() {
-            return () -> Collections.singletonList(new SnapshotsSplit(fileIO, location));
+            return () -> Collections.singletonList(new SnapshotsSplit(location));
         }
     }
 
-    private static class SnapshotsSplit implements Split {
+    private static class SnapshotsSplit extends SingletonSplit {
 
         private static final long serialVersionUID = 1L;
 
-        private final FileIO fileIO;
         private final Path location;
 
-        private SnapshotsSplit(FileIO fileIO, Path location) {
-            this.fileIO = fileIO;
+        private SnapshotsSplit(Path location) {
             this.location = location;
-        }
-
-        @Override
-        public long rowCount() {
-            try {
-                return new SnapshotManager(fileIO, location).snapshotCount();
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
         }
 
         @Override
@@ -194,27 +191,88 @@ public class SnapshotsTable implements ReadonlyTable {
         }
     }
 
-    private static class SnapshotsRead implements InnerTableRead {
+    private class SnapshotsRead implements InnerTableRead {
 
         private final FileIO fileIO;
-        private int[][] projection;
+        private RowType readType;
+        private Optional<Long> optionalFilterSnapshotIdMax = Optional.empty();
+        private Optional<Long> optionalFilterSnapshotIdMin = Optional.empty();
+        private final List<Long> snapshotIds = new ArrayList<>();
 
-        private final FileStoreTable dataTable;
-
-        public SnapshotsRead(FileIO fileIO, FileStoreTable dataTable) {
+        public SnapshotsRead(FileIO fileIO) {
             this.fileIO = fileIO;
-            this.dataTable = dataTable;
         }
 
         @Override
         public InnerTableRead withFilter(Predicate predicate) {
-            // TODO
+            if (predicate == null) {
+                return this;
+            }
+
+            String leafName = "snapshot_id";
+            if (predicate instanceof CompoundPredicate) {
+                CompoundPredicate compoundPredicate = (CompoundPredicate) predicate;
+                List<Predicate> children = compoundPredicate.children();
+                if ((compoundPredicate.function()) instanceof And) {
+                    for (Predicate leaf : children) {
+                        handleLeafPredicate(leaf, leafName);
+                    }
+                }
+
+                // optimize for IN filter
+                if ((compoundPredicate.function()) instanceof Or) {
+                    InPredicateVisitor.extractInElements(predicate, leafName)
+                            .ifPresent(
+                                    leafs ->
+                                            leafs.forEach(
+                                                    leaf ->
+                                                            snapshotIds.add(
+                                                                    Long.parseLong(
+                                                                            leaf.toString()))));
+                }
+            } else {
+                handleLeafPredicate(predicate, leafName);
+            }
+
             return this;
         }
 
+        public void handleLeafPredicate(Predicate predicate, String leafName) {
+            LeafPredicate snapshotPred =
+                    predicate.visit(LeafPredicateExtractor.INSTANCE).get(leafName);
+            if (snapshotPred != null) {
+                if (snapshotPred.function() instanceof Equal) {
+                    optionalFilterSnapshotIdMin =
+                            Optional.of((Long) snapshotPred.literals().get(0));
+                    optionalFilterSnapshotIdMax =
+                            Optional.of((Long) snapshotPred.literals().get(0));
+                }
+
+                if (snapshotPred.function() instanceof GreaterThan) {
+                    optionalFilterSnapshotIdMin =
+                            Optional.of((Long) snapshotPred.literals().get(0) + 1);
+                }
+
+                if (snapshotPred.function() instanceof GreaterOrEqual) {
+                    optionalFilterSnapshotIdMin =
+                            Optional.of((Long) snapshotPred.literals().get(0));
+                }
+
+                if (snapshotPred.function() instanceof LessThan) {
+                    optionalFilterSnapshotIdMax =
+                            Optional.of((Long) snapshotPred.literals().get(0) - 1);
+                }
+
+                if (snapshotPred.function() instanceof LessOrEqual) {
+                    optionalFilterSnapshotIdMax =
+                            Optional.of((Long) snapshotPred.literals().get(0));
+                }
+            }
+        }
+
         @Override
-        public InnerTableRead withProjection(int[][] projection) {
-            this.projection = projection;
+        public InnerTableRead withReadType(RowType readType) {
+            this.readType = readType;
             return this;
         }
 
@@ -228,20 +286,30 @@ public class SnapshotsTable implements ReadonlyTable {
             if (!(split instanceof SnapshotsSplit)) {
                 throw new IllegalArgumentException("Unsupported split: " + split.getClass());
             }
-            Path location = ((SnapshotsSplit) split).location;
-            Iterator<Snapshot> snapshots = new SnapshotManager(fileIO, location).snapshots();
-            Iterator<InternalRow> rows =
-                    Iterators.transform(snapshots, snapshot -> toRow(snapshot, dataTable));
-            if (projection != null) {
+
+            SnapshotManager snapshotManager = dataTable.snapshotManager();
+            Iterator<Snapshot> snapshots;
+            if (!snapshotIds.isEmpty()) {
+                snapshots = snapshotManager.snapshotsWithId(snapshotIds);
+            } else {
+                snapshots =
+                        snapshotManager.snapshotsWithinRange(
+                                optionalFilterSnapshotIdMax, optionalFilterSnapshotIdMin);
+            }
+
+            Iterator<InternalRow> rows = Iterators.transform(snapshots, this::toRow);
+            if (readType != null) {
                 rows =
                         Iterators.transform(
-                                rows, row -> ProjectedRow.from(projection).replaceRow(row));
+                                rows,
+                                row ->
+                                        ProjectedRow.from(readType, SnapshotsTable.TABLE_TYPE)
+                                                .replaceRow(row));
             }
             return new IteratorRecordReader<>(rows);
         }
 
-        private InternalRow toRow(Snapshot snapshot, FileStoreTable dataTable) {
-            FileStoreScan.Plan plan = dataTable.store().newScan().withSnapshot(snapshot).plan();
+        private InternalRow toRow(Snapshot snapshot) {
             return GenericRow.of(
                     snapshot.id(),
                     snapshot.schemaId(),
@@ -258,8 +326,6 @@ public class SnapshotsTable implements ReadonlyTable {
                     snapshot.totalRecordCount(),
                     snapshot.deltaRecordCount(),
                     snapshot.changelogRecordCount(),
-                    plan.files(FileKind.ADD).size(),
-                    plan.files(FileKind.DELETE).size(),
                     snapshot.watermark());
         }
     }

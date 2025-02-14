@@ -18,6 +18,9 @@
 
 package org.apache.paimon.flink.sink.index;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.crosspartition.IndexBootstrap;
+import org.apache.paimon.crosspartition.KeyPartOrRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.flink.sink.Committable;
 import org.apache.paimon.flink.sink.DynamicBucketRowWriteOperator;
@@ -29,22 +32,25 @@ import org.apache.paimon.flink.utils.InternalTypeInfo;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.MathUtils;
 
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 
 import javax.annotation.Nullable;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
+import static org.apache.paimon.CoreOptions.createCommitUser;
+import static org.apache.paimon.crosspartition.IndexBootstrap.bootstrapType;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_CROSS_PARTITION_MANAGED_MEMORY;
 import static org.apache.paimon.flink.sink.FlinkStreamPartitioner.partition;
-import static org.apache.paimon.flink.sink.index.IndexBootstrap.bootstrapType;
+import static org.apache.paimon.flink.utils.ManagedMemoryUtils.declareManagedMemory;
 
 /** Sink for global dynamic bucket table. */
 public class GlobalDynamicBucketSink extends FlinkWriteSink<Tuple2<InternalRow, Integer>> {
@@ -57,15 +63,14 @@ public class GlobalDynamicBucketSink extends FlinkWriteSink<Tuple2<InternalRow, 
     }
 
     @Override
-    protected OneInputStreamOperator<Tuple2<InternalRow, Integer>, Committable> createWriteOperator(
-            StoreSinkWrite.Provider writeProvider, String commitUser) {
-        return new DynamicBucketRowWriteOperator(table, writeProvider, commitUser);
+    protected OneInputStreamOperatorFactory<Tuple2<InternalRow, Integer>, Committable>
+            createWriteOperatorFactory(StoreSinkWrite.Provider writeProvider, String commitUser) {
+        return new DynamicBucketRowWriteOperator.Factory(table, writeProvider, commitUser);
     }
 
     public DataStreamSink<?> build(DataStream<InternalRow> input, @Nullable Integer parallelism) {
-        String initialCommitUser = UUID.randomUUID().toString();
-
         TableSchema schema = table.schema();
+        CoreOptions options = table.coreOptions();
         RowType rowType = schema.logicalRowType();
         List<String> primaryKeys = schema.primaryKeys();
         InternalRowTypeSerializer rowSerializer = new InternalRowTypeSerializer(rowType);
@@ -84,11 +89,15 @@ public class GlobalDynamicBucketSink extends FlinkWriteSink<Tuple2<InternalRow, 
                                 new InternalTypeInfo<>(
                                         new KeyWithRowSerializer<>(
                                                 bootstrapSerializer, rowSerializer)),
-                                new IndexBootstrapOperator<>(new IndexBootstrap(table), r -> r))
+                                new IndexBootstrapOperator.Factory<>(
+                                        new IndexBootstrap(table), r -> r))
                         .setParallelism(input.getParallelism());
 
         // 1. shuffle by key hash
-        Integer assignerParallelism = table.coreOptions().dynamicBucketAssignerParallelism();
+        Integer assignerParallelism =
+                MathUtils.max(
+                        options.dynamicBucketInitialBuckets(),
+                        options.dynamicBucketAssignerParallelism());
         if (assignerParallelism == null) {
             assignerParallelism = parallelism;
         }
@@ -104,10 +113,14 @@ public class GlobalDynamicBucketSink extends FlinkWriteSink<Tuple2<InternalRow, 
         DataStream<Tuple2<InternalRow, Integer>> bucketAssigned =
                 partitionByKeyHash
                         .transform(
-                                "dynamic-bucket-assigner",
+                                "cross-partition-bucket-assigner",
                                 rowWithBucketType,
                                 GlobalIndexAssignerOperator.forRowData(table))
                         .setParallelism(partitionByKeyHash.getParallelism());
+
+        // declare managed memory for RocksDB
+        declareManagedMemory(
+                bucketAssigned, options.toConfiguration().get(SINK_CROSS_PARTITION_MANAGED_MEMORY));
 
         // 3. shuffle by bucket
 
@@ -115,6 +128,6 @@ public class GlobalDynamicBucketSink extends FlinkWriteSink<Tuple2<InternalRow, 
                 partition(bucketAssigned, new RowWithBucketChannelComputer(schema), parallelism);
 
         // 4. writer and committer
-        return sinkFrom(partitionByBucket, initialCommitUser);
+        return sinkFrom(partitionByBucket, createCommitUser(options.toConfiguration()));
     }
 }

@@ -18,18 +18,14 @@
 
 package org.apache.paimon.flink.sink;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.CoreOptions.ChangelogProducer;
 import org.apache.paimon.CoreOptions.LogChangelogMode;
 import org.apache.paimon.CoreOptions.MergeEngine;
-import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.flink.PaimonDataStreamSinkProvider;
 import org.apache.paimon.flink.log.LogSinkProvider;
 import org.apache.paimon.flink.log.LogStoreTableFactory;
 import org.apache.paimon.options.Options;
-import org.apache.paimon.table.AppendOnlyFileStoreTable;
-import org.apache.paimon.table.ChangelogValueCountFileStoreTable;
-import org.apache.paimon.table.ChangelogWithKeyFileStoreTable;
-import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
 
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -49,6 +45,11 @@ import java.util.Map;
 import static org.apache.paimon.CoreOptions.CHANGELOG_PRODUCER;
 import static org.apache.paimon.CoreOptions.LOG_CHANGELOG_MODE;
 import static org.apache.paimon.CoreOptions.MERGE_ENGINE;
+import static org.apache.paimon.flink.FlinkConnectorOptions.CLUSTERING_COLUMNS;
+import static org.apache.paimon.flink.FlinkConnectorOptions.CLUSTERING_SAMPLE_FACTOR;
+import static org.apache.paimon.flink.FlinkConnectorOptions.CLUSTERING_SORT_IN_CLUSTER;
+import static org.apache.paimon.flink.FlinkConnectorOptions.CLUSTERING_STRATEGY;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_PARALLELISM;
 
 /** Table sink to create sink. */
 public abstract class FlinkTableSinkBase
@@ -76,20 +77,22 @@ public abstract class FlinkTableSinkBase
 
     @Override
     public ChangelogMode getChangelogMode(ChangelogMode requestedMode) {
-        if (table instanceof AppendOnlyFileStoreTable) {
+        if (table.primaryKeys().isEmpty()) {
             // Don't check this, for example, only inserts are available from the database, but the
             // plan phase contains all changelogs
             return requestedMode;
-        } else if (table instanceof ChangelogValueCountFileStoreTable) {
-            // no primary key, sink all changelogs
-            return requestedMode;
-        } else if (table instanceof ChangelogWithKeyFileStoreTable) {
+        } else {
             Options options = Options.fromMap(table.options());
             if (options.get(CHANGELOG_PRODUCER) == ChangelogProducer.INPUT) {
                 return requestedMode;
             }
 
             if (options.get(MERGE_ENGINE) == MergeEngine.AGGREGATE) {
+                return requestedMode;
+            }
+
+            if (options.get(MERGE_ENGINE) == MergeEngine.PARTIAL_UPDATE
+                    && new CoreOptions(options).definedAggFunc()) {
                 return requestedMode;
             }
 
@@ -105,9 +108,6 @@ public abstract class FlinkTableSinkBase
                 }
             }
             return builder.build();
-        } else {
-            throw new UnsupportedOperationException(
-                    "Unknown FileStoreTable subclass " + table.getClass().getName());
         }
     }
 
@@ -128,16 +128,28 @@ public abstract class FlinkTableSinkBase
         final LogSinkFunction logSinkFunction =
                 overwrite ? null : (logSinkProvider == null ? null : logSinkProvider.createSink());
         return new PaimonDataStreamSinkProvider(
-                (dataStream) ->
-                        new FlinkSinkBuilder((FileStoreTable) table)
-                                .withInput(
-                                        new DataStream<>(
-                                                dataStream.getExecutionEnvironment(),
-                                                dataStream.getTransformation()))
-                                .withLogSinkFunction(logSinkFunction)
-                                .withOverwritePartition(overwrite ? staticPartitions : null)
-                                .withParallelism(conf.get(FlinkConnectorOptions.SINK_PARALLELISM))
-                                .build());
+                (dataStream) -> {
+                    LogFlinkSinkBuilder builder = createSinkBuilder();
+                    builder.logSinkFunction(logSinkFunction)
+                            .forRowData(
+                                    new DataStream<>(
+                                            dataStream.getExecutionEnvironment(),
+                                            dataStream.getTransformation()))
+                            .clusteringIfPossible(
+                                    conf.get(CLUSTERING_COLUMNS),
+                                    conf.get(CLUSTERING_STRATEGY),
+                                    conf.get(CLUSTERING_SORT_IN_CLUSTER),
+                                    conf.get(CLUSTERING_SAMPLE_FACTOR));
+                    if (overwrite) {
+                        builder.overwrite(staticPartitions);
+                    }
+                    conf.getOptional(SINK_PARALLELISM).ifPresent(builder::parallelism);
+                    return builder.build();
+                });
+    }
+
+    protected LogFlinkSinkBuilder createSinkBuilder() {
+        return new LogFlinkSinkBuilder(table);
     }
 
     @Override

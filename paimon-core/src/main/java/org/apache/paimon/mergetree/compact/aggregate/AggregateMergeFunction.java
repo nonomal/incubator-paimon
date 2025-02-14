@@ -18,11 +18,16 @@
 
 package org.apache.paimon.mergetree.compact.aggregate;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.KeyValue;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.mergetree.compact.MergeFunction;
 import org.apache.paimon.mergetree.compact.MergeFunctionFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldAggregatorFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldLastNonNullValueAggFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldLastValueAggFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldPrimaryKeyAggFactory;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowKind;
@@ -30,10 +35,9 @@ import org.apache.paimon.utils.Projection;
 
 import javax.annotation.Nullable;
 
+import java.util.Arrays;
 import java.util.List;
 
-import static org.apache.paimon.CoreOptions.FIELDS_PREFIX;
-import static org.apache.paimon.options.ConfigOptions.key;
 import static org.apache.paimon.utils.InternalRowUtils.createFieldGetters;
 import static org.apache.paimon.utils.Preconditions.checkNotNull;
 
@@ -42,9 +46,6 @@ import static org.apache.paimon.utils.Preconditions.checkNotNull;
  * pre-aggregate non-null fields on merge.
  */
 public class AggregateMergeFunction implements MergeFunction<KeyValue> {
-
-    public static final String AGG_FUNCTION = "aggregate-function";
-    public static final String IGNORE_RETRACT = "ignore-retract";
 
     private final InternalRow.FieldGetter[] getters;
     private final FieldAggregator[] aggregators;
@@ -63,6 +64,7 @@ public class AggregateMergeFunction implements MergeFunction<KeyValue> {
     public void reset() {
         this.latestKv = null;
         this.row = new GenericRow(getters.length);
+        Arrays.stream(aggregators).forEach(FieldAggregator::reset);
     }
 
     @Override
@@ -82,7 +84,6 @@ public class AggregateMergeFunction implements MergeFunction<KeyValue> {
         }
     }
 
-    @Nullable
     @Override
     public KeyValue getResult() {
         checkNotNull(
@@ -107,7 +108,7 @@ public class AggregateMergeFunction implements MergeFunction<KeyValue> {
 
         private static final long serialVersionUID = 1L;
 
-        private final Options conf;
+        private final CoreOptions options;
         private final List<String> tableNames;
         private final List<DataType> tableTypes;
         private final List<String> primaryKeys;
@@ -117,7 +118,7 @@ public class AggregateMergeFunction implements MergeFunction<KeyValue> {
                 List<String> tableNames,
                 List<DataType> tableTypes,
                 List<String> primaryKeys) {
-            this.conf = conf;
+            this.options = new CoreOptions(conf);
             this.tableNames = tableNames;
             this.tableTypes = tableTypes;
             this.primaryKeys = primaryKeys;
@@ -134,27 +135,39 @@ public class AggregateMergeFunction implements MergeFunction<KeyValue> {
             }
 
             FieldAggregator[] fieldAggregators = new FieldAggregator[fieldNames.size()];
+            List<String> sequenceFields = options.sequenceField();
             for (int i = 0; i < fieldNames.size(); i++) {
                 String fieldName = fieldNames.get(i);
                 DataType fieldType = fieldTypes.get(i);
-                // aggregate by primary keys, so they do not aggregate
-                boolean isPrimaryKey = primaryKeys.contains(fieldName);
-                String strAggFunc =
-                        conf.get(
-                                key(FIELDS_PREFIX + "." + fieldName + "." + AGG_FUNCTION)
-                                        .stringType()
-                                        .noDefaultValue());
-                boolean ignoreRetract =
-                        conf.get(
-                                key(FIELDS_PREFIX + "." + fieldName + "." + IGNORE_RETRACT)
-                                        .booleanType()
-                                        .defaultValue(false));
+
+                String aggFuncName = getAggFuncName(fieldName, sequenceFields);
                 fieldAggregators[i] =
-                        FieldAggregator.createFieldAggregator(
-                                fieldType, strAggFunc, ignoreRetract, isPrimaryKey);
+                        FieldAggregatorFactory.create(fieldType, fieldName, aggFuncName, options);
             }
 
             return new AggregateMergeFunction(createFieldGetters(fieldTypes), fieldAggregators);
+        }
+
+        private String getAggFuncName(String fieldName, List<String> sequenceFields) {
+            if (sequenceFields.contains(fieldName)) {
+                // no agg for sequence fields, use last_value to do cover
+                return FieldLastValueAggFactory.NAME;
+            }
+
+            if (primaryKeys.contains(fieldName)) {
+                // aggregate by primary keys, so they do not aggregate
+                return FieldPrimaryKeyAggFactory.NAME;
+            }
+
+            String aggFuncName = options.fieldAggFunc(fieldName);
+            if (aggFuncName == null) {
+                aggFuncName = options.fieldsDefaultFunc();
+            }
+            if (aggFuncName == null) {
+                // final default agg func
+                aggFuncName = FieldLastNonNullValueAggFactory.NAME;
+            }
+            return aggFuncName;
         }
     }
 }

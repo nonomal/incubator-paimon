@@ -22,11 +22,13 @@ import org.apache.paimon.annotation.Public;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.table.Table;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Filter;
 
 import java.io.Serializable;
-import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 /**
  * An interface for building the {@link TableScan} and {@link TableRead}.
@@ -38,7 +40,7 @@ import java.util.List;
  * Table table = catalog.getTable(...);
  * ReadBuilder builder = table.newReadBuilder()
  *     .withFilter(...)
- *     .withProjection(...);
+ *     .withReadType(...);
  *
  * // 2. Plan splits in 'Coordinator' (or named 'Driver'):
  * List<Split> splits = builder.newScan().plan().splits();
@@ -73,7 +75,7 @@ public interface ReadBuilder extends Serializable {
     /** A name to identify the table. */
     String tableName();
 
-    /** Returns read row type, projected by {@link #withProjection}. */
+    /** Returns read row type. */
     RowType readType();
 
     /**
@@ -95,25 +97,48 @@ public interface ReadBuilder extends Serializable {
      */
     ReadBuilder withFilter(Predicate predicate);
 
-    /**
-     * Apply projection to the reader.
-     *
-     * <p>NOTE: Nested row projection is currently not supported.
-     */
-    default ReadBuilder withProjection(int[] projection) {
-        if (projection == null) {
-            return this;
-        }
-        int[][] nestedProjection =
-                Arrays.stream(projection).mapToObj(i -> new int[] {i}).toArray(int[][]::new);
-        return withProjection(nestedProjection);
-    }
+    /** Push partition filter. */
+    ReadBuilder withPartitionFilter(Map<String, String> partitionSpec);
 
     /**
-     * Push nested projection. For example, {@code [[0, 2, 1], ...]} specifies to include the 2nd
-     * field of the 3rd field of the 1st field in the top-level row.
+     * Push bucket filter. Note that this method cannot be used simultaneously with {@link
+     * #withShard(int, int)}.
+     *
+     * <p>Reason: Bucket filtering and sharding are different logical mechanisms for selecting
+     * subsets of table data. Applying both methods simultaneously introduces conflicting selection
+     * criteria.
      */
-    ReadBuilder withProjection(int[][] projection);
+    ReadBuilder withBucketFilter(Filter<Integer> bucketFilter);
+
+    /**
+     * Push read row type to the reader, support nested row pruning.
+     *
+     * @param readType read row type, can be a pruned type from {@link Table#rowType()}
+     * @since 1.0.0
+     */
+    ReadBuilder withReadType(RowType readType);
+
+    /**
+     * Apply projection to the reader, if you need nested row pruning, use {@link
+     * #withReadType(RowType)} instead.
+     */
+    ReadBuilder withProjection(int[] projection);
+
+    /** the row number pushed down. */
+    ReadBuilder withLimit(int limit);
+
+    /**
+     * Specify the shard to be read, and allocate sharded files to read records. Note that this
+     * method cannot be used simultaneously with {@link #withBucketFilter(Filter)}.
+     *
+     * <p>Reason: Sharding and bucket filtering are different logical mechanisms for selecting
+     * subsets of table data. Applying both methods simultaneously introduces conflicting selection
+     * criteria.
+     */
+    ReadBuilder withShard(int indexOfThisSubtask, int numberOfParallelSubtasks);
+
+    /** Delete stats in scan plan result. */
+    ReadBuilder dropStats();
 
     /** Create a {@link TableScan} to perform batch planning. */
     TableScan newScan();

@@ -18,21 +18,20 @@
 
 package org.apache.paimon.flink.sink.cdc;
 
-import org.apache.paimon.catalog.Catalog;
-import org.apache.paimon.flink.VersionedSerializerWrapper;
+import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.flink.sink.CommittableStateManager;
 import org.apache.paimon.flink.sink.Committer;
-import org.apache.paimon.flink.sink.CommitterMetrics;
-import org.apache.paimon.flink.sink.CommitterOperator;
+import org.apache.paimon.flink.sink.CommitterOperatorFactory;
 import org.apache.paimon.flink.sink.FlinkSink;
+import org.apache.paimon.flink.sink.FlinkStreamPartitioner;
 import org.apache.paimon.flink.sink.MultiTableCommittable;
+import org.apache.paimon.flink.sink.MultiTableCommittableChannelComputer;
 import org.apache.paimon.flink.sink.MultiTableCommittableTypeInfo;
 import org.apache.paimon.flink.sink.RestoreAndFailCommittableStateManager;
 import org.apache.paimon.flink.sink.StoreMultiCommitter;
 import org.apache.paimon.flink.sink.StoreSinkWrite;
 import org.apache.paimon.flink.sink.StoreSinkWriteImpl;
 import org.apache.paimon.flink.sink.WrappedManifestCommittableSerializer;
-import org.apache.paimon.flink.utils.StreamExecutionEnvironmentUtils;
 import org.apache.paimon.manifest.WrappedManifestCommittable;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
@@ -41,14 +40,12 @@ import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.sink.DiscardingSink;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.functions.sink.v2.DiscardingSink;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
-import java.util.Map;
-import java.util.UUID;
 
 import static org.apache.paimon.flink.sink.FlinkSink.assertStreamingConfiguration;
 import static org.apache.paimon.flink.sink.FlinkSink.configureGlobalCommitter;
@@ -63,49 +60,50 @@ public class FlinkCdcMultiTableSink implements Serializable {
     private static final String GLOBAL_COMMITTER_NAME = "Multiplex Global Committer";
 
     private final boolean isOverwrite = false;
-    private final Catalog.Loader catalogLoader;
+    private final CatalogLoader catalogLoader;
     private final double commitCpuCores;
     @Nullable private final MemorySize commitHeapMemory;
+    private final String commitUser;
 
     public FlinkCdcMultiTableSink(
-            Catalog.Loader catalogLoader,
+            CatalogLoader catalogLoader,
             double commitCpuCores,
-            @Nullable MemorySize commitHeapMemory) {
+            @Nullable MemorySize commitHeapMemory,
+            String commitUser) {
         this.catalogLoader = catalogLoader;
         this.commitCpuCores = commitCpuCores;
         this.commitHeapMemory = commitHeapMemory;
+        this.commitUser = commitUser;
     }
 
     private StoreSinkWrite.WithWriteBufferProvider createWriteProvider() {
         // for now, no compaction for multiplexed sink
-        return (table, commitUser, state, ioManager, memoryPoolFactory) ->
+        return (table, commitUser, state, ioManager, memoryPoolFactory, metricGroup) ->
                 new StoreSinkWriteImpl(
                         table,
                         commitUser,
                         state,
                         ioManager,
                         isOverwrite,
-                        false,
+                        table.coreOptions().prepareCommitWaitCompaction(),
                         true,
-                        memoryPoolFactory);
+                        memoryPoolFactory,
+                        metricGroup);
     }
 
-    public DataStreamSink<?> sinkFrom(
-            DataStream<CdcMultiplexRecord> input, Map<String, String> dynamicOptions) {
+    public DataStreamSink<?> sinkFrom(DataStream<CdcMultiplexRecord> input) {
         // This commitUser is valid only for new jobs.
         // After the job starts, this commitUser will be recorded into the states of write and
         // commit operators.
         // When the job restarts, commitUser will be recovered from states and this value is
         // ignored.
-        String initialCommitUser = UUID.randomUUID().toString();
-        return sinkFrom(input, initialCommitUser, createWriteProvider(), dynamicOptions);
+        return sinkFrom(input, commitUser, createWriteProvider());
     }
 
     public DataStreamSink<?> sinkFrom(
             DataStream<CdcMultiplexRecord> input,
             String commitUser,
-            StoreSinkWrite.WithWriteBufferProvider sinkProvider,
-            Map<String, String> dynamicOptions) {
+            StoreSinkWrite.WithWriteBufferProvider sinkProvider) {
         StreamExecutionEnvironment env = input.getExecutionEnvironment();
         assertStreamingConfiguration(env);
         MultiTableCommittableTypeInfo typeInfo = new MultiTableCommittableTypeInfo();
@@ -113,32 +111,37 @@ public class FlinkCdcMultiTableSink implements Serializable {
                 input.transform(
                                 WRITER_NAME,
                                 typeInfo,
-                                createWriteOperator(sinkProvider, commitUser, dynamicOptions))
+                                createWriteOperator(sinkProvider, commitUser))
                         .setParallelism(input.getParallelism());
 
+        // shuffle committables by table
+        DataStream<MultiTableCommittable> partitioned =
+                FlinkStreamPartitioner.partition(
+                        written,
+                        new MultiTableCommittableChannelComputer(),
+                        input.getParallelism());
+
         SingleOutputStreamOperator<?> committed =
-                written.transform(
-                        GLOBAL_COMMITTER_NAME,
-                        typeInfo,
-                        new CommitterOperator<>(
-                                true,
-                                commitUser,
-                                createCommitterFactory(),
-                                createCommittableStateManager()));
-        configureGlobalCommitter(
-                committed,
-                commitCpuCores,
-                commitHeapMemory,
-                StreamExecutionEnvironmentUtils.getConfiguration(env));
-        return committed.addSink(new DiscardingSink<>()).name("end").setParallelism(1);
+                partitioned
+                        .transform(
+                                GLOBAL_COMMITTER_NAME,
+                                typeInfo,
+                                new CommitterOperatorFactory<>(
+                                        true,
+                                        false,
+                                        commitUser,
+                                        createCommitterFactory(),
+                                        createCommittableStateManager()))
+                        .setParallelism(input.getParallelism());
+        configureGlobalCommitter(committed, commitCpuCores, commitHeapMemory);
+        return committed.sinkTo(new DiscardingSink<>()).name("end").setParallelism(1);
     }
 
-    protected OneInputStreamOperator<CdcMultiplexRecord, MultiTableCommittable> createWriteOperator(
-            StoreSinkWrite.WithWriteBufferProvider writeProvider,
-            String commitUser,
-            Map<String, String> dynamicOptions) {
-        return new CdcRecordStoreMultiWriteOperator(
-                catalogLoader, writeProvider, commitUser, new Options(), dynamicOptions);
+    protected OneInputStreamOperatorFactory<CdcMultiplexRecord, MultiTableCommittable>
+            createWriteOperator(
+                    StoreSinkWrite.WithWriteBufferProvider writeProvider, String commitUser) {
+        return new CdcRecordStoreMultiWriteOperator.Factory(
+                catalogLoader, writeProvider, commitUser, new Options());
     }
 
     // Table committers are dynamically created at runtime
@@ -148,12 +151,11 @@ public class FlinkCdcMultiTableSink implements Serializable {
         // commit new files list even if they're empty.
         // Otherwise we can't tell if the commit is successful after
         // a restart.
-        return (user, metricGroup) ->
-                new StoreMultiCommitter(catalogLoader, user, new CommitterMetrics(metricGroup));
+        return context -> new StoreMultiCommitter(catalogLoader, context);
     }
 
     protected CommittableStateManager<WrappedManifestCommittable> createCommittableStateManager() {
         return new RestoreAndFailCommittableStateManager<>(
-                () -> new VersionedSerializerWrapper<>(new WrappedManifestCommittableSerializer()));
+                WrappedManifestCommittableSerializer::new);
     }
 }

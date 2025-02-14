@@ -15,60 +15,78 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.paimon.spark
 
+import org.apache.paimon.CoreOptions
 import org.apache.paimon.operation.FileStoreCommit
-import org.apache.paimon.table.AbstractFileStoreTable
+import org.apache.paimon.table.FileStoreTable
 import org.apache.paimon.table.sink.BatchWriteBuilder
 import org.apache.paimon.types.RowType
-import org.apache.paimon.utils.{FileStorePathFactory, RowDataPartitionComputer}
+import org.apache.paimon.utils.{InternalRowPartitionComputer, TypeUtils}
 
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
-import org.apache.spark.sql.connector.catalog.SupportsPartitionManagement
+import org.apache.spark.sql.catalyst.util.CharVarcharUtils
+import org.apache.spark.sql.connector.catalog.SupportsAtomicPartitionManagement
 import org.apache.spark.sql.types.StructType
 
-import java.util.{Collections, UUID}
-import java.util.{Map => JMap}
+import java.util.{Map => JMap, Objects, UUID}
 
 import scala.collection.JavaConverters._
 
-trait PaimonPartitionManagement extends SupportsPartitionManagement {
+trait PaimonPartitionManagement extends SupportsAtomicPartitionManagement {
   self: SparkTable =>
 
-  def partitionKeys() = getTable.partitionKeys
+  private lazy val partitionRowType: RowType = TypeUtils.project(table.rowType, table.partitionKeys)
 
-  def tableRowType() = new RowType(
-    getTable.rowType.getFields.asScala
-      .filter(dataFiled => partitionKeys.contains(dataFiled.name()))
-      .asJava)
+  override lazy val partitionSchema: StructType = SparkTypeUtils.fromPaimonRowType(partitionRowType)
 
-  override def partitionSchema(): StructType = {
-    SparkTypeUtils.fromPaimonRowType(tableRowType)
+  private def toPaimonPartitions(rows: Array[InternalRow]): Array[java.util.Map[String, String]] = {
+    table match {
+      case fileStoreTable: FileStoreTable =>
+        val rowConverter = CatalystTypeConverters
+          .createToScalaConverter(CharVarcharUtils.replaceCharVarcharWithString(partitionSchema))
+        val rowDataPartitionComputer = new InternalRowPartitionComputer(
+          fileStoreTable.coreOptions().partitionDefaultName(),
+          partitionRowType,
+          table.partitionKeys().asScala.toArray,
+          CoreOptions.fromMap(table.options()).legacyPartitionName)
+
+        rows.map {
+          r =>
+            rowDataPartitionComputer
+              .generatePartValues(new SparkRow(partitionRowType, rowConverter(r).asInstanceOf[Row]))
+        }
+      case _ =>
+        throw new UnsupportedOperationException("Only FileStoreTable supports partitions.")
+    }
   }
 
-  override def dropPartition(internalRow: InternalRow): Boolean = {
-    // convert internalRow to row
-    val row: Row = CatalystTypeConverters
-      .createToScalaConverter(partitionSchema())
-      .apply(internalRow)
-      .asInstanceOf[Row]
-    val rowDataPartitionComputer = new RowDataPartitionComputer(
-      FileStorePathFactory.PARTITION_DEFAULT_NAME.defaultValue,
-      tableRowType,
-      partitionKeys.asScala.toArray)
-    val partitionMap = rowDataPartitionComputer.generatePartValues(new SparkRow(tableRowType, row))
-    getTable match {
-      case table: AbstractFileStoreTable =>
-        val commit: FileStoreCommit = table.store.newCommit(UUID.randomUUID.toString)
-        commit.dropPartitions(
-          Collections.singletonList(partitionMap),
-          BatchWriteBuilder.COMMIT_IDENTIFIER)
+  override def dropPartitions(rows: Array[InternalRow]): Boolean = {
+    table match {
+      case fileStoreTable: FileStoreTable =>
+        val partitions = toPaimonPartitions(rows).toSeq.asJava
+        val partitionHandler = fileStoreTable.catalogEnvironment().partitionHandler()
+        if (partitionHandler != null) {
+          try {
+            partitionHandler.dropPartitions(partitions)
+          } finally {
+            partitionHandler.close()
+          }
+        } else {
+          val commit: FileStoreCommit = fileStoreTable.store.newCommit(UUID.randomUUID.toString)
+          try {
+            commit.dropPartitions(partitions, BatchWriteBuilder.COMMIT_IDENTIFIER)
+          } finally {
+            commit.close()
+          }
+        }
+        true
+
       case _ =>
-        throw new UnsupportedOperationException(
-          "Only AbstractFileStoreTable supports drop partitions.")
+        throw new UnsupportedOperationException("Only FileStoreTable supports drop partitions.")
     }
-    true
   }
 
   override def replacePartitionMetadata(
@@ -78,7 +96,7 @@ trait PaimonPartitionManagement extends SupportsPartitionManagement {
   }
 
   override def loadPartitionMetadata(ident: InternalRow): JMap[String, String] = {
-    throw new UnsupportedOperationException("Load partition is not supported")
+    Map.empty[String, String].asJava
   }
 
   override def listPartitionIdentifiers(
@@ -89,39 +107,49 @@ trait PaimonPartitionManagement extends SupportsPartitionManagement {
       s"Number of partition names (${partitionCols.length}) must be equal to " +
         s"the number of partition values (${internalRow.numFields})."
     )
-    val schema: StructType = partitionSchema
     assert(
-      partitionCols.forall(fieldName => schema.fieldNames.contains(fieldName)),
+      partitionCols.forall(fieldName => partitionSchema.fieldNames.contains(fieldName)),
       s"Some partition names ${partitionCols.mkString("[", ", ", "]")} don't belong to " +
-        s"the partition schema '${schema.sql}'."
+        s"the partition schema '${partitionSchema.sql}'."
     )
-
-    val tableScan = getTable.newReadBuilder.newScan
-    val binaryRows = tableScan.listPartitions.asScala.toList
-    binaryRows
-      .map(
-        binaryRow => {
-          val sparkInternalRow: SparkInternalRow =
-            new SparkInternalRow(SparkTypeUtils.toPaimonType(schema).asInstanceOf[RowType])
-          sparkInternalRow.replace(binaryRow)
-        })
+    table.newReadBuilder.newScan.listPartitions.asScala
+      .map(binaryRow => DataConverter.fromPaimon(binaryRow, partitionRowType))
       .filter(
         sparkInternalRow => {
           partitionCols.zipWithIndex
             .map {
               case (partitionName, index) =>
-                val internalRowIndex = schema.fieldIndex(partitionName)
-                val structField = schema.fields(index)
-                sparkInternalRow
-                  .get(internalRowIndex, structField.dataType)
-                  .equals(internalRow.get(index, structField.dataType))
+                val internalRowIndex = partitionSchema.fieldIndex(partitionName)
+                val structField = partitionSchema.fields(internalRowIndex)
+                Objects.equals(
+                  sparkInternalRow.get(internalRowIndex, structField.dataType),
+                  internalRow.get(index, structField.dataType))
             }
-            .fold(true)(_ && _)
+            .forall(identity)
         })
       .toArray
   }
 
-  override def createPartition(ident: InternalRow, properties: JMap[String, String]): Unit = {
-    throw new UnsupportedOperationException("Create partition is not supported")
+  override def createPartitions(
+      rows: Array[InternalRow],
+      maps: Array[JMap[String, String]]): Unit = {
+    table match {
+      case fileStoreTable: FileStoreTable =>
+        val partitions = toPaimonPartitions(rows)
+        val partitionHandler = fileStoreTable.catalogEnvironment().partitionHandler()
+        if (partitionHandler == null) {
+          throw new UnsupportedOperationException(
+            "The table must have metastore to create partition.")
+        }
+        try {
+          if (fileStoreTable.coreOptions().partitionedTableInMetastore()) {
+            partitionHandler.createPartitions(partitions.toSeq.asJava)
+          }
+        } finally {
+          partitionHandler.close()
+        }
+      case _ =>
+        throw new UnsupportedOperationException("Only FileStoreTable supports create partitions.")
+    }
   }
 }

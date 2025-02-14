@@ -18,9 +18,11 @@
 
 package org.apache.paimon.index;
 
+import org.apache.paimon.deletionvectors.DeletionVectorsIndexFile;
 import org.apache.paimon.utils.ObjectSerializer;
 import org.apache.paimon.utils.ObjectSerializerTestBase;
 
+import java.util.LinkedHashMap;
 import java.util.Random;
 
 /** Test for {@link org.apache.paimon.index.IndexFileMetaSerializer}. */
@@ -38,10 +40,38 @@ public class IndexFileMetaSerializerTest extends ObjectSerializerTestBase<IndexF
 
     public static IndexFileMeta randomIndexFile() {
         Random rnd = new Random();
+        if (rnd.nextBoolean()) {
+            return randomHashIndexFile();
+        } else {
+            return randomDeletionVectorIndexFile();
+        }
+    }
+
+    public static IndexFileMeta randomHashIndexFile() {
+        Random rnd = new Random();
         return new IndexFileMeta(
                 HashIndexFile.HASH_INDEX,
                 "my_file_name" + rnd.nextLong(),
                 rnd.nextInt(),
                 rnd.nextInt());
+    }
+
+    public static IndexFileMeta randomDeletionVectorIndexFile() {
+        Random rnd = new Random();
+        LinkedHashMap<String, DeletionVectorMeta> deletionVectorMetas = new LinkedHashMap<>();
+        deletionVectorMetas.put(
+                "my_file_name1",
+                new DeletionVectorMeta(
+                        "my_file_name1", rnd.nextInt(), rnd.nextInt(), rnd.nextLong()));
+        deletionVectorMetas.put(
+                "my_file_name2",
+                new DeletionVectorMeta(
+                        "my_file_name2", rnd.nextInt(), rnd.nextInt(), rnd.nextLong()));
+        return new IndexFileMeta(
+                DeletionVectorsIndexFile.DELETION_VECTORS_INDEX,
+                "deletion_vectors_index_file_name" + rnd.nextLong(),
+                rnd.nextInt(),
+                rnd.nextInt(),
+                deletionVectorMetas);
     }
 }

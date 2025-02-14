@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -50,6 +50,7 @@ import java.util.stream.Collectors;
 
 import static org.apache.hadoop.hive.metastore.Warehouse.getDnsPath;
 import static org.apache.paimon.CoreOptions.METASTORE_PARTITIONED_TABLE;
+import static org.apache.paimon.catalog.Catalog.COMMENT_PROP;
 import static org.apache.paimon.hive.HiveTypeUtils.toPaimonType;
 
 /**
@@ -60,7 +61,6 @@ public class PaimonMetaHook implements HiveMetaHook {
 
     private static final Logger LOG = LoggerFactory.getLogger(PaimonMetaHook.class);
 
-    private static final String COMMENT = "comment";
     private final Configuration conf;
 
     // paimon table existed before create hive table
@@ -87,7 +87,7 @@ public class PaimonMetaHook implements HiveMetaHook {
             org.apache.hadoop.fs.Path hadoopPath =
                     getDnsPath(new org.apache.hadoop.fs.Path(warehouse), conf);
             warehouse = hadoopPath.toUri().toString();
-            location = AbstractCatalog.dataTableLocation(warehouse, identifier).toUri().toString();
+            location = AbstractCatalog.newTableLocation(warehouse, identifier).toUri().toString();
             table.getSd().setLocation(location);
         }
 
@@ -110,7 +110,7 @@ public class PaimonMetaHook implements HiveMetaHook {
         // create paimon table
         List<FieldSchema> cols = table.getSd().getCols();
         Schema.Builder schemaBuilder =
-                Schema.newBuilder().comment(table.getParameters().get(COMMENT));
+                Schema.newBuilder().comment(table.getParameters().get(COMMENT_PROP));
         cols.iterator()
                 .forEachRemaining(
                         fieldSchema ->

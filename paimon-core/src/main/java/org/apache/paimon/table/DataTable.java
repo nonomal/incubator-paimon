@@ -21,12 +21,18 @@ package org.apache.paimon.table;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.table.source.DataTableScan;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
+import org.apache.paimon.utils.BranchManager;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.TagManager;
 
 /** A {@link Table} for data. */
 public interface DataTable extends InnerTable {
+
+    @Override
+    DataTableScan newScan();
 
     SnapshotReader newSnapshotReader();
 
@@ -34,7 +40,17 @@ public interface DataTable extends InnerTable {
 
     SnapshotManager snapshotManager();
 
+    SchemaManager schemaManager();
+
     TagManager tagManager();
+
+    BranchManager branchManager();
+
+    /**
+     * Get {@link DataTable} with branch identified by {@code branchName}. Note that this method
+     * does not keep dynamic options in current table.
+     */
+    DataTable switchToBranch(String branchName);
 
     Path location();
 

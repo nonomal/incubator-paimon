@@ -47,7 +47,7 @@ public class AvroRowDatumWriter implements DatumWriter<InternalRow> {
             this.isUnion = true;
             schema = schema.getTypes().get(1);
         }
-        this.writer = new FieldWriterFactory().createRowWriter(schema, rowType.getFieldTypes());
+        this.writer = new FieldWriterFactory().createRowWriter(schema, rowType.getFields());
     }
 
     @Override
@@ -56,6 +56,15 @@ public class AvroRowDatumWriter implements DatumWriter<InternalRow> {
             // top Row is a UNION type
             out.writeIndex(1);
         }
-        this.writer.writeRow(datum, out);
+        try {
+            this.writer.writeRow(datum, out);
+        } catch (NullPointerException npe) {
+            throw new RuntimeException(
+                    "Caught NullPointerException, the possible reason is you have set following options together:\n"
+                            + "  1. file.format = avro;\n"
+                            + "  2. merge-function = aggregation/partial-update;\n"
+                            + "  3. some fields are not null.",
+                    npe);
+        }
     }
 }

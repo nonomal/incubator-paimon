@@ -20,19 +20,27 @@ package org.apache.paimon.flink.sink;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.flink.utils.RuntimeContextUtils;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataFileMetaSerializer;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.ChannelComputer;
+import org.apache.paimon.utils.Pair;
 import org.apache.paimon.utils.Preconditions;
 
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
+import org.apache.flink.streaming.api.operators.StreamOperator;
+import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
+import org.apache.flink.streaming.api.operators.StreamOperatorParameters;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.RowData;
 
 import java.io.IOException;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.apache.paimon.utils.SerializationUtils.deserializeBinaryRow;
 
@@ -48,58 +56,66 @@ public class StoreCompactOperator extends PrepareCommitOperator<RowData, Committ
     private final FileStoreTable table;
     private final StoreSinkWrite.Provider storeSinkWriteProvider;
     private final String initialCommitUser;
+    private final boolean fullCompaction;
 
     private transient StoreSinkWriteState state;
     private transient StoreSinkWrite write;
     private transient DataFileMetaSerializer dataFileMetaSerializer;
+    private transient Set<Pair<BinaryRow, Integer>> waitToCompact;
 
-    public StoreCompactOperator(
+    private StoreCompactOperator(
+            StreamOperatorParameters<Committable> parameters,
             FileStoreTable table,
             StoreSinkWrite.Provider storeSinkWriteProvider,
-            String initialCommitUser) {
-        super(Options.fromMap(table.options()));
+            String initialCommitUser,
+            boolean fullCompaction) {
+        super(parameters, Options.fromMap(table.options()));
         Preconditions.checkArgument(
                 !table.coreOptions().writeOnly(),
                 CoreOptions.WRITE_ONLY.key() + " should not be true for StoreCompactOperator.");
         this.table = table;
         this.storeSinkWriteProvider = storeSinkWriteProvider;
         this.initialCommitUser = initialCommitUser;
+        this.fullCompaction = fullCompaction;
     }
 
     @Override
     public void initializeState(StateInitializationContext context) throws Exception {
         super.initializeState(context);
 
-        // Each job can only have one user name and this name must be consistent across restarts.
-        // We cannot use job id as commit user name here because user may change job id by creating
+        // Each job can only have one username and this name must be consistent across restarts.
+        // We cannot use job id as commit username here because user may change job id by creating
         // a savepoint, stop the job and then resume from savepoint.
         String commitUser =
                 StateUtils.getSingleValueFromState(
                         context, "commit_user_state", String.class, initialCommitUser);
 
         state =
-                new StoreSinkWriteState(
+                new StoreSinkWriteStateImpl(
                         context,
                         (tableName, partition, bucket) ->
                                 ChannelComputer.select(
                                                 partition,
                                                 bucket,
-                                                getRuntimeContext().getNumberOfParallelSubtasks())
-                                        == getRuntimeContext().getIndexOfThisSubtask());
-
+                                                RuntimeContextUtils.getNumberOfParallelSubtasks(
+                                                        getRuntimeContext()))
+                                        == RuntimeContextUtils.getIndexOfThisSubtask(
+                                                getRuntimeContext()));
         write =
                 storeSinkWriteProvider.provide(
                         table,
                         commitUser,
                         state,
                         getContainingTask().getEnvironment().getIOManager(),
-                        memoryPool);
+                        memoryPool,
+                        getMetricGroup());
     }
 
     @Override
     public void open() throws Exception {
         super.open();
         dataFileMetaSerializer = new DataFileMetaSerializer();
+        waitToCompact = new LinkedHashSet<>();
     }
 
     @Override
@@ -114,19 +130,28 @@ public class StoreCompactOperator extends PrepareCommitOperator<RowData, Committ
 
         if (write.streamingMode()) {
             write.notifyNewFiles(snapshotId, partition, bucket, files);
-            write.compact(partition, bucket, false);
         } else {
             Preconditions.checkArgument(
                     files.isEmpty(),
                     "Batch compact job does not concern what files are compacted. "
                             + "They only need to know what buckets are compacted.");
-            write.compact(partition, bucket, true);
         }
+
+        waitToCompact.add(Pair.of(partition, bucket));
     }
 
     @Override
     protected List<Committable> prepareCommit(boolean waitCompaction, long checkpointId)
             throws IOException {
+
+        try {
+            for (Pair<BinaryRow, Integer> partitionBucket : waitToCompact) {
+                write.compact(partitionBucket.getKey(), partitionBucket.getRight(), fullCompaction);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Exception happens while executing compaction.", e);
+        }
+        waitToCompact.clear();
         return write.prepareCommit(waitCompaction, checkpointId);
     }
 
@@ -141,5 +166,47 @@ public class StoreCompactOperator extends PrepareCommitOperator<RowData, Committ
     public void close() throws Exception {
         super.close();
         write.close();
+    }
+
+    /** {@link StreamOperatorFactory} of {@link StoreCompactOperator}. */
+    public static class Factory extends PrepareCommitOperator.Factory<RowData, Committable> {
+        private final FileStoreTable table;
+        private final StoreSinkWrite.Provider storeSinkWriteProvider;
+        private final String initialCommitUser;
+        private final boolean fullCompaction;
+
+        public Factory(
+                FileStoreTable table,
+                StoreSinkWrite.Provider storeSinkWriteProvider,
+                String initialCommitUser,
+                boolean fullCompaction) {
+            super(Options.fromMap(table.options()));
+            Preconditions.checkArgument(
+                    !table.coreOptions().writeOnly(),
+                    CoreOptions.WRITE_ONLY.key() + " should not be true for StoreCompactOperator.");
+            this.table = table;
+            this.storeSinkWriteProvider = storeSinkWriteProvider;
+            this.initialCommitUser = initialCommitUser;
+            this.fullCompaction = fullCompaction;
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <T extends StreamOperator<Committable>> T createStreamOperator(
+                StreamOperatorParameters<Committable> parameters) {
+            return (T)
+                    new StoreCompactOperator(
+                            parameters,
+                            table,
+                            storeSinkWriteProvider,
+                            initialCommitUser,
+                            fullCompaction);
+        }
+
+        @Override
+        @SuppressWarnings("rawtypes")
+        public Class<? extends StreamOperator> getStreamOperatorClass(ClassLoader classLoader) {
+            return StoreCompactOperator.class;
+        }
     }
 }

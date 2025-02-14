@@ -22,6 +22,7 @@ import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.ReadonlyTable;
@@ -29,6 +30,7 @@ import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.InnerTableRead;
 import org.apache.paimon.table.source.InnerTableScan;
 import org.apache.paimon.table.source.ReadOnceTableScan;
+import org.apache.paimon.table.source.SingletonSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.DataField;
@@ -38,7 +40,6 @@ import org.apache.paimon.utils.ProjectedRow;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.Iterators;
 
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
@@ -52,7 +53,7 @@ public class CatalogOptionsTable implements ReadonlyTable {
 
     public static final String CATALOG_OPTIONS = "catalog_options";
 
-    private final Map<String, String> catalogOptions;
+    private final Options catalogOptions;
 
     public static final RowType TABLE_TYPE =
             new RowType(
@@ -60,7 +61,7 @@ public class CatalogOptionsTable implements ReadonlyTable {
                             new DataField(0, "key", newStringType(false)),
                             new DataField(1, "value", newStringType(false))));
 
-    public CatalogOptionsTable(Map<String, String> catalogOptions) {
+    public CatalogOptionsTable(Options catalogOptions) {
         this.catalogOptions = catalogOptions;
     }
 
@@ -112,19 +113,14 @@ public class CatalogOptionsTable implements ReadonlyTable {
         }
     }
 
-    private static class CatalogOptionsSplit implements Split {
+    private static class CatalogOptionsSplit extends SingletonSplit {
 
         private static final long serialVersionUID = 1L;
 
         private final Map<String, String> catalogOptions;
 
-        private CatalogOptionsSplit(Map<String, String> catalogOptions) {
-            this.catalogOptions = catalogOptions;
-        }
-
-        @Override
-        public long rowCount() {
-            return catalogOptions.size();
+        private CatalogOptionsSplit(Options catalogOptions) {
+            this.catalogOptions = catalogOptions.toMap();
         }
 
         @Override
@@ -148,7 +144,7 @@ public class CatalogOptionsTable implements ReadonlyTable {
 
     private static class CatalogOptionsRead implements InnerTableRead {
 
-        private int[][] projection;
+        private RowType readType;
 
         @Override
         public InnerTableRead withFilter(Predicate predicate) {
@@ -156,8 +152,8 @@ public class CatalogOptionsTable implements ReadonlyTable {
         }
 
         @Override
-        public InnerTableRead withProjection(int[][] projection) {
-            this.projection = projection;
+        public InnerTableRead withReadType(RowType readType) {
+            this.readType = readType;
             return this;
         }
 
@@ -167,7 +163,7 @@ public class CatalogOptionsTable implements ReadonlyTable {
         }
 
         @Override
-        public RecordReader<InternalRow> createReader(Split split) throws IOException {
+        public RecordReader<InternalRow> createReader(Split split) {
             if (!(split instanceof CatalogOptionsTable.CatalogOptionsSplit)) {
                 throw new IllegalArgumentException("Unsupported split: " + split.getClass());
             }
@@ -175,10 +171,13 @@ public class CatalogOptionsTable implements ReadonlyTable {
                     Iterators.transform(
                             ((CatalogOptionsSplit) split).catalogOptions.entrySet().iterator(),
                             this::toRow);
-            if (projection != null) {
+            if (readType != null) {
                 rows =
                         Iterators.transform(
-                                rows, row -> ProjectedRow.from(projection).replaceRow(row));
+                                rows,
+                                row ->
+                                        ProjectedRow.from(readType, CatalogOptionsTable.TABLE_TYPE)
+                                                .replaceRow(row));
             }
             return new IteratorRecordReader<>(rows);
         }

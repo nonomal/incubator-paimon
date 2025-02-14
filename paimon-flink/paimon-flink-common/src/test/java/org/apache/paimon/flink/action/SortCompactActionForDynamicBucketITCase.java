@@ -24,17 +24,18 @@ import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.operation.KeyValueFileStoreScan;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.predicate.PredicateBuilder;
 import org.apache.paimon.schema.Schema;
-import org.apache.paimon.table.ChangelogWithKeyFileStoreTable;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.BatchTableCommit;
 import org.apache.paimon.table.sink.BatchTableWrite;
 import org.apache.paimon.table.sink.BatchWriteBuilder;
 import org.apache.paimon.table.sink.CommitMessage;
-import org.apache.paimon.table.sink.DynamicBucketRow;
 import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.Pair;
 
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -57,23 +58,18 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
         PredicateBuilder predicateBuilder = new PredicateBuilder(getTable().rowType());
         Predicate predicate = predicateBuilder.between(1, 100L, 200L);
 
-        List<ManifestEntry> files = ((FileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilter =
-                ((ChangelogWithKeyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((KeyValueFileStoreScan) getTable().store().newScan())
                         .withValueFilter(predicate)
                         .plan()
                         .files();
 
         zorder(Arrays.asList("f2", "f1"));
 
-        List<ManifestEntry> filesZorder =
-                ((FileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> filesZorder = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilterZorder =
-                ((ChangelogWithKeyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((KeyValueFileStoreScan) getTable().store().newScan())
                         .withValueFilter(predicate)
                         .plan()
                         .files();
@@ -91,28 +87,53 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
 
         // order f2,f1 will make predicate of f1 perform worse.
         order(Arrays.asList("f2", "f1"));
-        List<ManifestEntry> files = ((FileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilter =
-                ((ChangelogWithKeyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((KeyValueFileStoreScan) getTable().store().newScan())
                         .withValueFilter(predicate)
                         .plan()
                         .files();
 
         zorder(Arrays.asList("f2", "f1"));
 
-        List<ManifestEntry> filesZorder =
-                ((FileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> filesZorder = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilterZorder =
-                ((ChangelogWithKeyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((KeyValueFileStoreScan) getTable().store().newScan())
                         .withValueFilter(predicate)
                         .plan()
                         .files();
 
         Assertions.assertThat(filesFilterZorder.size() / (double) filesZorder.size())
+                .isLessThan(filesFilter.size() / (double) files.size());
+    }
+
+    @Test
+    public void testDynamicBucketSortWithOrderAndHilbert() throws Exception {
+        createTable();
+
+        commit(writeData(100));
+        PredicateBuilder predicateBuilder = new PredicateBuilder(getTable().rowType());
+        Predicate predicate = predicateBuilder.between(1, 100L, 200L);
+
+        // order f2,f1 will make predicate of f1 perform worse.
+        order(Arrays.asList("f2", "f1"));
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
+        List<ManifestEntry> filesFilter =
+                ((KeyValueFileStoreScan) getTable().store().newScan())
+                        .withValueFilter(predicate)
+                        .plan()
+                        .files();
+
+        hilbert(Arrays.asList("f2", "f1"));
+
+        List<ManifestEntry> filesHilbert = getTable().store().newScan().plan().files();
+        List<ManifestEntry> filesFilterHilbert =
+                ((KeyValueFileStoreScan) getTable().store().newScan())
+                        .withValueFilter(predicate)
+                        .plan()
+                        .files();
+
+        Assertions.assertThat(filesFilterHilbert.size() / (double) filesHilbert.size())
                 .isLessThan(filesFilter.size() / (double) files.size());
     }
 
@@ -128,23 +149,18 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
                         BinaryString.fromString("000000000" + 100),
                         BinaryString.fromString("000000000" + 200));
 
-        List<ManifestEntry> files = ((FileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> files = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilter =
-                ((ChangelogWithKeyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((KeyValueFileStoreScan) getTable().store().newScan())
                         .withValueFilter(predicate)
                         .plan()
                         .files();
 
-        zorder(Arrays.asList("f4"));
+        zorder(Collections.singletonList("f4"));
 
-        List<ManifestEntry> filesZorder =
-                ((FileStoreTable) getTable()).store().newScan().plan().files();
+        List<ManifestEntry> filesZorder = getTable().store().newScan().plan().files();
         List<ManifestEntry> filesFilterZorder =
-                ((ChangelogWithKeyFileStoreTable) getTable())
-                        .store()
-                        .newScan()
+                ((KeyValueFileStoreScan) getTable().store().newScan())
                         .withValueFilter(predicate)
                         .plan()
                         .files();
@@ -153,44 +169,31 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
     }
 
     private void zorder(List<String> columns) throws Exception {
-        if (RANDOM.nextBoolean()) {
-            new SortCompactAction(
-                            warehouse,
-                            database,
-                            tableName,
-                            Collections.emptyMap(),
-                            Collections.emptyMap())
-                    .withOrderStrategy("zorder")
-                    .withOrderColumns(columns)
-                    .run();
-        } else {
-            callProcedure("zorder", columns);
-        }
+        createAction("zorder", columns).run();
+    }
+
+    private void hilbert(List<String> columns) throws Exception {
+        createAction("hilbert", columns).run();
     }
 
     private void order(List<String> columns) throws Exception {
-        if (RANDOM.nextBoolean()) {
-            new SortCompactAction(
-                            warehouse,
-                            database,
-                            tableName,
-                            Collections.emptyMap(),
-                            Collections.emptyMap())
-                    .withOrderStrategy("order")
-                    .withOrderColumns(columns)
-                    .run();
-        } else {
-            callProcedure("order", columns);
-        }
+        createAction("order", columns).run();
     }
 
-    private void callProcedure(String orderStrategy, List<String> orderByColumns) {
-        callProcedure(
-                String.format(
-                        "CALL compact('%s.%s', 'ALL', '%s', '%s')",
-                        database, tableName, orderStrategy, String.join(",", orderByColumns)),
-                false,
-                true);
+    private SortCompactAction createAction(String orderStrategy, List<String> columns) {
+        return createAction(
+                SortCompactAction.class,
+                "compact",
+                "--warehouse",
+                warehouse,
+                "--database",
+                database,
+                "--table",
+                tableName,
+                "--order_strategy",
+                orderStrategy,
+                "--order_by",
+                String.join(",", columns));
     }
 
     // schema with all the basic types.
@@ -217,7 +220,8 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
         try (BatchTableWrite batchTableWrite = builder.newWrite()) {
             for (int i = 0; i < size; i++) {
                 for (int j = 0; j < 100; j++) {
-                    batchTableWrite.write(data(i));
+                    Pair<InternalRow, Integer> rowWithBucket = data(i);
+                    batchTableWrite.write(rowWithBucket.getKey(), rowWithBucket.getValue());
                 }
             }
             messages = batchTableWrite.prepareCommit();
@@ -227,7 +231,9 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
     }
 
     private void commit(List<CommitMessage> messages) throws Exception {
-        getTable().newBatchWriteBuilder().newCommit().commit(messages);
+        BatchTableCommit commit = getTable().newBatchWriteBuilder().newCommit();
+        commit.commit(messages);
+        commit.close();
     }
 
     private void createTable() throws Exception {
@@ -235,15 +241,15 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
         catalog.createTable(identifier(), schema(), true);
     }
 
-    private Table getTable() throws Exception {
-        return catalog.getTable(identifier());
+    private FileStoreTable getTable() throws Exception {
+        return (FileStoreTable) catalog.getTable(identifier());
     }
 
     private Identifier identifier() {
         return Identifier.create(database, tableName);
     }
 
-    private static InternalRow data(int bucket) {
+    private static Pair<InternalRow, Integer> data(int bucket) {
         String in = String.valueOf(Math.abs(RANDOM.nextInt(10000)));
         int count = 4 - in.length();
         for (int i = 0; i < count; i++) {
@@ -257,6 +263,6 @@ public class SortCompactActionForDynamicBucketITCase extends ActionITCaseBase {
                         (long) RANDOM.nextInt(10000),
                         (long) RANDOM.nextInt(10000),
                         BinaryString.fromString("00000000" + in));
-        return new DynamicBucketRow(row, bucket);
+        return Pair.of(row, bucket);
     }
 }

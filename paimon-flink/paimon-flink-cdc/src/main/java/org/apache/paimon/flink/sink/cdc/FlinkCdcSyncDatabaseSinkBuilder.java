@@ -18,11 +18,11 @@
 
 package org.apache.paimon.flink.sink.cdc;
 
-import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.FlinkConnectorOptions;
 import org.apache.paimon.flink.action.MultiTablesSinkMode;
-import org.apache.paimon.flink.sink.FlinkStreamPartitioner;
+import org.apache.paimon.flink.sink.FlinkWriteSink;
 import org.apache.paimon.flink.utils.SingleOutputStreamOperatorUtils;
 import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
@@ -33,7 +33,6 @@ import org.apache.paimon.utils.Preconditions;
 
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
-import org.apache.flink.streaming.api.transformations.PartitionTransformation;
 
 import javax.annotation.Nullable;
 
@@ -41,12 +40,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import static org.apache.paimon.CoreOptions.createCommitUser;
 import static org.apache.paimon.flink.action.MultiTablesSinkMode.COMBINED;
 import static org.apache.paimon.flink.sink.FlinkStreamPartitioner.partition;
 
 /**
- * Builder for {@link FlinkCdcSink} when syncing the whole database into one Paimon database. Each
- * database table will be written into a separate Paimon table.
+ * Builder for CDC {@link FlinkWriteSink} when syncing the whole database into one Paimon database.
+ * Each database table will be written into a separate Paimon table.
  *
  * <p>This builder will create a separate sink for each Paimon sink table. Thus this implementation
  * is not very efficient in resource saving.
@@ -66,17 +66,17 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
     @Nullable private Integer parallelism;
     private double committerCpu;
     @Nullable private MemorySize committerMemory;
-    private Map<String, String> dynamicOptions;
 
     // Paimon catalog used to check and create tables. There will be two
     //     places where this catalog is used. 1) in processing function,
     //     it will check newly added tables and create the corresponding
     //     Paimon tables. 2) in multiplex sink where it is used to
     //     initialize different writers to multiple tables.
-    private Catalog.Loader catalogLoader;
+    private CatalogLoader catalogLoader;
     // database to sync, currently only support single database
     private String database;
     private MultiTablesSinkMode mode;
+    private String commitUser;
 
     public FlinkCdcSyncDatabaseSinkBuilder<T> withInput(DataStream<T> input) {
         this.input = input;
@@ -99,10 +99,10 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
     }
 
     public FlinkCdcSyncDatabaseSinkBuilder<T> withTableOptions(Options options) {
-        this.dynamicOptions = options.toMap();
         this.parallelism = options.get(FlinkConnectorOptions.SINK_PARALLELISM);
         this.committerCpu = options.get(FlinkConnectorOptions.SINK_COMMITTER_CPU);
         this.committerMemory = options.get(FlinkConnectorOptions.SINK_COMMITTER_MEMORY);
+        this.commitUser = createCommitUser(options);
         return this;
     }
 
@@ -111,7 +111,7 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
         return this;
     }
 
-    public FlinkCdcSyncDatabaseSinkBuilder<T> withCatalogLoader(Catalog.Loader catalogLoader) {
+    public FlinkCdcSyncDatabaseSinkBuilder<T> withCatalogLoader(CatalogLoader catalogLoader) {
         this.catalogLoader = catalogLoader;
         return this;
     }
@@ -140,6 +140,7 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
                         .process(
                                 new CdcDynamicTableParsingProcessFunction<>(
                                         database, catalogLoader, parserFactory))
+                        .name("Side Output")
                         .setParallelism(input.getParallelism());
 
         // for newly-added tables, create a multiplexing operator that handles all their records
@@ -151,29 +152,34 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
         SingleOutputStreamOperatorUtils.getSideOutput(
                         parsed,
                         CdcDynamicTableParsingProcessFunction.DYNAMIC_SCHEMA_CHANGE_OUTPUT_TAG)
-                .process(new MultiTableUpdatedDataFieldsProcessFunction(catalogLoader));
+                .keyBy(t -> t.f0)
+                .process(new MultiTableUpdatedDataFieldsProcessFunction(catalogLoader))
+                .name("Schema Evolution");
 
-        FlinkStreamPartitioner<CdcMultiplexRecord> partitioner =
-                new FlinkStreamPartitioner<>(
-                        new CdcMultiplexRecordChannelComputer(catalogLoader, dynamicOptions));
-        PartitionTransformation<CdcMultiplexRecord> partitioned =
-                new PartitionTransformation<>(
-                        newlyAddedTableStream.getTransformation(), partitioner);
+        DataStream<CdcMultiplexRecord> converted =
+                CaseSensitiveUtils.cdcMultiplexRecordConvert(catalogLoader, newlyAddedTableStream);
 
-        if (parallelism != null) {
-            partitioned.setParallelism(parallelism);
-        }
+        DataStream<CdcMultiplexRecord> partitioned =
+                partition(
+                        converted,
+                        new CdcMultiplexRecordChannelComputer(catalogLoader),
+                        parallelism);
 
         FlinkCdcMultiTableSink sink =
-                new FlinkCdcMultiTableSink(catalogLoader, committerCpu, committerMemory);
-        sink.sinkFrom(
-                new DataStream<>(input.getExecutionEnvironment(), partitioned), dynamicOptions);
+                new FlinkCdcMultiTableSink(
+                        catalogLoader, committerCpu, committerMemory, commitUser);
+        sink.sinkFrom(partitioned);
     }
 
     private void buildForFixedBucket(FileStoreTable table, DataStream<CdcRecord> parsed) {
         DataStream<CdcRecord> partitioned =
                 partition(parsed, new CdcRecordChannelComputer(table.schema()), parallelism);
-        new FlinkCdcSink(table).sinkFrom(partitioned);
+        new CdcFixedBucketSink(table).sinkFrom(partitioned);
+    }
+
+    private void buildForUnawareBucket(FileStoreTable table, DataStream<CdcRecord> parsed) {
+        // rebalance it to make sure schema change work to avoid infinite loop
+        new CdcUnawareBucketSink(table, parallelism).sinkFrom(parsed.rebalance());
     }
 
     private void buildDividedCdcSink() {
@@ -182,6 +188,7 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
         SingleOutputStreamOperator<Void> parsed =
                 input.forward()
                         .process(new CdcMultiTableParsingProcessFunction<>(parserFactory))
+                        .name("Side Output")
                         .setParallelism(input.getParallelism());
 
         for (FileStoreTable table : tables) {
@@ -194,7 +201,8 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
                                     new UpdatedDataFieldsProcessFunction(
                                             new SchemaManager(table.fileIO(), table.location()),
                                             Identifier.create(database, table.name()),
-                                            catalogLoader));
+                                            catalogLoader))
+                            .name("Schema Evolution");
             schemaChangeProcessFunction.getTransformation().setParallelism(1);
             schemaChangeProcessFunction.getTransformation().setMaxParallelism(1);
 
@@ -204,16 +212,21 @@ public class FlinkCdcSyncDatabaseSinkBuilder<T> {
                             CdcMultiTableParsingProcessFunction.createRecordOutputTag(
                                     table.name()));
 
+            DataStream<CdcRecord> converted =
+                    CaseSensitiveUtils.cdcRecordConvert(catalogLoader, parsedForTable);
+
             BucketMode bucketMode = table.bucketMode();
             switch (bucketMode) {
-                case FIXED:
-                    buildForFixedBucket(table, parsedForTable);
+                case HASH_FIXED:
+                    buildForFixedBucket(table, converted);
                     break;
-                case DYNAMIC:
-                    new CdcDynamicBucketSink(table).build(parsedForTable, parallelism);
+                case HASH_DYNAMIC:
+                    new CdcDynamicBucketSink(table).build(converted, parallelism);
                     break;
-                case GLOBAL_DYNAMIC:
-                case UNAWARE:
+                case BUCKET_UNAWARE:
+                    buildForUnawareBucket(table, converted);
+                    break;
+                case CROSS_PARTITION:
                 default:
                     throw new UnsupportedOperationException(
                             "Unsupported bucket mode: " + bucketMode);

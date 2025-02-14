@@ -18,9 +18,13 @@
 
 package org.apache.paimon.flink.source;
 
+import org.apache.paimon.flink.NestedProjectedRowData;
+import org.apache.paimon.flink.source.metrics.FileStoreSourceReaderMetrics;
 import org.apache.paimon.utils.Reference;
 
+import org.apache.flink.api.common.eventtime.TimestampAssigner;
 import org.apache.flink.api.connector.source.SourceOutput;
+import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.file.src.reader.BulkFormat.RecordIterator;
 import org.apache.flink.connector.file.src.util.RecordAndPosition;
@@ -102,12 +106,38 @@ public class FlinkRecordsWithSplitIds implements RecordsWithSplitIds<RecordItera
     }
 
     public static void emitRecord(
+            SourceReaderContext context,
             RecordIterator<RowData> element,
             SourceOutput<RowData> output,
-            FileStoreSourceSplitState state) {
+            FileStoreSourceSplitState state,
+            FileStoreSourceReaderMetrics metrics,
+            @Nullable NestedProjectedRowData nestedProjectedRowData) {
+        long timestamp = TimestampAssigner.NO_TIMESTAMP;
+        if (metrics.getLatestFileCreationTime() != FileStoreSourceReaderMetrics.UNDEFINED) {
+            timestamp = metrics.getLatestFileCreationTime();
+        }
+
+        // This metric only counts the number of RecordIterator<RowData> emitted,
+        // however what we really want is to count the number of RowData emitted,
+        // so we replenish the missing record count here.
+        org.apache.flink.metrics.Counter numRecordsIn =
+                context.metricGroup().getIOMetricGroup().getNumRecordsInCounter();
+        boolean firstRecord = true;
+
         RecordAndPosition<RowData> record;
         while ((record = element.next()) != null) {
-            output.collect(record.getRecord());
+            // First record in the iterator is already counted by SourceReaderBase#pollNext.
+            if (firstRecord) {
+                firstRecord = false;
+            } else {
+                numRecordsIn.inc();
+            }
+
+            RowData rowData = record.getRecord();
+            if (nestedProjectedRowData != null) {
+                rowData = nestedProjectedRowData.replaceRow(rowData);
+            }
+            output.collect(rowData, timestamp);
             state.setPosition(record);
         }
     }

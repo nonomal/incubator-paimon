@@ -21,21 +21,37 @@ package org.apache.paimon.utils;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Decimal;
 import org.apache.paimon.data.GenericArray;
+import org.apache.paimon.data.GenericMap;
+import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypeChecks;
 import org.apache.paimon.types.DataTypeRoot;
 import org.apache.paimon.types.DecimalType;
+import org.apache.paimon.types.LocalZonedTimestampType;
+import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TimestampType;
 import org.apache.paimon.types.VarCharType;
 
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.core.JsonProcessingException;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.TimeZone;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.types.DataTypeChecks.getNestedTypes;
@@ -44,6 +60,18 @@ import static org.apache.paimon.types.DataTypeFamily.CHARACTER_STRING;
 
 /** Type related helper functions. */
 public class TypeUtils {
+    public static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final Logger LOG = LoggerFactory.getLogger(TypeUtils.class);
+
+    public static RowType concat(RowType left, RowType right) {
+        RowType.Builder builder = RowType.builder();
+        List<DataField> fields = new ArrayList<>(left.getFields());
+        fields.addAll(right.getFields());
+        fields.forEach(
+                dataField ->
+                        builder.field(dataField.name(), dataField.type(), dataField.description()));
+        return builder.build();
+    }
 
     public static RowType project(RowType inputType, int[] mapping) {
         List<DataField> fields = inputType.getFields();
@@ -68,7 +96,7 @@ public class TypeUtils {
         return castFromStringInternal(s, type, true);
     }
 
-    private static Object castFromStringInternal(String s, DataType type, boolean isCdcValue) {
+    public static Object castFromStringInternal(String s, DataType type, boolean isCdcValue) {
         BinaryString str = BinaryString.fromString(s);
         switch (type.getTypeRoot()) {
             case CHAR:
@@ -132,24 +160,134 @@ public class TypeUtils {
             case TIMESTAMP_WITHOUT_TIME_ZONE:
                 TimestampType timestampType = (TimestampType) type;
                 return BinaryStringUtils.toTimestamp(str, timestampType.getPrecision());
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                LocalZonedTimestampType localZonedTimestampType = (LocalZonedTimestampType) type;
+                return BinaryStringUtils.toTimestamp(
+                        str, localZonedTimestampType.getPrecision(), TimeZone.getDefault());
             case ARRAY:
                 ArrayType arrayType = (ArrayType) type;
                 DataType elementType = arrayType.getElementType();
-                if (elementType instanceof VarCharType) {
-                    if (s.startsWith("[")) {
-                        s = s.substring(1);
+                try {
+                    JsonNode arrayNode = OBJECT_MAPPER.readTree(s);
+                    List<Object> resultList = new ArrayList<>();
+                    for (JsonNode elementNode : arrayNode) {
+                        if (!elementNode.isNull()) {
+                            String elementJson;
+                            if (elementNode.isTextual()) {
+                                elementJson = elementNode.asText();
+                            } else {
+                                elementJson = elementNode.toString();
+                            }
+                            Object elementObject =
+                                    castFromStringInternal(elementJson, elementType, isCdcValue);
+                            resultList.add(elementObject);
+                        } else {
+                            resultList.add(null);
+                        }
                     }
-                    if (s.endsWith("]")) {
-                        s = s.substring(0, s.length() - 1);
+                    return new GenericArray(resultList.toArray());
+                } catch (JsonProcessingException e) {
+                    LOG.info(
+                            String.format(
+                                    "Failed to parse ARRAY for type %s with value %s", type, s),
+                            e);
+                    // try existing code flow
+                    if (elementType instanceof VarCharType) {
+                        if (s.startsWith("[")) {
+                            s = s.substring(1);
+                        }
+                        if (s.endsWith("]")) {
+                            s = s.substring(0, s.length() - 1);
+                        }
+                        String[] ss = s.split(",");
+                        BinaryString[] binaryStrings = new BinaryString[ss.length];
+                        for (int i = 0; i < ss.length; i++) {
+                            binaryStrings[i] = BinaryString.fromString(ss[i]);
+                        }
+                        return new GenericArray(binaryStrings);
+                    } else {
+                        throw new UnsupportedOperationException("Unsupported type " + type);
                     }
-                    String[] ss = s.split(",");
-                    BinaryString[] binaryStrings = new BinaryString[ss.length];
-                    for (int i = 0; i < ss.length; i++) {
-                        binaryStrings[i] = BinaryString.fromString(ss[i]);
+                } catch (Exception e) {
+                    throw new RuntimeException(
+                            String.format("Failed to parse Json String %s", s), e);
+                }
+            case MAP:
+                MapType mapType = (MapType) type;
+                DataType keyType = mapType.getKeyType();
+                DataType valueType = mapType.getValueType();
+                try {
+                    JsonNode mapNode = OBJECT_MAPPER.readTree(s);
+                    Map<Object, Object> resultMap = new HashMap<>();
+                    mapNode.fields()
+                            .forEachRemaining(
+                                    entry -> {
+                                        Object key =
+                                                castFromStringInternal(
+                                                        entry.getKey(), keyType, isCdcValue);
+                                        Object value = null;
+                                        if (!entry.getValue().isNull()) {
+                                            if (entry.getValue().isTextual()) {
+                                                value =
+                                                        castFromStringInternal(
+                                                                entry.getValue().asText(),
+                                                                valueType,
+                                                                isCdcValue);
+                                            } else {
+                                                value =
+                                                        castFromStringInternal(
+                                                                entry.getValue().toString(),
+                                                                valueType,
+                                                                isCdcValue);
+                                            }
+                                        }
+                                        resultMap.put(key, value);
+                                    });
+                    return new GenericMap(resultMap);
+                } catch (JsonProcessingException e) {
+                    LOG.info(
+                            String.format("Failed to parse MAP for type %s with value %s", type, s),
+                            e);
+                    return new GenericMap(Collections.emptyMap());
+                } catch (Exception e) {
+                    throw new RuntimeException(
+                            String.format("Failed to parse Json String %s", s), e);
+                }
+            case ROW:
+                RowType rowType = (RowType) type;
+                try {
+                    JsonNode rowNode = OBJECT_MAPPER.readTree(s);
+                    GenericRow genericRow =
+                            new GenericRow(
+                                    rowType.getFields()
+                                            .size()); // TODO: What about RowKind? always +I?
+                    for (int pos = 0; pos < rowType.getFields().size(); ++pos) {
+                        DataField field = rowType.getFields().get(pos);
+                        JsonNode fieldNode = rowNode.get(field.name());
+                        if (fieldNode != null && !fieldNode.isNull()) {
+                            String fieldJson;
+                            if (fieldNode.isTextual()) {
+                                fieldJson = fieldNode.asText();
+                            } else {
+                                fieldJson = fieldNode.toString();
+                            }
+                            Object fieldObject =
+                                    castFromStringInternal(fieldJson, field.type(), isCdcValue);
+                            genericRow.setField(pos, fieldObject);
+                        } else {
+                            genericRow.setField(pos, null); // Handle null fields
+                        }
                     }
-                    return new GenericArray(binaryStrings);
-                } else {
-                    throw new UnsupportedOperationException("Unsupported type " + type);
+                    return genericRow;
+                } catch (JsonProcessingException e) {
+                    LOG.info(
+                            String.format(
+                                    "Failed to parse ROW for type  %s  with value  %s", type, s),
+                            e);
+                    return new GenericRow(0);
+                } catch (Exception e) {
+                    throw new RuntimeException(
+                            String.format("Failed to parse Json String %s", s), e);
                 }
             default:
                 throw new UnsupportedOperationException("Unsupported type " + type);
@@ -212,5 +350,21 @@ public class TypeUtils {
             default:
                 return t1.copy(true).equals(t2.copy(true));
         }
+    }
+
+    public static boolean isBasicType(Object obj) {
+        Class<?> clazz = obj.getClass();
+        return clazz.isPrimitive() || isWrapperType(clazz) || clazz.equals(String.class);
+    }
+
+    private static boolean isWrapperType(Class<?> clazz) {
+        return clazz.equals(Boolean.class)
+                || clazz.equals(Character.class)
+                || clazz.equals(Byte.class)
+                || clazz.equals(Short.class)
+                || clazz.equals(Integer.class)
+                || clazz.equals(Long.class)
+                || clazz.equals(Float.class)
+                || clazz.equals(Double.class);
     }
 }

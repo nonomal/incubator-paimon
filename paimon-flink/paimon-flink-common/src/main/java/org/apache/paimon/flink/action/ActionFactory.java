@@ -18,13 +18,11 @@
 
 package org.apache.paimon.flink.action;
 
-import org.apache.paimon.catalog.CatalogUtils;
 import org.apache.paimon.factories.Factory;
 import org.apache.paimon.factories.FactoryException;
 import org.apache.paimon.factories.FactoryUtil;
-import org.apache.paimon.utils.Preconditions;
+import org.apache.paimon.options.CatalogOptions;
 
-import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.api.java.utils.MultipleParameterTool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,15 +35,37 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import static org.apache.paimon.utils.ParameterUtils.parseCommaSeparatedKeyValues;
+import static org.apache.paimon.utils.ParameterUtils.parseKeyValueList;
+import static org.apache.paimon.utils.ParameterUtils.parseKeyValueString;
+
 /** Factory to create {@link Action}. */
 public interface ActionFactory extends Factory {
 
     Logger LOG = LoggerFactory.getLogger(ActionFactory.class);
 
-    Optional<Action> create(MultipleParameterTool params);
+    String HELP = "help";
+    String WAREHOUSE = "warehouse";
+    String DATABASE = "database";
+    String TABLE = "table";
+    @Deprecated String PATH = "path";
+    String CATALOG_CONF = "catalog_conf";
+    String TABLE_CONF = "table_conf";
+    String PARTITION = "partition";
+    String EXPIRATIONTIME = "expiration_time";
+    String TIMESTAMPFORMATTER = "timestamp_formatter";
+    String EXPIRE_STRATEGY = "expire_strategy";
+    String TIMESTAMP_PATTERN = "timestamp_pattern";
+    // Supports `full` and `minor`.
+    String COMPACT_STRATEGY = "compact_strategy";
+    String MINOR = "minor";
+    String FULL = "full";
+
+    Optional<Action> create(MultipleParameterToolAdapter params);
 
     static Optional<Action> createAction(String[] args) {
-        String action = args[0].toLowerCase();
+        // to be compatible with old usage
+        String action = args[0].toLowerCase().replaceAll("-", "_");
         String[] actionArgs = Arrays.copyOfRange(args, 1, args.length);
         ActionFactory actionFactory;
         try {
@@ -59,10 +79,19 @@ public interface ActionFactory extends Factory {
 
         LOG.info("{} job args: {}", actionFactory.identifier(), String.join(" ", actionArgs));
 
-        MultipleParameterTool params = MultipleParameterTool.fromArgs(actionArgs);
-        if (params.has("help")) {
+        MultipleParameterToolAdapter params =
+                new MultipleParameterToolAdapter(MultipleParameterTool.fromArgs(actionArgs));
+        if (params.has(HELP)) {
             actionFactory.printHelp();
             return Optional.empty();
+        }
+
+        if (params.has(PATH)) {
+            throw new UnsupportedOperationException(
+                    String.format(
+                            "Parameter '%s' is deprecated. Please use '--%s %s=<warehouse>' to specify warehouse if needed, "
+                                    + "and use '%s' to specify database and '%s' to specify table.",
+                            PATH, CATALOG_CONF, CatalogOptions.WAREHOUSE.key(), DATABASE, TABLE));
         }
 
         return actionFactory.create(params);
@@ -82,42 +111,9 @@ public interface ActionFactory extends Factory {
         System.out.println("For detailed options of each action, run <action> --help");
     }
 
-    default Tuple3<String, String, String> getTablePath(MultipleParameterTool params) {
-        String warehouse = params.get("warehouse");
-        String database = params.get("database");
-        String table = params.get("table");
-        String path = params.get("path");
-
-        Tuple3<String, String, String> tablePath = null;
-        int count = 0;
-        if (warehouse != null || database != null || table != null) {
-            if (warehouse == null || database == null || table == null) {
-                throw new IllegalArgumentException(
-                        "Warehouse, database and table must be specified all at once to specify a table.");
-            }
-            tablePath = Tuple3.of(warehouse, database, table);
-            count++;
-        }
-        if (path != null) {
-            tablePath =
-                    Tuple3.of(
-                            CatalogUtils.warehouse(path),
-                            CatalogUtils.database(path),
-                            CatalogUtils.table(path));
-            count++;
-        }
-
-        if (count != 1) {
-            throw new IllegalArgumentException(
-                    "Please specify either \"warehouse, database and table\" or \"path\".");
-        }
-
-        return tablePath;
-    }
-
-    default List<Map<String, String>> getPartitions(MultipleParameterTool params) {
+    default List<Map<String, String>> getPartitions(MultipleParameterToolAdapter params) {
         List<Map<String, String>> partitions = new ArrayList<>();
-        for (String partition : params.getMultiParameter("partition")) {
+        for (String partition : params.getMultiParameter(PARTITION)) {
             Map<String, String> kvs = parseCommaSeparatedKeyValues(partition);
             partitions.add(kvs);
         }
@@ -125,7 +121,7 @@ public interface ActionFactory extends Factory {
         return partitions;
     }
 
-    default Map<String, String> optionalConfigMap(MultipleParameterTool params, String key) {
+    default Map<String, String> optionalConfigMap(MultipleParameterToolAdapter params, String key) {
         if (!params.has(key)) {
             return Collections.emptyMap();
         }
@@ -137,32 +133,25 @@ public interface ActionFactory extends Factory {
         return config;
     }
 
-    default void checkRequiredArgument(MultipleParameterTool params, String key) {
-        Preconditions.checkArgument(
-                params.has(key), "Argument '%s' is required. Run '<action> --help' for help.", key);
-    }
-
-    default String getRequiredValue(MultipleParameterTool params, String key) {
-        checkRequiredArgument(params, key);
-        return params.get(key);
-    }
-
-    static Map<String, String> parseCommaSeparatedKeyValues(String keyValues) {
-        Map<String, String> kvs = new HashMap<>();
-        for (String kvString : keyValues.split(",")) {
-            parseKeyValueString(kvs, kvString);
+    default Map<String, List<String>> optionalConfigMapList(
+            MultipleParameterToolAdapter params, String key) {
+        if (!params.has(key)) {
+            return Collections.emptyMap();
         }
-        return kvs;
+
+        Map<String, List<String>> config = new HashMap<>();
+        for (String kvString : params.getMultiParameter(key)) {
+            parseKeyValueList(config, kvString);
+        }
+        return config;
     }
 
-    static void parseKeyValueString(Map<String, String> map, String kvString) {
-        String[] kv = kvString.split("=", 2);
-        if (kv.length != 2) {
-            throw new IllegalArgumentException(
-                    String.format(
-                            "Invalid key-value string '%s'. Please use format 'key=value'",
-                            kvString));
+    default Map<String, String> catalogConfigMap(MultipleParameterToolAdapter params) {
+        Map<String, String> catalogConfig = new HashMap<>(optionalConfigMap(params, CATALOG_CONF));
+        String warehouse = params.get(WAREHOUSE);
+        if (warehouse != null && !catalogConfig.containsKey(WAREHOUSE)) {
+            catalogConfig.put(WAREHOUSE, warehouse);
         }
-        map.put(kv[0].trim(), kv[1].trim());
+        return catalogConfig;
     }
 }

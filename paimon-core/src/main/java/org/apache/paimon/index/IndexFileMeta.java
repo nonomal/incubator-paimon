@@ -18,29 +18,68 @@
 
 package org.apache.paimon.index;
 
+import org.apache.paimon.annotation.Public;
+import org.apache.paimon.deletionvectors.DeletionVectorsIndexFile;
+import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
 
-import java.util.ArrayList;
-import java.util.List;
+import javax.annotation.Nullable;
+
+import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.Objects;
 
 import static org.apache.paimon.utils.SerializationUtils.newStringType;
 
-/** Metadata of index file. */
+/**
+ * Metadata of index file.
+ *
+ * @since 0.9.0
+ */
+@Public
 public class IndexFileMeta {
+
+    public static final RowType SCHEMA =
+            new RowType(
+                    false,
+                    Arrays.asList(
+                            new DataField(0, "_INDEX_TYPE", newStringType(false)),
+                            new DataField(1, "_FILE_NAME", newStringType(false)),
+                            new DataField(2, "_FILE_SIZE", new BigIntType(false)),
+                            new DataField(3, "_ROW_COUNT", new BigIntType(false)),
+                            new DataField(
+                                    4,
+                                    "_DELETIONS_VECTORS_RANGES",
+                                    new ArrayType(true, DeletionVectorMeta.SCHEMA))));
 
     private final String indexType;
     private final String fileName;
     private final long fileSize;
     private final long rowCount;
 
+    /**
+     * Metadata only used by {@link DeletionVectorsIndexFile}, use LinkedHashMap to ensure that the
+     * order of DeletionVectorMetas and the written DeletionVectors is consistent.
+     */
+    private final @Nullable LinkedHashMap<String, DeletionVectorMeta> deletionVectorMetas;
+
     public IndexFileMeta(String indexType, String fileName, long fileSize, long rowCount) {
+        this(indexType, fileName, fileSize, rowCount, null);
+    }
+
+    public IndexFileMeta(
+            String indexType,
+            String fileName,
+            long fileSize,
+            long rowCount,
+            @Nullable LinkedHashMap<String, DeletionVectorMeta> deletionVectorMetas) {
         this.indexType = indexType;
         this.fileName = fileName;
         this.fileSize = fileSize;
         this.rowCount = rowCount;
+        this.deletionVectorMetas = deletionVectorMetas;
     }
 
     public String indexType() {
@@ -59,6 +98,10 @@ public class IndexFileMeta {
         return rowCount;
     }
 
+    public @Nullable LinkedHashMap<String, DeletionVectorMeta> deletionVectorMetas() {
+        return deletionVectorMetas;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -71,12 +114,13 @@ public class IndexFileMeta {
         return Objects.equals(indexType, that.indexType)
                 && Objects.equals(fileName, that.fileName)
                 && fileSize == that.fileSize
-                && rowCount == that.rowCount;
+                && rowCount == that.rowCount
+                && Objects.equals(deletionVectorMetas, that.deletionVectorMetas);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(indexType, fileName, fileSize, rowCount);
+        return Objects.hash(indexType, fileName, fileSize, rowCount, deletionVectorMetas);
     }
 
     @Override
@@ -91,15 +135,8 @@ public class IndexFileMeta {
                 + fileSize
                 + ", rowCount="
                 + rowCount
+                + ", deletionVectorMetas="
+                + deletionVectorMetas
                 + '}';
-    }
-
-    public static RowType schema() {
-        List<DataField> fields = new ArrayList<>();
-        fields.add(new DataField(0, "_INDEX_TYPE", newStringType(false)));
-        fields.add(new DataField(1, "_FILE_NAME", newStringType(false)));
-        fields.add(new DataField(2, "_FILE_SIZE", new BigIntType(false)));
-        fields.add(new DataField(3, "_ROW_COUNT", new BigIntType(false)));
-        return new RowType(fields);
     }
 }

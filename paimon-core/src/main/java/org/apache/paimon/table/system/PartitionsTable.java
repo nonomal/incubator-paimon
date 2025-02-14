@@ -18,46 +18,45 @@
 
 package org.apache.paimon.table.system;
 
+import org.apache.paimon.casting.CastExecutor;
+import org.apache.paimon.casting.CastExecutors;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.data.LazyGenericRow;
+import org.apache.paimon.data.Timestamp;
 import org.apache.paimon.disk.IOManager;
-import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.ReadonlyTable;
 import org.apache.paimon.table.Table;
-import org.apache.paimon.table.source.DataSplit;
 import org.apache.paimon.table.source.InnerTableRead;
 import org.apache.paimon.table.source.InnerTableScan;
 import org.apache.paimon.table.source.ReadOnceTableScan;
+import org.apache.paimon.table.source.SingletonSplit;
 import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
-import org.apache.paimon.table.source.TableScan;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.IteratorRecordReader;
 import org.apache.paimon.utils.ProjectedRow;
-import org.apache.paimon.utils.RowDataToObjectArrayConverter;
 import org.apache.paimon.utils.SerializationUtils;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.Iterators;
 
 import java.io.IOException;
-import java.util.ArrayList;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.NoSuchElementException;
-import java.util.Objects;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
 
 import static org.apache.paimon.catalog.Catalog.SYSTEM_TABLE_SPLITTER;
 
@@ -73,7 +72,9 @@ public class PartitionsTable implements ReadonlyTable {
                     Arrays.asList(
                             new DataField(0, "partition", SerializationUtils.newStringType(true)),
                             new DataField(1, "record_count", new BigIntType(false)),
-                            new DataField(2, "file_size_in_bytes", new BigIntType(false))));
+                            new DataField(2, "file_size_in_bytes", new BigIntType(false)),
+                            new DataField(3, "file_count", new BigIntType(false)),
+                            new DataField(4, "last_update_time", DataTypes.TIMESTAMP_MILLIS())));
 
     private final FileStoreTable storeTable;
 
@@ -98,12 +99,12 @@ public class PartitionsTable implements ReadonlyTable {
 
     @Override
     public InnerTableScan newScan() {
-        return new PartitionsScan(storeTable);
+        return new PartitionsScan();
     }
 
     @Override
     public InnerTableRead newRead() {
-        return new PartitionsRead();
+        return new PartitionsRead(storeTable);
     }
 
     @Override
@@ -113,68 +114,44 @@ public class PartitionsTable implements ReadonlyTable {
 
     private static class PartitionsScan extends ReadOnceTableScan {
 
-        private final FileStoreTable storeTable;
-
-        private PartitionsScan(FileStoreTable storeTable) {
-            this.storeTable = storeTable;
-        }
-
         @Override
         public InnerTableScan withFilter(Predicate predicate) {
-            // TODO
             return this;
         }
 
         @Override
         public Plan innerPlan() {
-            return () -> Collections.singletonList(new PartitionsSplit(storeTable));
+            return () -> Collections.singletonList(new PartitionsSplit());
         }
     }
 
-    private static class PartitionsSplit implements Split {
+    private static class PartitionsSplit extends SingletonSplit {
 
         private static final long serialVersionUID = 1L;
-
-        private final FileStoreTable storeTable;
-
-        private PartitionsSplit(FileStoreTable storeTable) {
-            this.storeTable = storeTable;
-        }
-
-        @Override
-        public long rowCount() {
-            TableScan.Plan plan = plan();
-            return plan.splits().stream()
-                    .map(s -> ((DataSplit) s).partition())
-                    .collect(Collectors.toSet())
-                    .size();
-        }
-
-        private TableScan.Plan plan() {
-            return storeTable.newScan().plan();
-        }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) {
                 return true;
             }
-            if (o == null || getClass() != o.getClass()) {
-                return false;
-            }
-            PartitionsSplit that = (PartitionsSplit) o;
-            return Objects.equals(storeTable, that.storeTable);
+            return o != null && getClass() == o.getClass();
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(storeTable);
+            return 1;
         }
     }
 
     private static class PartitionsRead implements InnerTableRead {
 
-        private int[][] projection;
+        private final FileStoreTable fileStoreTable;
+
+        private RowType readType;
+
+        public PartitionsRead(FileStoreTable table) {
+            this.fileStoreTable = table;
+        }
 
         @Override
         public InnerTableRead withFilter(Predicate predicate) {
@@ -183,8 +160,8 @@ public class PartitionsTable implements ReadonlyTable {
         }
 
         @Override
-        public InnerTableRead withProjection(int[][] projection) {
-            this.projection = projection;
+        public InnerTableRead withReadType(RowType readType) {
+            this.readType = readType;
             return this;
         }
 
@@ -198,123 +175,45 @@ public class PartitionsTable implements ReadonlyTable {
             if (!(split instanceof PartitionsSplit)) {
                 throw new IllegalArgumentException("Unsupported split: " + split.getClass());
             }
-            PartitionsSplit filesSplit = (PartitionsSplit) split;
-            FileStoreTable table = filesSplit.storeTable;
-            TableScan.Plan plan = filesSplit.plan();
-            if (plan.splits().isEmpty()) {
-                return new IteratorRecordReader<>(Collections.emptyIterator());
-            }
-            List<Iterator<InternalRow>> iteratorList = new ArrayList<>();
-            RowDataToObjectArrayConverter partitionConverter =
-                    new RowDataToObjectArrayConverter(table.schema().logicalPartitionType());
 
-            for (Split dataSplit : plan.splits()) {
-                iteratorList.add(
-                        Iterators.transform(
-                                ((DataSplit) dataSplit).dataFiles().iterator(),
-                                file -> toRow((DataSplit) dataSplit, partitionConverter, file)));
-            }
-            Iterator<InternalRow> rows = Iterators.concat(iteratorList.iterator());
-            // Group by partition and sum the others
-            Iterator<InternalRow> resultRows = groupAndSum(rows);
+            List<PartitionEntry> partitions = fileStoreTable.newScan().listPartitionEntries();
 
-            if (projection != null) {
-                resultRows =
-                        Iterators.transform(
-                                resultRows, row -> ProjectedRow.from(projection).replaceRow(row));
-            }
-
-            return new IteratorRecordReader<>(resultRows);
-        }
-
-        private LazyGenericRow toRow(
-                DataSplit dataSplit,
-                RowDataToObjectArrayConverter partitionConverter,
-                DataFileMeta dataFileMeta) {
-
-            BinaryString partitionId =
-                    dataSplit.partition() == null
-                            ? null
-                            : BinaryString.fromString(
-                                    Arrays.toString(
-                                            partitionConverter.convert(dataSplit.partition())));
             @SuppressWarnings("unchecked")
-            Supplier<Object>[] fields =
-                    new Supplier[] {
-                        () -> partitionId, dataFileMeta::rowCount, dataFileMeta::fileSize
-                    };
+            CastExecutor<InternalRow, BinaryString> partitionCastExecutor =
+                    (CastExecutor<InternalRow, BinaryString>)
+                            CastExecutors.resolveToString(
+                                    fileStoreTable.schema().logicalPartitionType());
 
-            return new LazyGenericRow(fields);
-        }
-    }
+            // sorted by partition
+            Iterator<InternalRow> iterator =
+                    partitions.stream()
+                            .map(partitionEntry -> toRow(partitionEntry, partitionCastExecutor))
+                            .sorted(Comparator.comparing(row -> row.getString(0)))
+                            .iterator();
 
-    public static Iterator<InternalRow> groupAndSum(Iterator<InternalRow> rows) {
-        return new GroupedIterator(rows);
-    }
-
-    /** group by partition and sum the recordCount and fileBytes . */
-    static class GroupedIterator implements Iterator<InternalRow> {
-        private final Iterator<InternalRow> rows;
-        private final Map<BinaryString, Partition> groupedData;
-        private Iterator<Partition> resultIterator;
-
-        public GroupedIterator(Iterator<InternalRow> rows) {
-            this.rows = rows;
-            this.groupedData = new HashMap<>();
-            groupAndSum();
-        }
-
-        private void groupAndSum() {
-            while (rows.hasNext()) {
-                InternalRow row = rows.next();
-                BinaryString partitionId = row.getString(0);
-                long recordCount = row.getLong(1);
-                long fileSizeInBytes = row.getLong(2);
-
-                // Grouping and summing
-                Partition rowData =
-                        groupedData.computeIfAbsent(
-                                partitionId, key -> new Partition(partitionId, 0, 0));
-                rowData.recordCount += recordCount;
-                rowData.fileSizeInBytes += fileSizeInBytes;
+            if (readType != null) {
+                iterator =
+                        Iterators.transform(
+                                iterator,
+                                row ->
+                                        ProjectedRow.from(readType, PartitionsTable.TABLE_TYPE)
+                                                .replaceRow(row));
             }
-            resultIterator = groupedData.values().iterator();
+            return new IteratorRecordReader<>(iterator);
         }
 
-        @Override
-        public boolean hasNext() {
-            return resultIterator.hasNext();
-        }
-
-        @Override
-        public InternalRow next() {
-            if (hasNext()) {
-                Partition partition = resultIterator.next();
-                return GenericRow.of(
-                        partition.partition, partition.recordCount, partition.fileSizeInBytes);
-            } else {
-                throw new NoSuchElementException("No more elements in the iterator.");
-            }
-        }
-    }
-
-    static class Partition {
-        private final BinaryString partition;
-        private long recordCount;
-        private long fileSizeInBytes;
-
-        Partition(BinaryString partition, long recordCount, long fileSizeInBytes) {
-            this.partition = partition;
-            this.recordCount = recordCount;
-            this.fileSizeInBytes = fileSizeInBytes;
-        }
-
-        public long recordCount() {
-            return recordCount;
-        }
-
-        public long fileSize() {
-            return fileSizeInBytes;
+        private InternalRow toRow(
+                PartitionEntry entry,
+                CastExecutor<InternalRow, BinaryString> partitionCastExecutor) {
+            return GenericRow.of(
+                    partitionCastExecutor.cast(entry.partition()),
+                    entry.recordCount(),
+                    entry.fileSizeInBytes(),
+                    entry.fileCount(),
+                    Timestamp.fromLocalDateTime(
+                            LocalDateTime.ofInstant(
+                                    Instant.ofEpochMilli(entry.lastFileCreationTime()),
+                                    ZoneId.systemDefault())));
         }
     }
 }

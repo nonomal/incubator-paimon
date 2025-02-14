@@ -18,10 +18,12 @@
 
 package org.apache.paimon.flink.action;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.flink.LogicalTypeConversion;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
+import org.apache.paimon.utils.StringUtils;
 
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.table.api.Table;
@@ -44,7 +46,9 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.apache.paimon.flink.action.ActionFactory.parseCommaSeparatedKeyValues;
+import static org.apache.paimon.CoreOptions.MergeEngine.DEDUPLICATE;
+import static org.apache.paimon.CoreOptions.MergeEngine.PARTIAL_UPDATE;
+import static org.apache.paimon.utils.ParameterUtils.parseCommaSeparatedKeyValues;
 
 /**
  * Flink action for 'MERGE INTO', which references the syntax as follows (we use 'upsert' semantics
@@ -74,6 +78,8 @@ public class MergeIntoAction extends TableActionBase {
 
     private static final Logger LOG = LoggerFactory.getLogger(MergeIntoAction.class);
 
+    public static final String IDENTIFIER_QUOTE = "`";
+
     // primary keys of target table
     private final List<String> primaryKeys;
 
@@ -96,11 +102,11 @@ public class MergeIntoAction extends TableActionBase {
     private String mergeCondition;
 
     // actions to be taken
-    boolean matchedUpsert;
-    boolean notMatchedUpsert;
-    boolean matchedDelete;
-    boolean notMatchedDelete;
-    boolean insert;
+    private boolean matchedUpsert;
+    private boolean notMatchedUpsert;
+    private boolean matchedDelete;
+    private boolean notMatchedDelete;
+    private boolean insert;
 
     // upsert
     @Nullable String matchedUpsertCondition;
@@ -117,16 +123,8 @@ public class MergeIntoAction extends TableActionBase {
     @Nullable private String notMatchedInsertCondition;
     @Nullable private String notMatchedInsertValues;
 
-    public MergeIntoAction(String warehouse, String database, String tableName) {
-        this(warehouse, database, tableName, Collections.emptyMap());
-    }
-
-    public MergeIntoAction(
-            String warehouse,
-            String database,
-            String tableName,
-            Map<String, String> catalogConfig) {
-        super(warehouse, database, tableName, catalogConfig);
+    public MergeIntoAction(String database, String tableName, Map<String, String> catalogConfig) {
+        super(database, tableName, catalogConfig);
 
         if (!(table instanceof FileStoreTable)) {
             throw new UnsupportedOperationException(
@@ -134,8 +132,6 @@ public class MergeIntoAction extends TableActionBase {
                             "Only FileStoreTable supports merge-into action. The table type is '%s'.",
                             table.getClass().getName()));
         }
-
-        changeIgnoreMergeEngine();
 
         // init primaryKeys of target table
         primaryKeys = ((FileStoreTable) table).schema().primaryKeys();
@@ -217,8 +213,46 @@ public class MergeIntoAction extends TableActionBase {
         return this;
     }
 
+    public void validate() {
+        if (!matchedUpsert && !notMatchedUpsert && !matchedDelete && !notMatchedDelete && !insert) {
+            throw new IllegalArgumentException(
+                    "Must specify at least one merge action. Run 'merge_into --help' for help.");
+        }
+
+        CoreOptions.MergeEngine mergeEngine = CoreOptions.fromMap(table.options()).mergeEngine();
+        boolean supportMergeInto = mergeEngine == DEDUPLICATE || mergeEngine == PARTIAL_UPDATE;
+        if (!supportMergeInto) {
+            throw new UnsupportedOperationException(
+                    String.format("Merge engine %s can not support merge-into.", mergeEngine));
+        }
+
+        if ((matchedUpsert && matchedDelete)
+                && (matchedUpsertCondition == null || matchedDeleteCondition == null)) {
+            throw new IllegalArgumentException(
+                    "If both matched-upsert and matched-delete actions are present, their conditions must both be present too.");
+        }
+
+        if ((notMatchedUpsert && notMatchedDelete)
+                && (notMatchedBySourceUpsertCondition == null
+                        || notMatchedBySourceDeleteCondition == null)) {
+            throw new IllegalArgumentException(
+                    "If both not-matched-by-source-upsert and not-matched-by--source-delete actions are present, "
+                            + "their conditions must both be present too.\n");
+        }
+
+        if (notMatchedBySourceUpsertSet != null && notMatchedBySourceUpsertSet.equals("*")) {
+            throw new IllegalArgumentException(
+                    "The '*' cannot be used in not_matched_by_source_upsert_set");
+        }
+    }
+
     @Override
     public void run() throws Exception {
+        DataStream<RowData> dataStream = buildDataStream();
+        batchSink(dataStream).await();
+    }
+
+    public DataStream<RowData> buildDataStream() {
         // handle aliases
         handleTargetAlias();
 
@@ -237,9 +271,8 @@ public class MergeIntoAction extends TableActionBase {
                         .map(Optional::get)
                         .collect(Collectors.toList());
 
-        // sink to target table
         DataStream<RowData> firstDs = dataStreams.get(0);
-        batchSink(firstDs.union(dataStreams.stream().skip(1).toArray(DataStream[]::new)));
+        return firstDs.union(dataStreams.stream().skip(1).toArray(DataStream[]::new));
     }
 
     private void handleTargetAlias() {
@@ -303,7 +336,7 @@ public class MergeIntoAction extends TableActionBase {
         String query =
                 String.format(
                         "SELECT %s FROM %s INNER JOIN %s ON %s %s",
-                        String.join(",", project),
+                        String.join(",", normalizeFieldName(project)),
                         escapedTargetName(),
                         escapedSourceName(),
                         mergeCondition,
@@ -347,7 +380,7 @@ public class MergeIntoAction extends TableActionBase {
         String query =
                 String.format(
                         "SELECT %s FROM %s WHERE NOT EXISTS (SELECT * FROM %s WHERE %s) %s",
-                        String.join(",", project),
+                        String.join(",", normalizeFieldName(project)),
                         escapedTargetName(),
                         escapedSourceName(),
                         mergeCondition,
@@ -378,7 +411,7 @@ public class MergeIntoAction extends TableActionBase {
         String query =
                 String.format(
                         "SELECT %s FROM %s INNER JOIN %s ON %s %s",
-                        String.join(",", project),
+                        String.join(",", normalizeFieldName(project)),
                         escapedTargetName(),
                         escapedSourceName(),
                         mergeCondition,
@@ -400,7 +433,7 @@ public class MergeIntoAction extends TableActionBase {
         String query =
                 String.format(
                         "SELECT %s FROM %s WHERE NOT EXISTS (SELECT * FROM %s WHERE %s) %s",
-                        String.join(",", targetFieldNames),
+                        String.join(",", normalizeFieldName(targetFieldNames)),
                         escapedTargetName(),
                         escapedSourceName(),
                         mergeCondition,
@@ -488,5 +521,30 @@ public class MergeIntoAction extends TableActionBase {
         return Arrays.stream(sourceTable.split("\\."))
                 .map(s -> String.format("`%s`", s))
                 .collect(Collectors.joining("."));
+    }
+
+    private List<String> normalizeFieldName(List<String> fieldNames) {
+        return fieldNames.stream().map(this::normalizeFieldName).collect(Collectors.toList());
+    }
+
+    private String normalizeFieldName(String fieldName) {
+        if (StringUtils.isNullOrWhitespaceOnly(fieldName) || fieldName.endsWith(IDENTIFIER_QUOTE)) {
+            return fieldName;
+        }
+
+        String[] splitFieldNames = fieldName.split("\\.");
+        if (!targetFieldNames.contains(splitFieldNames[splitFieldNames.length - 1])) {
+            return fieldName;
+        }
+
+        return String.join(
+                ".",
+                Arrays.stream(splitFieldNames)
+                        .map(
+                                part ->
+                                        part.endsWith(IDENTIFIER_QUOTE)
+                                                ? part
+                                                : IDENTIFIER_QUOTE + part + IDENTIFIER_QUOTE)
+                        .toArray(String[]::new));
     }
 }

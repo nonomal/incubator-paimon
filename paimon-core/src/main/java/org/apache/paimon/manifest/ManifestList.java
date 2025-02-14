@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,10 +18,12 @@
 
 package org.apache.paimon.manifest;
 
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriterFactory;
 import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.ObjectsFile;
@@ -31,6 +33,8 @@ import org.apache.paimon.utils.VersionedObjectSerializer;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -39,17 +43,69 @@ import java.util.List;
  */
 public class ManifestList extends ObjectsFile<ManifestFileMeta> {
 
-    private final FormatWriterFactory writerFactory;
-
     private ManifestList(
             FileIO fileIO,
             ManifestFileMetaSerializer serializer,
+            RowType schema,
             FormatReaderFactory readerFactory,
             FormatWriterFactory writerFactory,
+            String compression,
             PathFactory pathFactory,
-            @Nullable SegmentsCache<String> cache) {
-        super(fileIO, serializer, readerFactory, writerFactory, pathFactory, cache);
-        this.writerFactory = writerFactory;
+            @Nullable SegmentsCache<Path> cache) {
+        super(
+                fileIO,
+                serializer,
+                schema,
+                readerFactory,
+                writerFactory,
+                compression,
+                pathFactory,
+                cache);
+    }
+
+    /**
+     * Return all {@link ManifestFileMeta} instances for either data or changelog manifests in this
+     * snapshot.
+     *
+     * @return a list of ManifestFileMeta.
+     */
+    public List<ManifestFileMeta> readAllManifests(Snapshot snapshot) {
+        List<ManifestFileMeta> result = new ArrayList<>();
+        result.addAll(readDataManifests(snapshot));
+        result.addAll(readChangelogManifests(snapshot));
+        return result;
+    }
+
+    /**
+     * Return a {@link ManifestFileMeta} for each data manifest in this snapshot.
+     *
+     * @return a list of ManifestFileMeta.
+     */
+    public List<ManifestFileMeta> readDataManifests(Snapshot snapshot) {
+        List<ManifestFileMeta> result = new ArrayList<>();
+        result.addAll(read(snapshot.baseManifestList()));
+        result.addAll(readDeltaManifests(snapshot));
+        return result;
+    }
+
+    /**
+     * Return a {@link ManifestFileMeta} for each delta manifest in this snapshot.
+     *
+     * @return a list of ManifestFileMeta.
+     */
+    public List<ManifestFileMeta> readDeltaManifests(Snapshot snapshot) {
+        return read(snapshot.deltaManifestList());
+    }
+
+    /**
+     * Return a {@link ManifestFileMeta} for each changelog manifest in this snapshot.
+     *
+     * @return a list of ManifestFileMeta.
+     */
+    public List<ManifestFileMeta> readChangelogManifests(Snapshot snapshot) {
+        return snapshot.changelogManifestList() == null
+                ? Collections.emptyList()
+                : read(snapshot.changelogManifestList());
     }
 
     /**
@@ -66,27 +122,32 @@ public class ManifestList extends ObjectsFile<ManifestFileMeta> {
 
         private final FileIO fileIO;
         private final FileFormat fileFormat;
+        private final String compression;
         private final FileStorePathFactory pathFactory;
-        @Nullable private final SegmentsCache<String> cache;
+        @Nullable private final SegmentsCache<Path> cache;
 
         public Factory(
                 FileIO fileIO,
                 FileFormat fileFormat,
+                String compression,
                 FileStorePathFactory pathFactory,
-                @Nullable SegmentsCache<String> cache) {
+                @Nullable SegmentsCache<Path> cache) {
             this.fileIO = fileIO;
             this.fileFormat = fileFormat;
+            this.compression = compression;
             this.pathFactory = pathFactory;
             this.cache = cache;
         }
 
         public ManifestList create() {
-            RowType metaType = VersionedObjectSerializer.versionType(ManifestFileMeta.schema());
+            RowType metaType = VersionedObjectSerializer.versionType(ManifestFileMeta.SCHEMA);
             return new ManifestList(
                     fileIO,
                     new ManifestFileMetaSerializer(),
+                    metaType,
                     fileFormat.createReaderFactory(metaType),
                     fileFormat.createWriterFactory(metaType),
+                    compression,
                     pathFactory.manifestListFactory(),
                     cache);
         }

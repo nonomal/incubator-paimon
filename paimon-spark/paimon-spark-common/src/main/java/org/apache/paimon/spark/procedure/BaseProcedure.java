@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -108,6 +108,11 @@ abstract class BaseProcedure implements Procedure {
         }
     }
 
+    protected DataSourceV2Relation createRelation(Identifier ident) {
+        return DataSourceV2Relation.create(
+                loadSparkTable(ident), Option.apply(tableCatalog), Option.apply(ident));
+    }
+
     protected void refreshSparkCache(Identifier ident, Table table) {
         CacheManager cacheManager = spark.sharedState().cacheManager();
         DataSourceV2Relation relation =
@@ -117,6 +122,14 @@ abstract class BaseProcedure implements Procedure {
 
     protected InternalRow newInternalRow(Object... values) {
         return new GenericInternalRow(values);
+    }
+
+    protected SparkSession spark() {
+        return spark;
+    }
+
+    protected TableCatalog tableCatalog() {
+        return tableCatalog;
     }
 
     protected abstract static class Builder<T extends BaseProcedure> implements ProcedureBuilder {

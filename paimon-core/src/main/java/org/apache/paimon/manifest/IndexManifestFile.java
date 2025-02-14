@@ -22,62 +22,52 @@ import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriterFactory;
 import org.apache.paimon.fs.FileIO;
-import org.apache.paimon.manifest.IndexManifestEntry.Identifier;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.ObjectsFile;
 import org.apache.paimon.utils.PathFactory;
+import org.apache.paimon.utils.SegmentsCache;
 import org.apache.paimon.utils.VersionedObjectSerializer;
 
 import javax.annotation.Nullable;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
 /** Index manifest file. */
 public class IndexManifestFile extends ObjectsFile<IndexManifestEntry> {
 
     private IndexManifestFile(
             FileIO fileIO,
+            RowType schema,
             FormatReaderFactory readerFactory,
             FormatWriterFactory writerFactory,
-            PathFactory pathFactory) {
+            String compression,
+            PathFactory pathFactory,
+            @Nullable SegmentsCache<Path> cache) {
         super(
                 fileIO,
                 new IndexManifestEntrySerializer(),
+                schema,
                 readerFactory,
                 writerFactory,
+                compression,
                 pathFactory,
-                null);
+                cache);
     }
 
-    /** Merge new index files to index manifest. */
+    /** Write new index files to index manifest. */
     @Nullable
-    public String merge(
-            @Nullable String previousIndexManifest, List<IndexManifestEntry> newIndexFiles) {
-        String indexManifest = previousIndexManifest;
-        if (newIndexFiles.size() > 0) {
-            Map<Identifier, IndexManifestEntry> indexEntries = new LinkedHashMap<>();
-            List<IndexManifestEntry> entries =
-                    indexManifest == null ? new ArrayList<>() : read(indexManifest);
-            entries.addAll(newIndexFiles);
-            for (IndexManifestEntry file : entries) {
-                if (file.kind() == FileKind.ADD) {
-                    indexEntries.put(file.identifier(), file);
-                    if (file.indexFile().rowCount() == 0) {
-                        indexEntries.remove(file.identifier());
-                        fileIO.deleteQuietly(pathFactory.toPath(file.indexFile().fileName()));
-                    }
-                } else {
-                    indexEntries.remove(file.identifier());
-                }
-            }
-            indexManifest = writeWithoutRolling(indexEntries.values());
+    public String writeIndexFiles(
+            @Nullable String previousIndexManifest,
+            List<IndexManifestEntry> newIndexFiles,
+            BucketMode bucketMode) {
+        if (newIndexFiles.isEmpty()) {
+            return previousIndexManifest;
         }
-
-        return indexManifest;
+        IndexManifestFileHandler handler = new IndexManifestFileHandler(this, bucketMode);
+        return handler.write(previousIndexManifest, newIndexFiles);
     }
 
     /** Creator of {@link IndexManifestFile}. */
@@ -85,21 +75,33 @@ public class IndexManifestFile extends ObjectsFile<IndexManifestEntry> {
 
         private final FileIO fileIO;
         private final FileFormat fileFormat;
+        private final String compression;
         private final FileStorePathFactory pathFactory;
+        @Nullable private final SegmentsCache<Path> cache;
 
-        public Factory(FileIO fileIO, FileFormat fileFormat, FileStorePathFactory pathFactory) {
+        public Factory(
+                FileIO fileIO,
+                FileFormat fileFormat,
+                String compression,
+                FileStorePathFactory pathFactory,
+                @Nullable SegmentsCache<Path> cache) {
             this.fileIO = fileIO;
             this.fileFormat = fileFormat;
+            this.compression = compression;
             this.pathFactory = pathFactory;
+            this.cache = cache;
         }
 
         public IndexManifestFile create() {
-            RowType schema = VersionedObjectSerializer.versionType(IndexManifestEntry.schema());
+            RowType schema = VersionedObjectSerializer.versionType(IndexManifestEntry.SCHEMA);
             return new IndexManifestFile(
                     fileIO,
+                    schema,
                     fileFormat.createReaderFactory(schema),
                     fileFormat.createWriterFactory(schema),
-                    pathFactory.indexManifestFileFactory());
+                    compression,
+                    pathFactory.indexManifestFileFactory(),
+                    cache);
         }
     }
 }

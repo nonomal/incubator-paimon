@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,18 +18,17 @@
 
 package org.apache.paimon.manifest;
 
-import org.apache.paimon.CoreOptions;
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriterFactory;
-import org.apache.paimon.format.TableStatsCollector;
+import org.apache.paimon.format.SimpleStatsCollector;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.io.RollingFileWriter;
 import org.apache.paimon.io.SingleFileWriter;
 import org.apache.paimon.schema.SchemaManager;
-import org.apache.paimon.stats.FieldStatsArraySerializer;
+import org.apache.paimon.stats.SimpleStatsConverter;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.ObjectsFile;
@@ -40,6 +39,7 @@ import org.apache.paimon.utils.VersionedObjectSerializer;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -58,12 +58,22 @@ public class ManifestFile extends ObjectsFile<ManifestEntry> {
             SchemaManager schemaManager,
             RowType partitionType,
             ManifestEntrySerializer serializer,
+            RowType schema,
             FormatReaderFactory readerFactory,
             FormatWriterFactory writerFactory,
+            String compression,
             PathFactory pathFactory,
             long suggestedFileSize,
-            @Nullable SegmentsCache<String> cache) {
-        super(fileIO, serializer, readerFactory, writerFactory, pathFactory, cache);
+            @Nullable SegmentsCache<Path> cache) {
+        super(
+                fileIO,
+                serializer,
+                schema,
+                readerFactory,
+                writerFactory,
+                compression,
+                pathFactory,
+                cache);
         this.schemaManager = schemaManager;
         this.partitionType = partitionType;
         this.writerFactory = writerFactory;
@@ -75,20 +85,22 @@ public class ManifestFile extends ObjectsFile<ManifestEntry> {
         return suggestedFileSize;
     }
 
+    public List<ExpireFileEntry> readExpireFileEntries(String fileName, @Nullable Long fileSize) {
+        List<ManifestEntry> entries = read(fileName, fileSize);
+        List<ExpireFileEntry> result = new ArrayList<>(entries.size());
+        for (ManifestEntry entry : entries) {
+            result.add(ExpireFileEntry.from(entry));
+        }
+        return result;
+    }
+
     /**
      * Write several {@link ManifestEntry}s into manifest files.
      *
      * <p>NOTE: This method is atomic.
      */
     public List<ManifestFileMeta> write(List<ManifestEntry> entries) {
-        RollingFileWriter<ManifestEntry, ManifestFileMeta> writer =
-                new RollingFileWriter<>(
-                        () ->
-                                new ManifestEntryWriter(
-                                        writerFactory,
-                                        pathFactory.newPath(),
-                                        CoreOptions.FILE_COMPRESSION.defaultValue()),
-                        suggestedFileSize);
+        RollingFileWriter<ManifestEntry, ManifestFileMeta> writer = createRollingWriter();
         try {
             writer.write(entries);
             writer.close();
@@ -98,20 +110,36 @@ public class ManifestFile extends ObjectsFile<ManifestEntry> {
         return writer.result();
     }
 
-    private class ManifestEntryWriter extends SingleFileWriter<ManifestEntry, ManifestFileMeta> {
+    public RollingFileWriter<ManifestEntry, ManifestFileMeta> createRollingWriter() {
+        return new RollingFileWriter<>(
+                () -> new ManifestEntryWriter(writerFactory, pathFactory.newPath(), compression),
+                suggestedFileSize);
+    }
 
-        private final TableStatsCollector partitionStatsCollector;
-        private final FieldStatsArraySerializer partitionStatsSerializer;
+    public ManifestEntryWriter createManifestEntryWriter(Path manifestPath) {
+        return new ManifestEntryWriter(writerFactory, manifestPath, compression);
+    }
+
+    /** Writer for {@link ManifestEntry}. */
+    public class ManifestEntryWriter extends SingleFileWriter<ManifestEntry, ManifestFileMeta> {
+
+        private final SimpleStatsCollector partitionStatsCollector;
+        private final SimpleStatsConverter partitionStatsSerializer;
 
         private long numAddedFiles = 0;
         private long numDeletedFiles = 0;
         private long schemaId = Long.MIN_VALUE;
 
         ManifestEntryWriter(FormatWriterFactory factory, Path path, String fileCompression) {
-            super(ManifestFile.this.fileIO, factory, path, serializer::toRow, fileCompression);
-
-            this.partitionStatsCollector = new TableStatsCollector(partitionType);
-            this.partitionStatsSerializer = new FieldStatsArraySerializer(partitionType);
+            super(
+                    ManifestFile.this.fileIO,
+                    factory,
+                    path,
+                    serializer::toRow,
+                    fileCompression,
+                    false);
+            this.partitionStatsCollector = new SimpleStatsCollector(partitionType);
+            this.partitionStatsSerializer = new SimpleStatsConverter(partitionType);
         }
 
         @Override
@@ -140,7 +168,7 @@ public class ManifestFile extends ObjectsFile<ManifestEntry> {
                     fileIO.getFileSize(path),
                     numAddedFiles,
                     numDeletedFiles,
-                    partitionStatsSerializer.toBinary(partitionStatsCollector.extract()),
+                    partitionStatsSerializer.toBinaryAllMode(partitionStatsCollector.extract()),
                     numAddedFiles + numDeletedFiles > 0
                             ? schemaId
                             : schemaManager.latest().get().id());
@@ -154,36 +182,45 @@ public class ManifestFile extends ObjectsFile<ManifestEntry> {
         private final SchemaManager schemaManager;
         private final RowType partitionType;
         private final FileFormat fileFormat;
+        private final String compression;
         private final FileStorePathFactory pathFactory;
         private final long suggestedFileSize;
-        @Nullable private final SegmentsCache<String> cache;
+        @Nullable private final SegmentsCache<Path> cache;
 
         public Factory(
                 FileIO fileIO,
                 SchemaManager schemaManager,
                 RowType partitionType,
                 FileFormat fileFormat,
+                String compression,
                 FileStorePathFactory pathFactory,
                 long suggestedFileSize,
-                @Nullable SegmentsCache<String> cache) {
+                @Nullable SegmentsCache<Path> cache) {
             this.fileIO = fileIO;
             this.schemaManager = schemaManager;
             this.partitionType = partitionType;
             this.fileFormat = fileFormat;
+            this.compression = compression;
             this.pathFactory = pathFactory;
             this.suggestedFileSize = suggestedFileSize;
             this.cache = cache;
         }
 
+        public boolean isCacheEnabled() {
+            return cache != null;
+        }
+
         public ManifestFile create() {
-            RowType entryType = VersionedObjectSerializer.versionType(ManifestEntry.schema());
+            RowType entryType = VersionedObjectSerializer.versionType(ManifestEntry.SCHEMA);
             return new ManifestFile(
                     fileIO,
                     schemaManager,
                     partitionType,
                     new ManifestEntrySerializer(),
+                    entryType,
                     fileFormat.createReaderFactory(entryType),
                     fileFormat.createWriterFactory(entryType),
+                    compression,
                     pathFactory.manifestFileFactory(),
                     suggestedFileSize,
                     cache);

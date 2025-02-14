@@ -19,40 +19,23 @@
 package org.apache.paimon.flink.lookup;
 
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.types.RowType;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.utils.Filter;
 
+import java.io.Closeable;
 import java.io.IOException;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
-import java.util.function.Predicate;
 
 /** A lookup table which provides get and refresh. */
-public interface LookupTable {
+public interface LookupTable extends Closeable {
+
+    void specificPartitionFilter(Predicate filter);
+
+    void open() throws Exception;
 
     List<InternalRow> get(InternalRow key) throws IOException;
 
-    void refresh(Iterator<InternalRow> incremental) throws IOException;
+    void refresh() throws Exception;
 
-    static LookupTable create(
-            RocksDBStateFactory stateFactory,
-            RowType rowType,
-            List<String> primaryKey,
-            List<String> joinKey,
-            Predicate<InternalRow> recordFilter,
-            long lruCacheSize)
-            throws IOException {
-        if (primaryKey.isEmpty()) {
-            return new NoPrimaryKeyLookupTable(
-                    stateFactory, rowType, joinKey, recordFilter, lruCacheSize);
-        } else {
-            if (new HashSet<>(primaryKey).equals(new HashSet<>(joinKey))) {
-                return new PrimaryKeyLookupTable(
-                        stateFactory, rowType, joinKey, recordFilter, lruCacheSize);
-            } else {
-                return new SecondaryIndexLookupTable(
-                        stateFactory, rowType, primaryKey, joinKey, recordFilter, lruCacheSize);
-            }
-        }
-    }
+    void specifyCacheRowFilter(Filter<InternalRow> filter);
 }

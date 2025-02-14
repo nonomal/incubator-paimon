@@ -1,12 +1,13 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -23,7 +24,6 @@ import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.column.Dictionary;
 import org.apache.parquet.column.values.ValuesReader;
 import org.apache.parquet.io.api.Binary;
-import org.apache.parquet.schema.PrimitiveType;
 
 import javax.annotation.Nullable;
 
@@ -46,18 +46,22 @@ public final class ParquetDataColumnReaderFactory {
      * The default data column reader for existing Parquet page reader which works for both
      * dictionary or non dictionary types, Mirror from dictionary encoding path.
      */
-    public static class DefaultParquetDataColumnReader implements ParquetDataColumnReader {
-        protected final ValuesReader valuesReader;
-        protected final Dictionary dict;
+    private static class DefaultParquetDataColumnReader implements ParquetDataColumnReader {
 
-        public DefaultParquetDataColumnReader(ValuesReader valuesReader) {
+        private final ValuesReader valuesReader;
+        private final Dictionary dict;
+        private final boolean isUtcTimestamp;
+
+        public DefaultParquetDataColumnReader(ValuesReader valuesReader, boolean isUtcTimestamp) {
             this.valuesReader = checkNotNull(valuesReader);
             this.dict = null;
+            this.isUtcTimestamp = isUtcTimestamp;
         }
 
-        public DefaultParquetDataColumnReader(Dictionary dict) {
+        public DefaultParquetDataColumnReader(Dictionary dict, boolean isUtcTimestamp) {
             this.valuesReader = null;
             this.dict = checkNotNull(dict);
+            this.isUtcTimestamp = isUtcTimestamp;
         }
 
         @Override
@@ -116,8 +120,23 @@ public final class ParquetDataColumnReaderFactory {
         }
 
         @Override
-        public Timestamp readTimestamp(int id) {
-            throw new RuntimeException("Unsupported operation");
+        public Timestamp readNanosTimestamp() {
+            return int96TimestampConvert(valuesReader.readBytes());
+        }
+
+        @Override
+        public Timestamp readMillsTimestamp(int id) {
+            return Timestamp.fromEpochMillis(readLong(id));
+        }
+
+        @Override
+        public Timestamp readMicrosTimestamp(int id) {
+            return Timestamp.fromMicros(readLong(id));
+        }
+
+        @Override
+        public Timestamp readNanosTimestamp(int id) {
+            return int96TimestampConvert(dict.decodeToBinary(id));
         }
 
         @Override
@@ -165,31 +184,12 @@ public final class ParquetDataColumnReaderFactory {
             return valuesReader.readValueDictionaryId();
         }
 
-        public void skip() {
-            valuesReader.skip();
-        }
-
         @Override
         public Dictionary getDictionary() {
             return dict;
         }
-    }
 
-    /** The reader who reads from the underlying Timestamp value. */
-    public static class TypesFromInt96PageReader extends DefaultParquetDataColumnReader {
-        private final boolean isUtcTimestamp;
-
-        public TypesFromInt96PageReader(ValuesReader realReader, boolean isUtcTimestamp) {
-            super(realReader);
-            this.isUtcTimestamp = isUtcTimestamp;
-        }
-
-        public TypesFromInt96PageReader(Dictionary dict, boolean isUtcTimestamp) {
-            super(dict);
-            this.isUtcTimestamp = isUtcTimestamp;
-        }
-
-        private Timestamp convert(Binary binary) {
+        private Timestamp int96TimestampConvert(Binary binary) {
             ByteBuffer buf = binary.toByteBuffer();
             buf.order(ByteOrder.LITTLE_ENDIAN);
             long timeOfDayNanos = buf.getLong();
@@ -197,48 +197,25 @@ public final class ParquetDataColumnReaderFactory {
             return TimestampColumnReader.int96ToTimestamp(
                     isUtcTimestamp, timeOfDayNanos, julianDay);
         }
-
-        @Override
-        public Timestamp readTimestamp(int id) {
-            return convert(dict.decodeToBinary(id));
-        }
-
-        @Override
-        public Timestamp readMillsTimestamp() {
-            return convert(valuesReader.readBytes());
-        }
-
-        @Override
-        public Timestamp readMicrosTimestamp() {
-            return convert(valuesReader.readBytes());
-        }
     }
 
     private static ParquetDataColumnReader getDataColumnReaderByTypeHelper(
             boolean isDictionary,
-            PrimitiveType parquetType,
             @Nullable Dictionary dictionary,
             @Nullable ValuesReader valuesReader,
             boolean isUtcTimestamp) {
-        if (parquetType.getPrimitiveTypeName() == PrimitiveType.PrimitiveTypeName.INT96) {
-            return isDictionary
-                    ? new TypesFromInt96PageReader(dictionary, isUtcTimestamp)
-                    : new TypesFromInt96PageReader(valuesReader, isUtcTimestamp);
-        } else {
-            return isDictionary
-                    ? new DefaultParquetDataColumnReader(dictionary)
-                    : new DefaultParquetDataColumnReader(valuesReader);
-        }
+        return isDictionary
+                ? new DefaultParquetDataColumnReader(dictionary, isUtcTimestamp)
+                : new DefaultParquetDataColumnReader(valuesReader, isUtcTimestamp);
     }
 
     public static ParquetDataColumnReader getDataColumnReaderByTypeOnDictionary(
-            PrimitiveType parquetType, Dictionary realReader, boolean isUtcTimestamp) {
-        return getDataColumnReaderByTypeHelper(true, parquetType, realReader, null, isUtcTimestamp);
+            Dictionary realReader, boolean isUtcTimestamp) {
+        return getDataColumnReaderByTypeHelper(true, realReader, null, isUtcTimestamp);
     }
 
     public static ParquetDataColumnReader getDataColumnReaderByType(
-            PrimitiveType parquetType, ValuesReader realReader, boolean isUtcTimestamp) {
-        return getDataColumnReaderByTypeHelper(
-                false, parquetType, null, realReader, isUtcTimestamp);
+            ValuesReader realReader, boolean isUtcTimestamp) {
+        return getDataColumnReaderByTypeHelper(false, null, realReader, isUtcTimestamp);
     }
 }

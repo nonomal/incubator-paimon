@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,6 +19,7 @@
 package org.apache.paimon.utils;
 
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.Decimal;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.Timestamp;
@@ -133,6 +134,14 @@ public class InternalRowUtilsTest {
 
         // test TIME_WITHOUT_TIME_ZONE data type
         assertThat(InternalRowUtils.compare(165, 168, DataTypeRoot.TIME_WITHOUT_TIME_ZONE))
+                .isLessThan(0);
+
+        // test VARCHAR type
+        assertThat(
+                        InternalRowUtils.compare(
+                                BinaryString.fromString("a"),
+                                BinaryString.fromString("b"),
+                                DataTypeRoot.VARCHAR))
                 .isLessThan(0);
     }
 }

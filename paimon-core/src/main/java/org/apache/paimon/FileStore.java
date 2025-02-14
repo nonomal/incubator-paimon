@@ -18,32 +18,46 @@
 
 package org.apache.paimon;
 
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.index.IndexFileHandler;
+import org.apache.paimon.manifest.IndexManifestFile;
 import org.apache.paimon.manifest.ManifestCacheFilter;
+import org.apache.paimon.manifest.ManifestFile;
+import org.apache.paimon.manifest.ManifestList;
+import org.apache.paimon.operation.ChangelogDeletion;
 import org.apache.paimon.operation.FileStoreCommit;
-import org.apache.paimon.operation.FileStoreExpire;
-import org.apache.paimon.operation.FileStoreRead;
 import org.apache.paimon.operation.FileStoreScan;
 import org.apache.paimon.operation.FileStoreWrite;
 import org.apache.paimon.operation.PartitionExpire;
 import org.apache.paimon.operation.SnapshotDeletion;
+import org.apache.paimon.operation.SplitRead;
 import org.apache.paimon.operation.TagDeletion;
+import org.apache.paimon.service.ServiceManager;
+import org.apache.paimon.stats.StatsFileHandler;
 import org.apache.paimon.table.BucketMode;
-import org.apache.paimon.tag.TagAutoCreation;
+import org.apache.paimon.table.sink.CommitCallback;
+import org.apache.paimon.table.sink.TagCallback;
+import org.apache.paimon.tag.TagAutoManager;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.SegmentsCache;
 import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.utils.TagManager;
 
+import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Cache;
+
 import javax.annotation.Nullable;
 
-import java.io.Serializable;
+import java.util.List;
 
 /**
  * File store interface.
  *
  * @param <T> type of record to read and write.
  */
-public interface FileStore<T> extends Serializable {
+public interface FileStore<T> {
+
+    FileStorePathFactory pathFactory();
 
     SnapshotManager snapshotManager();
 
@@ -55,9 +69,17 @@ public interface FileStore<T> extends Serializable {
 
     FileStoreScan newScan();
 
+    ManifestList.Factory manifestListFactory();
+
+    ManifestFile.Factory manifestFileFactory();
+
+    IndexManifestFile.Factory indexManifestFileFactory();
+
     IndexFileHandler newIndexFileHandler();
 
-    FileStoreRead<T> newRead();
+    StatsFileHandler newStatsFileHandler();
+
+    SplitRead<T> newRead();
 
     FileStoreWrite<T> newWrite(String commitUser);
 
@@ -65,9 +87,11 @@ public interface FileStore<T> extends Serializable {
 
     FileStoreCommit newCommit(String commitUser);
 
-    FileStoreExpire newExpire();
+    FileStoreCommit newCommit(String commitUser, List<CommitCallback> callbacks);
 
     SnapshotDeletion newSnapshotDeletion();
+
+    ChangelogDeletion newChangelogDeletion();
 
     TagManager newTagManager();
 
@@ -76,8 +100,15 @@ public interface FileStore<T> extends Serializable {
     @Nullable
     PartitionExpire newPartitionExpire(String commitUser);
 
-    @Nullable
-    TagAutoCreation newTagCreationManager();
+    TagAutoManager newTagCreationManager();
+
+    ServiceManager newServiceManager();
 
     boolean mergeSchema(RowType rowType, boolean allowExplicitCast);
+
+    List<TagCallback> createTagCallbacks();
+
+    void setManifestCache(SegmentsCache<Path> manifestCache);
+
+    void setSnapshotCache(Cache<Path, Snapshot> cache);
 }

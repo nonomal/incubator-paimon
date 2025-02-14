@@ -18,25 +18,28 @@
 
 package org.apache.paimon.flink.action.cdc.format.ogg;
 
+import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.flink.action.cdc.ComputedColumn;
 import org.apache.paimon.flink.action.cdc.TypeMapping;
-import org.apache.paimon.flink.action.cdc.format.RecordParser;
+import org.apache.paimon.flink.action.cdc.format.AbstractJsonRecordParser;
 import org.apache.paimon.flink.sink.cdc.RichCdcMultiplexRecord;
 import org.apache.paimon.types.RowKind;
 
 import org.apache.paimon.shade.jackson2.com.fasterxml.jackson.databind.JsonNode;
 
+import javax.annotation.Nullable;
+
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.apache.paimon.utils.Preconditions.checkNotNull;
+import static org.apache.paimon.utils.JsonSerdeUtil.isNull;
 
 /**
- * The {@code OggRecordParser} class extends the abstract {@link RecordParser} and is responsible
- * for parsing records from the Oracle GoldenGate (OGG) JSON format. Oracle GoldenGate is a software
- * application used for real-time data integration and replication in heterogeneous IT environments.
- * This parser extracts relevant information from the OGG JSON records and transforms them into a
- * list of {@link RichCdcMultiplexRecord} objects.
+ * The {@code OggRecordParser} class extends the abstract {@link AbstractJsonRecordParser} and is
+ * responsible for parsing records from the Oracle GoldenGate (OGG) JSON format. Oracle GoldenGate
+ * is a software application used for real-time data integration and replication in heterogeneous IT
+ * environments. This parser extracts relevant information from the OGG JSON records and transforms
+ * them into a list of {@link RichCdcMultiplexRecord} objects.
  *
  * <p>The class handles three types of database operations, represented by "U" for UPDATE, "I" for
  * INSERT, and "D" for DELETE. It then generates corresponding {@link RichCdcMultiplexRecord}
@@ -47,7 +50,7 @@ import static org.apache.paimon.utils.Preconditions.checkNotNull;
  * providing a way to understand the structure of the incoming records and their corresponding field
  * types.
  */
-public class OggRecordParser extends RecordParser {
+public class OggRecordParser extends AbstractJsonRecordParser {
 
     private static final String FIELD_BEFORE = "before";
     private static final String FIELD_TYPE = "op_type";
@@ -55,25 +58,24 @@ public class OggRecordParser extends RecordParser {
     private static final String OP_INSERT = "I";
     private static final String OP_DELETE = "D";
 
-    public OggRecordParser(
-            boolean caseSensitive, TypeMapping typeMapping, List<ComputedColumn> computedColumns) {
-        super(caseSensitive, typeMapping, computedColumns);
+    public OggRecordParser(TypeMapping typeMapping, List<ComputedColumn> computedColumns) {
+        super(typeMapping, computedColumns);
     }
 
     @Override
     public List<RichCdcMultiplexRecord> extractRecords() {
         List<RichCdcMultiplexRecord> records = new ArrayList<>();
-        String operation = extractStringFromRootJson(FIELD_TYPE);
+        String operation = getAndCheck(FIELD_TYPE).asText();
         switch (operation) {
             case OP_UPDATE:
-                processRecord(root.get(FIELD_BEFORE), RowKind.DELETE, records);
-                processRecord(root.get(fieldData), RowKind.INSERT, records);
+                processRecord(getBefore(operation), RowKind.DELETE, records);
+                processRecord(getData(), RowKind.INSERT, records);
                 break;
             case OP_INSERT:
-                processRecord(root.get(fieldData), RowKind.INSERT, records);
+                processRecord(getData(), RowKind.INSERT, records);
                 break;
             case OP_DELETE:
-                processRecord(root.get(FIELD_BEFORE), RowKind.DELETE, records);
+                processRecord(getBefore(operation), RowKind.DELETE, records);
                 break;
             default:
                 throw new UnsupportedOperationException("Unknown record operation: " + operation);
@@ -81,61 +83,50 @@ public class OggRecordParser extends RecordParser {
         return records;
     }
 
+    private JsonNode getData() {
+        return getAndCheck(dataField());
+    }
+
+    private JsonNode getBefore(String op) {
+        return getAndCheck(FIELD_BEFORE, FIELD_TYPE, op);
+    }
+
     @Override
-    protected void validateFormat() {
-        String errorMessageTemplate =
-                "Didn't find '%s' node in json. Please make sure your topic's format is correct.";
+    protected String primaryField() {
+        return "primary_keys";
+    }
 
-        checkNotNull(root.get(FIELD_TABLE), errorMessageTemplate, FIELD_TABLE);
-        checkNotNull(root.get(FIELD_TYPE), errorMessageTemplate, FIELD_TYPE);
-        checkNotNull(root.get(fieldPrimaryKeys), errorMessageTemplate, fieldPrimaryKeys);
+    @Override
+    protected String dataField() {
+        return "after";
+    }
 
-        String fieldType = root.get(FIELD_TYPE).asText();
+    @Nullable
+    @Override
+    protected String getTableName() {
+        Identifier id = getTableId();
+        return id == null ? null : id.getObjectName();
+    }
 
-        switch (fieldType) {
-            case OP_UPDATE:
-                checkNotNull(root.get(fieldData), errorMessageTemplate, fieldData);
-                checkNotNull(root.get(FIELD_BEFORE), errorMessageTemplate, FIELD_BEFORE);
-                break;
-            case OP_INSERT:
-                checkNotNull(root.get(fieldData), errorMessageTemplate, fieldData);
-                break;
-            case OP_DELETE:
-                checkNotNull(root.get(FIELD_BEFORE), errorMessageTemplate, FIELD_BEFORE);
-                break;
+    @Nullable
+    @Override
+    protected String getDatabaseName() {
+        Identifier id = getTableId();
+        return id == null ? null : id.getDatabaseName();
+    }
+
+    @Nullable
+    private Identifier getTableId() {
+        JsonNode node = root.get(FIELD_TABLE);
+        if (isNull(node)) {
+            return null;
         }
+
+        return Identifier.fromString(node.asText());
     }
 
     @Override
-    protected String extractStringFromRootJson(String key) {
-        if (key.equals(FIELD_TABLE)) {
-            extractDatabaseAndTableNames();
-            return tableName;
-        } else if (key.equals(FIELD_DATABASE)) {
-            extractDatabaseAndTableNames();
-            return databaseName;
-        }
-        return root.get(key) != null ? root.get(key).asText() : null;
-    }
-
-    @Override
-    protected void setPrimaryField() {
-        fieldPrimaryKeys = "primary_keys";
-    }
-
-    @Override
-    protected void setDataField() {
-        fieldData = "after";
-    }
-
-    private void extractDatabaseAndTableNames() {
-        JsonNode tableNode = root.get(FIELD_TABLE);
-        if (tableNode != null) {
-            String[] dbt = tableNode.asText().split("\\.", 2);
-            if (dbt.length == 2) {
-                databaseName = dbt[0];
-                tableName = dbt[1];
-            }
-        }
+    protected String format() {
+        return "ogg-json";
     }
 }

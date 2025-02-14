@@ -21,10 +21,10 @@ package org.apache.paimon.tests.cdc;
 import org.apache.paimon.flink.action.cdc.mysql.MySqlContainer;
 import org.apache.paimon.flink.action.cdc.mysql.MySqlVersion;
 import org.apache.paimon.tests.E2eTestBase;
+import org.apache.paimon.utils.StringUtils;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
 
-import org.apache.hadoop.shaded.org.apache.commons.lang3.StringUtils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -134,7 +134,7 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
                 "INSERT INTO schema_evolution_2 VALUES (1, 2, 'two'), (2, 4, 'four')");
 
         String jobId =
-                runSql(
+                runBatchSql(
                         "INSERT INTO result1 SELECT * FROM ts_table;",
                         catalogDdl,
                         useCatalogCmd,
@@ -151,7 +151,7 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
         statement.executeUpdate("INSERT INTO schema_evolution_2 VALUES (1, 6, 'six', 60)");
 
         jobId =
-                runSql(
+                runBatchSql(
                         "INSERT INTO result2 SELECT * FROM ts_table;",
                         catalogDdl,
                         useCatalogCmd,
@@ -176,7 +176,7 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
                 "INSERT INTO schema_evolution_2 VALUES (2, 8, 'eight', 80000000000)");
 
         jobId =
-                runSql(
+                runBatchSql(
                         "INSERT INTO result3 SELECT * FROM ts_table;",
                         catalogDdl,
                         useCatalogCmd,
@@ -219,7 +219,7 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
         statement.executeUpdate("INSERT INTO t2 VALUES (2, 'two', 20)");
 
         String jobId =
-                runSql(
+                runBatchSql(
                         "INSERT INTO result1 SELECT * FROM t1;",
                         catalogDdl,
                         useCatalogCmd,
@@ -230,7 +230,7 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
         cancelJob(jobId);
 
         jobId =
-                runSql(
+                runBatchSql(
                         "INSERT INTO result2 SELECT * FROM t2;",
                         catalogDdl,
                         useCatalogCmd,
@@ -246,7 +246,7 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
         statement.executeUpdate("INSERT INTO t2 VALUES (4, 'four', 40, 40.5)");
 
         jobId =
-                runSql(
+                runBatchSql(
                         "INSERT INTO result3 SELECT * FROM t1;",
                         catalogDdl,
                         useCatalogCmd,
@@ -257,7 +257,7 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
         cancelJob(jobId);
 
         jobId =
-                runSql(
+                runBatchSql(
                         "INSERT INTO result4 SELECT * FROM t2;",
                         catalogDdl,
                         useCatalogCmd,
@@ -277,10 +277,6 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
                 mySqlContainer.getPassword());
     }
 
-    protected String runSql(String sql, String... ddls) throws Exception {
-        return runSql(String.join("\n", ddls) + "\n" + sql);
-    }
-
     protected void cancelJob(String jobId) throws Exception {
         jobManager.execInContainer("bin/flink", "cancel", jobId);
     }
@@ -296,11 +292,15 @@ public abstract class MySqlCdcE2eTestBase extends E2eTestBase {
             throws Exception {
 
         String partitionKeysStr =
-                StringUtils.isBlank(partitionKeys) ? "" : "--partition-keys " + partitionKeys;
+                StringUtils.isNullOrWhitespaceOnly(partitionKeys)
+                        ? ""
+                        : "--partition-keys " + partitionKeys;
         String primaryKeysStr =
-                StringUtils.isBlank(primaryKeys) ? "" : "--primary-keys " + primaryKeys;
+                StringUtils.isNullOrWhitespaceOnly(primaryKeys)
+                        ? ""
+                        : "--primary-keys " + primaryKeys;
         String typeMappingStr =
-                StringUtils.isBlank(typeMappingOptions)
+                StringUtils.isNullOrWhitespaceOnly(typeMappingOptions)
                         ? ""
                         : "--type-mapping " + typeMappingOptions;
         String tableStr = action.equals(ACTION_SYNC_TABLE) ? "--table ts_table" : "";

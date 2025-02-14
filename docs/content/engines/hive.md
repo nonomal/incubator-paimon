@@ -1,6 +1,6 @@
 ---
 title: "Hive"
-weight: 5
+weight: 4
 type: docs
 aliases:
 - /engines/hive.html
@@ -79,61 +79,12 @@ There are several ways to add this jar to Hive.
 * You can create an `auxlib` folder under the root directory of Hive, and copy `paimon-hive-connector-{{< version >}}.jar` into `auxlib`.
 * You can also copy this jar to a path accessible by Hive, then use `add jar /path/to/paimon-hive-connector-{{< version >}}.jar` to enable paimon support in Hive. Note that this method is not recommended. If you're using the MR execution engine and running a join statement, you may be faced with the exception `org.apache.hive.com.esotericsoftware.kryo.kryoexception: unable to find class`.
 
-NOTE: If you are using HDFS, make sure that the environment variable `HADOOP_HOME` or `HADOOP_CONF_DIR` is set.
+NOTE: 
 
-## Flink SQL: with Paimon Hive Catalog 
-
-By using paimon Hive catalog, you can create, drop, select and insert into paimon tables from Flink. These operations directly affect the corresponding Hive metastore. Tables created in this way can also be accessed directly from Hive.
-
-**Step 1: Prepare Flink Hive Connector Bundled Jar**
-
-See [creating a catalog with Hive metastore]({{< ref "how-to/creating-catalogs#creating-a-catalog-with-hive-metastore" >}}).
-
-**Step 2: Create Test Data with Flink SQL**
-
-Execute the following Flink SQL script in Flink SQL client to define a Paimon Hive catalog and create a table.
-
-```sql
--- Flink SQL CLI
--- Define paimon Hive catalog
-
-CREATE CATALOG my_hive WITH (
-  'type' = 'paimon',
-  'metastore' = 'hive',
-  'uri' = 'thrift://<hive-metastore-host-name>:<port>',
-  -- 'hive-conf-dir' = '...', this is recommended in the kerberos environment
-  -- 'hadoop-conf-dir' = '...', this is recommended in the kerberos environment
-  'warehouse' = 'hdfs:///path/to/table/store/warehouse'
-);
-
--- Use paimon Hive catalog
-
-USE CATALOG my_hive;
-
--- Create a table in paimon Hive catalog (use "default" database by default)
-
-CREATE TABLE test_table (
-  a int,
-  b string
-);
-
--- Insert records into test table
-
-INSERT INTO test_table VALUES (1, 'Table'), (2, 'Store');
-
--- Read records from test table
-
-SELECT * FROM test_table;
-
-/*
-+---+-------+
-| a |     b |
-+---+-------+
-| 1 | Table |
-| 2 | Store |
-+---+-------+
-*/
-```
+* If you are using HDFS :
+  * Make sure that the environment variable `HADOOP_HOME` or `HADOOP_CONF_DIR` is set.
+  * You can set `paimon.hadoop-load-default-config` =`false` to disable loading the default value from `core-default.xml`、`hdfs-default.xml`, which may lead smaller size for split.
+* With hive cbo, it may lead to some incorrect query results, such as to query `struct` type with `not null` predicate, you can disable the cbo by `set hive.cbo.enable=false;` command.
 
 ## Hive SQL: access Paimon Tables already in Hive metastore
 
@@ -162,7 +113,10 @@ OK
 */
 
 -- Insert records into test table
--- Note tez engine does not support hive write, only the hive engine is supported.
+-- Limitations:
+-- Only support INSERT INTO, not support INSERT OVERWRITE
+-- It is recommended to write to a non primary key table
+-- Writing to a primary key table may result in a large number of small files
 
 INSERT INTO test_table VALUES (3, 'Paimon');
 

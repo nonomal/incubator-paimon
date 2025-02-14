@@ -1,6 +1,6 @@
 ---
 title: "Manage Snapshots"
-weight: 4
+weight: 5
 type: docs
 aliases:
 - /maintenance/manage-snapshots.html
@@ -30,7 +30,7 @@ This section will describe the management and behavior related to snapshots.
 
 ## Expire Snapshots
 
-Paimon writers generate one or two [snapshots]({{< ref "concepts/basic-concepts#snapshots" >}}) per commit. Each snapshot may add some new data files or mark some old data files as deleted. However, the marked data files are not truly deleted because Paimon also supports time traveling to an earlier snapshot. They are only deleted when the snapshot expires.
+Paimon writers generate one or two [snapshot]({{< ref "concepts/basic-concepts#snapshot" >}}) per commit. Each snapshot may add some new data files or mark some old data files as deleted. However, the marked data files are not truly deleted because Paimon also supports time traveling to an earlier snapshot. They are only deleted when the snapshot expires.
 
 Currently, expiration is automatically performed by Paimon writers when committing new changes. By expiring old snapshots, old data files and metadata files that are no longer used can be deleted to release disk space.
 
@@ -216,9 +216,9 @@ Please note that too short retain time or too small retain number may result in:
 - Batch queries cannot find the file. For example, the table is relatively large and
   the batch query takes 10 minutes to read, but the snapshot from 10 minutes ago
   expires, at which point the batch query will read a deleted snapshot.
-- Streaming reading jobs on table files (without the external log system) fail to restart.
+- Streaming reading jobs on table files fail to restart.
   When the job restarts, the snapshot it recorded may have expired. (You can use
-  [Consumer Id]({{< ref "how-to/querying-tables#consumer-id" >}}) to protect streaming reading
+  [Consumer Id]({{< ref "flink/sql-query#consumer-id" >}}) to protect streaming reading
   in a small retain time of snapshot expiration).
 
 By default, paimon will delete expired snapshots synchronously. When there are too 
@@ -232,19 +232,29 @@ Rollback a table to a specific snapshot ID.
 
 {{< tabs "rollback-to" >}}
 
-{{< tab "Flink" >}}
+{{< tab "Flink SQL" >}}
+
+Run the following command:
+
+```sql
+CALL sys.rollback_to(`table` => 'database_name.table_name', snapshot_id => <snasphot-id>);
+```
+
+{{< /tab >}}
+
+{{< tab "Flink Action" >}}
 
 Run the following command:
 
 ```bash
 <FLINK_HOME>/bin/flink run \
     /path/to/paimon-flink-action-{{< version >}}.jar \
-    rollback-to \
+    rollback_to \
     --warehouse <warehouse-path> \
     --database <database-name> \ 
     --table <table-name> \
-    --snapshot <snapshot-id> \
-    [--catalog-conf <paimon-catalog-conf> [--catalog-conf <paimon-catalog-conf> ...]]
+    --version <snapshot-id> \
+    [--catalog_conf <paimon-catalog-conf> [--catalog_conf <paimon-catalog-conf> ...]]
 ```
 
 {{< /tab >}}
@@ -281,8 +291,57 @@ public class RollbackTo {
 Run the following sql:
 
 ```sql
-CALL rollback(table => 'test.T', version => '2');
+CALL sys.rollback(table => 'database_name.table_name', snapshot => snasphot_id);
 ```
+
+{{< /tab >}}
+
+{{< /tabs >}}
+
+## Remove Orphan Files
+
+Paimon files are deleted physically only when expiring snapshots. However, it is possible that some unexpected errors occurred
+when deleting files, so that there may exist files that are not used by Paimon snapshots (so-called "orphan files"). You can
+submit a `remove_orphan_files` job to clean them:
+
+{{< tabs "remove_orphan_files" >}}
+
+{{< tab "Spark SQL/Flink SQL" >}}
+```sql
+CALL sys.remove_orphan_files(`table` => 'my_db.my_table', [older_than => '2023-10-31 12:00:00'])
+
+CALL sys.remove_orphan_files(`table` => 'my_db.*', [older_than => '2023-10-31 12:00:00'])
+```
+{{< /tab >}}
+
+{{< tab "Flink Action" >}}
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-{{< version >}}.jar \
+    remove_orphan_files \
+    --warehouse <warehouse-path> \
+    --database <database-name> \ 
+    --table <table-name> \
+    [--older_than <timestamp>] \
+    [--dry_run <false/true>] \
+    [--parallelism <parallelism>]
+```
+
+To avoid deleting files that are newly added by other writing jobs, this action only deletes orphan files older than
+1 day by default. The interval can be modified by `--older_than`. For example:
+
+```bash
+<FLINK_HOME>/bin/flink run \
+    /path/to/paimon-flink-action-{{< version >}}.jar \
+    remove_orphan_files \
+    --warehouse <warehouse-path> \
+    --database <database-name> \ 
+    --table T \
+    --older_than '2023-10-31 12:00:00'
+```
+
+The table can be `*` to clean all tables in the database.
 
 {{< /tab >}}
 

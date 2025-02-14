@@ -33,6 +33,8 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Splits are allocated at the granularity of snapshots. When the splits of the current snapshot are
@@ -42,8 +44,11 @@ public class AlignedSplitAssigner implements SplitAssigner {
 
     private final Deque<PendingSnapshot> pendingSplitAssignment;
 
+    private final AtomicInteger numberOfPendingSplits;
+
     public AlignedSplitAssigner() {
         this.pendingSplitAssignment = new LinkedList<>();
+        this.numberOfPendingSplits = new AtomicInteger(0);
     }
 
     @Override
@@ -51,10 +56,12 @@ public class AlignedSplitAssigner implements SplitAssigner {
         PendingSnapshot head = pendingSplitAssignment.peek();
         if (head != null && !head.isPlaceHolder) {
             List<FileStoreSourceSplit> subtaskSplits = head.remove(subtask);
-            return subtaskSplits != null ? subtaskSplits : Collections.emptyList();
-        } else {
-            return Collections.emptyList();
+            if (subtaskSplits != null) {
+                numberOfPendingSplits.getAndAdd(-subtaskSplits.size());
+                return subtaskSplits;
+            }
         }
+        return Collections.emptyList();
     }
 
     @Override
@@ -69,6 +76,7 @@ public class AlignedSplitAssigner implements SplitAssigner {
         } else {
             last.add(subtask, splits);
         }
+        numberOfPendingSplits.incrementAndGet();
     }
 
     @Override
@@ -87,6 +95,7 @@ public class AlignedSplitAssigner implements SplitAssigner {
         } else {
             head.addAll(suggestedTask, splits);
         }
+        numberOfPendingSplits.getAndAdd(splits.size());
     }
 
     @Override
@@ -96,6 +105,17 @@ public class AlignedSplitAssigner implements SplitAssigner {
             pendingSnapshot.subtaskSplits.values().forEach(remainingSplits::addAll);
         }
         return remainingSplits;
+    }
+
+    @Override
+    public Optional<Long> getNextSnapshotId(int subtask) {
+        PendingSnapshot head = pendingSplitAssignment.peek();
+        return Optional.ofNullable(head != null ? head.snapshotId : null);
+    }
+
+    @Override
+    public int numberOfRemainingSplits() {
+        return numberOfPendingSplits.get();
     }
 
     public boolean isAligned() {
@@ -112,11 +132,6 @@ public class AlignedSplitAssigner implements SplitAssigner {
         Preconditions.checkArgument(
                 head != null && head.empty(),
                 "The head pending splits is not empty. This is a bug, please file an issue.");
-    }
-
-    public Long minRemainingSnapshotId() {
-        PendingSnapshot head = pendingSplitAssignment.peek();
-        return head != null ? head.snapshotId : null;
     }
 
     private static class PendingSnapshot {

@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,5 +46,22 @@ public class ReflectionUtils {
     public static <T> T invokeStaticMethod(Method method, Object... args)
             throws InvocationTargetException, IllegalAccessException {
         return (T) method.invoke(null, args);
+    }
+
+    public static Method getMethod(Class<?> clz, String methodName, int argSize)
+            throws NoSuchMethodException {
+        Method method = null;
+        Method[] methods = clz.getMethods();
+        for (Method m : methods) {
+            if (methodName.equals(m.getName()) && m.getParameterTypes().length == argSize) {
+                method = m;
+                break;
+            }
+        }
+
+        if (method == null) {
+            throw new NoSuchMethodException(methodName);
+        }
+        return method;
     }
 }

@@ -18,6 +18,7 @@
 
 package org.apache.paimon.flink.sorter;
 
+import org.apache.paimon.CoreOptions.OrderType;
 import org.apache.paimon.flink.action.SortCompactAction;
 import org.apache.paimon.table.FileStoreTable;
 
@@ -70,47 +71,17 @@ public abstract class TableSorter {
             StreamExecutionEnvironment batchTEnv,
             DataStream<RowData> origin,
             FileStoreTable fileStoreTable,
-            String sortStrategy,
-            List<String> orderColumns) {
-        switch (OrderType.of(sortStrategy)) {
+            TableSortInfo sortInfo) {
+        OrderType sortStrategy = sortInfo.getSortStrategy();
+        switch (sortStrategy) {
             case ORDER:
-                return new OrderSorter(batchTEnv, origin, fileStoreTable, orderColumns);
+                return new OrderSorter(batchTEnv, origin, fileStoreTable, sortInfo);
             case ZORDER:
-                return new ZorderSorter(batchTEnv, origin, fileStoreTable, orderColumns);
+                return new ZorderSorter(batchTEnv, origin, fileStoreTable, sortInfo);
             case HILBERT:
-                // todo support hilbert curve
-                throw new IllegalArgumentException("Not supported yet.");
+                return new HilbertSorter(batchTEnv, origin, fileStoreTable, sortInfo);
             default:
                 throw new IllegalArgumentException("cannot match order type: " + sortStrategy);
-        }
-    }
-
-    enum OrderType {
-        ORDER("order"),
-        ZORDER("zorder"),
-        HILBERT("hilbert");
-
-        private final String orderType;
-
-        OrderType(String orderType) {
-            this.orderType = orderType;
-        }
-
-        @Override
-        public String toString() {
-            return "order type: " + orderType;
-        }
-
-        public static OrderType of(String orderType) {
-            if (ORDER.orderType.equals(orderType)) {
-                return ORDER;
-            } else if (ZORDER.orderType.equals(orderType)) {
-                return ZORDER;
-            } else if (HILBERT.orderType.equals(orderType)) {
-                return HILBERT;
-            }
-
-            throw new IllegalArgumentException("cannot match type: " + orderType + " for ordering");
         }
     }
 }

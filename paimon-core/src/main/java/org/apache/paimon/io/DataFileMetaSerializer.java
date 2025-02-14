@@ -21,7 +21,8 @@ package org.apache.paimon.io;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.stats.BinaryTableStats;
+import org.apache.paimon.manifest.FileSource;
+import org.apache.paimon.stats.SimpleStats;
 import org.apache.paimon.utils.ObjectSerializer;
 
 import static org.apache.paimon.utils.InternalRowUtils.fromStringArrayData;
@@ -35,7 +36,7 @@ public class DataFileMetaSerializer extends ObjectSerializer<DataFileMeta> {
     private static final long serialVersionUID = 1L;
 
     public DataFileMetaSerializer() {
-        super(DataFileMeta.schema());
+        super(DataFileMeta.SCHEMA);
     }
 
     @Override
@@ -46,14 +47,19 @@ public class DataFileMetaSerializer extends ObjectSerializer<DataFileMeta> {
                 meta.rowCount(),
                 serializeBinaryRow(meta.minKey()),
                 serializeBinaryRow(meta.maxKey()),
-                meta.keyStats().toRowData(),
-                meta.valueStats().toRowData(),
+                meta.keyStats().toRow(),
+                meta.valueStats().toRow(),
                 meta.minSequenceNumber(),
                 meta.maxSequenceNumber(),
                 meta.schemaId(),
                 meta.level(),
                 toStringArrayData(meta.extraFiles()),
-                meta.creationTime());
+                meta.creationTime(),
+                meta.deleteRowCount().orElse(null),
+                meta.embeddedIndex(),
+                meta.fileSource().map(FileSource::toByteValue).orElse(null),
+                toStringArrayData(meta.valueStatsCols()),
+                meta.externalPath().map(BinaryString::fromString).orElse(null));
     }
 
     @Override
@@ -64,13 +70,18 @@ public class DataFileMetaSerializer extends ObjectSerializer<DataFileMeta> {
                 row.getLong(2),
                 deserializeBinaryRow(row.getBinary(3)),
                 deserializeBinaryRow(row.getBinary(4)),
-                BinaryTableStats.fromRowData(row.getRow(5, 3)),
-                BinaryTableStats.fromRowData(row.getRow(6, 3)),
+                SimpleStats.fromRow(row.getRow(5, 3)),
+                SimpleStats.fromRow(row.getRow(6, 3)),
                 row.getLong(7),
                 row.getLong(8),
                 row.getLong(9),
                 row.getInt(10),
                 fromStringArrayData(row.getArray(11)),
-                row.getTimestamp(12, 3));
+                row.getTimestamp(12, 3),
+                row.isNullAt(13) ? null : row.getLong(13),
+                row.isNullAt(14) ? null : row.getBinary(14),
+                row.isNullAt(15) ? null : FileSource.fromByteValue(row.getByte(15)),
+                row.isNullAt(16) ? null : fromStringArrayData(row.getArray(16)),
+                row.isNullAt(17) ? null : row.getString(17).toString());
     }
 }

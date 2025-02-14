@@ -25,24 +25,23 @@ import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.FileFormat;
+import org.apache.paimon.format.FileFormatDiscover;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.KeyValueFileReaderFactory;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
 import org.apache.paimon.memory.MemoryOwner;
 import org.apache.paimon.mergetree.compact.DeduplicateMergeFunction;
-import org.apache.paimon.operation.KeyValueFileStoreRead;
 import org.apache.paimon.operation.KeyValueFileStoreWrite;
+import org.apache.paimon.operation.MergeFileSplitRead;
+import org.apache.paimon.operation.RawFileSplitRead;
 import org.apache.paimon.options.Options;
-import org.apache.paimon.predicate.Predicate;
-import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.schema.KeyValueFieldsExtractor;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.source.KeyValueTableRead;
 import org.apache.paimon.table.source.TableRead;
-import org.apache.paimon.table.source.ValueContentRowDataRecordIterator;
-import org.apache.paimon.table.source.ValueCountRowDataRecordIterator;
 import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.IntType;
@@ -61,7 +60,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.function.Function;
 
 import static java.util.Collections.singletonList;
 
@@ -71,11 +69,13 @@ public class TestChangelogDataReadWrite {
     private static final RowType KEY_TYPE =
             new RowType(singletonList(new DataField(0, "k", new BigIntType())));
     private static final RowType VALUE_TYPE =
-            new RowType(singletonList(new DataField(0, "v", new BigIntType())));
+            new RowType(singletonList(new DataField(1, "v", new BigIntType())));
+    private static final RowType PARTITION_TYPE =
+            new RowType(singletonList(new DataField(0, "p", new IntType())));
     private static final Comparator<InternalRow> COMPARATOR =
             Comparator.comparingLong(o -> o.getLong(0));
     private static final RecordEqualiser EQUALISER =
-            (RecordEqualiser) (row1, row2) -> row1.getLong(0) == row2.getLong(0);
+            (row1, row2) -> row1.getLong(0) == row2.getLong(0);
     private static final KeyValueFieldsExtractor EXTRACTOR =
             new KeyValueFieldsExtractor() {
                 @Override
@@ -87,7 +87,7 @@ public class TestChangelogDataReadWrite {
                 @Override
                 public List<DataField> valueFields(TableSchema schema) {
                     return Collections.singletonList(
-                            new DataField(0, "v", new org.apache.paimon.types.BigIntType(false)));
+                            new DataField(1, "v", new org.apache.paimon.types.BigIntType(false)));
                 }
             };
 
@@ -105,54 +105,50 @@ public class TestChangelogDataReadWrite {
                         tablePath,
                         RowType.of(new IntType()),
                         "default",
-                        CoreOptions.FILE_FORMAT.defaultValue().toString());
+                        CoreOptions.FILE_FORMAT.defaultValue().toString(),
+                        CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                        CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                        CoreOptions.PARTITION_GENERATE_LEGCY_NAME.defaultValue(),
+                        CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                        CoreOptions.FILE_COMPRESSION.defaultValue(),
+                        null,
+                        null);
         this.snapshotManager = new SnapshotManager(LocalFileIO.create(), new Path(root));
         this.commitUser = UUID.randomUUID().toString();
     }
 
     public TableRead createReadWithKey() {
-        return createRead(ValueContentRowDataRecordIterator::new);
-    }
-
-    public TableRead createReadWithValueCount() {
-        return createRead(ValueCountRowDataRecordIterator::new);
-    }
-
-    private TableRead createRead(
-            Function<
-                            RecordReader.RecordIterator<KeyValue>,
-                            RecordReader.RecordIterator<InternalRow>>
-                    rowDataIteratorCreator) {
-        KeyValueFileStoreRead read =
-                new KeyValueFileStoreRead(
-                        LocalFileIO.create(),
-                        new SchemaManager(LocalFileIO.create(), tablePath),
-                        0,
+        SchemaManager schemaManager = new SchemaManager(LocalFileIO.create(), tablePath);
+        CoreOptions options = new CoreOptions(new HashMap<>());
+        TableSchema schema = schemaManager.schema(0);
+        MergeFileSplitRead read =
+                new MergeFileSplitRead(
+                        options,
+                        schema,
                         KEY_TYPE,
                         VALUE_TYPE,
                         COMPARATOR,
                         DeduplicateMergeFunction.factory(),
-                        ignore -> avro,
+                        KeyValueFileReaderFactory.builder(
+                                LocalFileIO.create(),
+                                schemaManager,
+                                schema,
+                                KEY_TYPE,
+                                VALUE_TYPE,
+                                ignore -> avro,
+                                pathFactory,
+                                EXTRACTOR,
+                                options));
+        RawFileSplitRead rawFileRead =
+                new RawFileSplitRead(
+                        LocalFileIO.create(),
+                        schemaManager,
+                        schema,
+                        VALUE_TYPE,
+                        FileFormatDiscover.of(options),
                         pathFactory,
-                        EXTRACTOR,
-                        new CoreOptions(new HashMap<>()));
-        return new KeyValueTableRead(read) {
-            @Override
-            public KeyValueTableRead withFilter(Predicate predicate) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            public KeyValueTableRead withProjection(int[][] projection) {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
-            protected RecordReader.RecordIterator<InternalRow> rowDataRecordIteratorFromKv(
-                    RecordReader.RecordIterator<KeyValue> kvRecordIterator) {
-                return rowDataIteratorCreator.apply(kvRecordIterator);
-            }
-        };
+                        options.fileIndexReadEnabled());
+        return new KeyValueTableRead(() -> read, () -> rawFileRead, null);
     }
 
     public List<DataFileMeta> writeFiles(
@@ -177,15 +173,18 @@ public class TestChangelogDataReadWrite {
 
         Map<String, FileStorePathFactory> pathFactoryMap = new HashMap<>();
         pathFactoryMap.put("avro", pathFactory);
+        SchemaManager schemaManager = new SchemaManager(LocalFileIO.create(), tablePath);
         RecordWriter<KeyValue> writer =
                 new KeyValueFileStoreWrite(
                                 LocalFileIO.create(),
-                                new SchemaManager(LocalFileIO.create(), tablePath),
-                                0,
+                                schemaManager,
+                                schemaManager.schema(0),
                                 commitUser,
+                                PARTITION_TYPE,
                                 KEY_TYPE,
                                 VALUE_TYPE,
                                 () -> COMPARATOR,
+                                () -> null,
                                 () -> EQUALISER,
                                 DeduplicateMergeFunction.factory(),
                                 pathFactory,
@@ -193,8 +192,10 @@ public class TestChangelogDataReadWrite {
                                 snapshotManager,
                                 null, // not used, we only create an empty writer
                                 null,
+                                null,
                                 options,
-                                EXTRACTOR)
+                                EXTRACTOR,
+                                tablePath.getName())
                         .createWriterContainer(partition, bucket, true)
                         .writer;
         ((MemoryOwner) writer)

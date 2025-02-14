@@ -27,6 +27,7 @@ import org.apache.paimon.flink.util.AbstractTestBase;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.io.DataFileMetaSerializer;
+import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaManager;
 import org.apache.paimon.schema.TableSchema;
@@ -50,6 +51,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -58,6 +60,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static org.apache.paimon.partition.PartitionPredicate.createPartitionPredicate;
 import static org.apache.paimon.utils.SerializationUtils.deserializeBinaryRow;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -103,7 +106,8 @@ public class CompactorSourceITCase extends AbstractTestBase {
         write.write(rowData(1, 1510, BinaryString.fromString("20221209"), 15));
         commit.commit(1, write.prepareCommit(true, 1));
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().streamingMode().build();
         DataStreamSource<RowData> compactorSource =
                 new CompactorSourceBuilder("test", table)
                         .withContinuousMode(false)
@@ -164,7 +168,8 @@ public class CompactorSourceITCase extends AbstractTestBase {
         write.write(rowData(2, 1620, BinaryString.fromString("20221209"), 16));
         commit.commit(3, write.prepareCommit(true, 3));
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().streamingMode().build();
         DataStreamSource<RowData> compactorSource =
                 new CompactorSourceBuilder("test", table)
                         .withContinuousMode(true)
@@ -257,12 +262,18 @@ public class CompactorSourceITCase extends AbstractTestBase {
         write.write(rowData(1, 1510, BinaryString.fromString("20221209"), 15));
         commit.commit(2, write.prepareCommit(true, 2));
 
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().streamingMode().build();
+        Predicate partitionPredicate =
+                createPartitionPredicate(
+                        specifiedPartitions,
+                        table.rowType(),
+                        table.coreOptions().partitionDefaultName());
         DataStreamSource<RowData> compactorSource =
                 new CompactorSourceBuilder("test", table)
                         .withContinuousMode(isStreaming)
                         .withEnv(env)
-                        .withPartitions(specifiedPartitions)
+                        .withPartitionPredicate(partitionPredicate)
                         .build();
         CloseableIterator<RowData> it = compactorSource.executeAndCollect();
 
@@ -271,6 +282,54 @@ public class CompactorSourceITCase extends AbstractTestBase {
             actual.add(toString(it.next()));
         }
         assertThat(actual).hasSameElementsAs(expected);
+
+        write.close();
+        commit.close();
+        it.close();
+    }
+
+    @ParameterizedTest(name = "defaultOptions = {0}")
+    @ValueSource(booleans = {true, false})
+    public void testHistoryPartitionRead(boolean defaultOptions) throws Exception {
+        Duration partitionIdleTime = Duration.ofMillis(3000);
+        FileStoreTable table = createFileStoreTable();
+        if (!defaultOptions) {
+            // change options to test whether CompactorSourceBuilder work normally
+            table = table.copy(Collections.singletonMap(CoreOptions.SCAN_SNAPSHOT_ID.key(), "2"));
+        }
+        StreamWriteBuilder streamWriteBuilder =
+                table.newStreamWriteBuilder().withCommitUser(commitUser);
+        StreamTableWrite write = streamWriteBuilder.newWrite();
+        StreamTableCommit commit = streamWriteBuilder.newCommit();
+
+        write.write(rowData(1, 1510, BinaryString.fromString("20221208"), 15));
+        write.write(rowData(1, 1620, BinaryString.fromString("20221208"), 16));
+        commit.commit(0, write.prepareCommit(true, 0));
+
+        write.write(rowData(2, 1511, BinaryString.fromString("20221208"), 15));
+        write.write(rowData(2, 1510, BinaryString.fromString("20221209"), 15));
+        commit.commit(1, write.prepareCommit(true, 1));
+
+        Thread.sleep(3000);
+        write.write(rowData(3, 1510, BinaryString.fromString("20221208"), 16));
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        StreamExecutionEnvironment env =
+                streamExecutionEnvironmentBuilder().streamingMode().build();
+        DataStreamSource<RowData> compactorSource =
+                new CompactorSourceBuilder("test", table)
+                        .withContinuousMode(false)
+                        .withPartitionIdleTime(partitionIdleTime)
+                        .withEnv(env)
+                        .build();
+        CloseableIterator<RowData> it = compactorSource.executeAndCollect();
+
+        List<String> actual = new ArrayList<>();
+        while (it.hasNext()) {
+            actual.add(toString(it.next()));
+        }
+        assertThat(actual)
+                .hasSameElementsAs(Arrays.asList("+I 3|20221208|15|0|0", "+I 3|20221209|15|0|0"));
 
         write.close();
         commit.close();
@@ -318,7 +377,7 @@ public class CompactorSourceITCase extends AbstractTestBase {
                                 ROW_TYPE.getFields(),
                                 Arrays.asList("dt", "hh"),
                                 Arrays.asList("dt", "hh", "k"),
-                                Collections.emptyMap(),
+                                Collections.singletonMap("bucket", "1"),
                                 ""));
         return FileStoreTableFactory.create(LocalFileIO.create(), tablePath, tableSchema);
     }

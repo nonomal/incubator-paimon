@@ -20,17 +20,23 @@ package org.apache.paimon.mergetree.compact;
 
 import org.apache.paimon.KeyValueFileStore;
 import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.compact.CompactDeletionFile;
 import org.apache.paimon.compact.CompactFutureManager;
 import org.apache.paimon.compact.CompactResult;
 import org.apache.paimon.compact.CompactUnit;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.deletionvectors.DeletionVectorsMaintainer;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.mergetree.LevelSortedRun;
 import org.apache.paimon.mergetree.Levels;
+import org.apache.paimon.operation.metrics.CompactionMetrics;
+import org.apache.paimon.operation.metrics.MetricUtils;
 import org.apache.paimon.utils.Preconditions;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.Comparator;
@@ -38,6 +44,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /** Compact manager for {@link KeyValueFileStore}. */
@@ -53,6 +60,10 @@ public class MergeTreeCompactManager extends CompactFutureManager {
     private final int numSortedRunStopTrigger;
     private final CompactRewriter rewriter;
 
+    @Nullable private final CompactionMetrics.Reporter metricsReporter;
+    @Nullable private final DeletionVectorsMaintainer dvMaintainer;
+    private final boolean lazyGenDeletionFile;
+
     public MergeTreeCompactManager(
             ExecutorService executor,
             Levels levels,
@@ -60,7 +71,10 @@ public class MergeTreeCompactManager extends CompactFutureManager {
             Comparator<InternalRow> keyComparator,
             long compactionFileSize,
             int numSortedRunStopTrigger,
-            CompactRewriter rewriter) {
+            CompactRewriter rewriter,
+            @Nullable CompactionMetrics.Reporter metricsReporter,
+            @Nullable DeletionVectorsMaintainer dvMaintainer,
+            boolean lazyGenDeletionFile) {
         this.executor = executor;
         this.levels = levels;
         this.strategy = strategy;
@@ -68,6 +82,11 @@ public class MergeTreeCompactManager extends CompactFutureManager {
         this.numSortedRunStopTrigger = numSortedRunStopTrigger;
         this.keyComparator = keyComparator;
         this.rewriter = rewriter;
+        this.metricsReporter = metricsReporter;
+        this.dvMaintainer = dvMaintainer;
+        this.lazyGenDeletionFile = lazyGenDeletionFile;
+
+        MetricUtils.safeCall(this::reportLevel0FileCount, LOG);
     }
 
     @Override
@@ -84,6 +103,7 @@ public class MergeTreeCompactManager extends CompactFutureManager {
     @Override
     public void addNewFile(DataFileMeta file) {
         levels.addLevel0File(file);
+        MetricUtils.safeCall(this::reportLevel0FileCount, LOG);
     }
 
     @Override
@@ -134,7 +154,8 @@ public class MergeTreeCompactManager extends CompactFutureManager {
                      */
                     boolean dropDelete =
                             unit.outputLevel() != 0
-                                    && unit.outputLevel() >= levels.nonEmptyHighestLevel();
+                                    && (unit.outputLevel() >= levels.nonEmptyHighestLevel()
+                                            || dvMaintainer != null);
 
                     if (LOG.isDebugEnabled()) {
                         LOG.debug(
@@ -160,9 +181,24 @@ public class MergeTreeCompactManager extends CompactFutureManager {
     }
 
     private void submitCompaction(CompactUnit unit, boolean dropDelete) {
+        Supplier<CompactDeletionFile> compactDfSupplier = () -> null;
+        if (dvMaintainer != null) {
+            compactDfSupplier =
+                    lazyGenDeletionFile
+                            ? () -> CompactDeletionFile.lazyGeneration(dvMaintainer)
+                            : () -> CompactDeletionFile.generateFiles(dvMaintainer);
+        }
+
         MergeTreeCompactTask task =
                 new MergeTreeCompactTask(
-                        keyComparator, compactionFileSize, rewriter, unit, dropDelete);
+                        keyComparator,
+                        compactionFileSize,
+                        rewriter,
+                        unit,
+                        dropDelete,
+                        levels.maxLevel(),
+                        metricsReporter,
+                        compactDfSupplier);
         if (LOG.isDebugEnabled()) {
             LOG.debug(
                     "Pick these files (name, level, size) for compaction: {}",
@@ -175,6 +211,9 @@ public class MergeTreeCompactManager extends CompactFutureManager {
                             .collect(Collectors.joining(", ")));
         }
         taskFuture = executor.submit(task);
+        if (metricsReporter != null) {
+            metricsReporter.increaseCompactionsQueuedCount();
+        }
     }
 
     /** Finish current task, and update result files to {@link Levels}. */
@@ -191,6 +230,7 @@ public class MergeTreeCompactManager extends CompactFutureManager {
                                 r.after());
                     }
                     levels.update(r.before(), r.after());
+                    MetricUtils.safeCall(this::reportLevel0FileCount, LOG);
                     if (LOG.isDebugEnabled()) {
                         LOG.debug(
                                 "Levels in compact manager updated. Current runs are\n{}",
@@ -200,8 +240,17 @@ public class MergeTreeCompactManager extends CompactFutureManager {
         return result;
     }
 
+    private void reportLevel0FileCount() {
+        if (metricsReporter != null) {
+            metricsReporter.reportLevel0FileCount(levels.level0().size());
+        }
+    }
+
     @Override
     public void close() throws IOException {
         rewriter.close();
+        if (metricsReporter != null) {
+            MetricUtils.safeCall(metricsReporter::unregister, LOG);
+        }
     }
 }

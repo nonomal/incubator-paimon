@@ -20,11 +20,10 @@ package org.apache.paimon.flink.action;
 
 import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.flink.FlinkCatalog;
 import org.apache.paimon.flink.FlinkCatalogFactory;
 import org.apache.paimon.flink.LogicalTypeConversion;
-import org.apache.paimon.flink.utils.StreamExecutionEnvironmentUtils;
-import org.apache.paimon.options.CatalogOptions;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypeCasts;
@@ -41,6 +40,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.options.CatalogOptions.CACHE_ENABLED;
+
 /** Abstract base of {@link Action} for table. */
 public abstract class ActionBase implements Action {
 
@@ -48,32 +49,56 @@ public abstract class ActionBase implements Action {
     protected final Catalog catalog;
     protected final FlinkCatalog flinkCatalog;
     protected final String catalogName = "paimon-" + UUID.randomUUID();
-    protected final StreamExecutionEnvironment env;
-    protected final StreamTableEnvironment batchTEnv;
 
-    public ActionBase(String warehouse, Map<String, String> catalogConfig) {
+    protected StreamExecutionEnvironment env;
+    protected StreamTableEnvironment batchTEnv;
+
+    public ActionBase(Map<String, String> catalogConfig) {
         catalogOptions = Options.fromMap(catalogConfig);
-        catalogOptions.set(CatalogOptions.WAREHOUSE, warehouse);
 
-        catalog = FlinkCatalogFactory.createPaimonCatalog(catalogOptions);
-        flinkCatalog = FlinkCatalogFactory.createCatalog(catalogName, catalog, catalogOptions);
-        env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // disable cache to avoid concurrent modification exception
+        if (!catalogOptions.contains(CACHE_ENABLED)) {
+            catalogOptions.set(CACHE_ENABLED, false);
+        }
+
+        catalog = initPaimonCatalog();
+        flinkCatalog = initFlinkCatalog();
+
+        // use the default env if user doesn't pass one
+        initFlinkEnv(StreamExecutionEnvironment.getExecutionEnvironment());
+    }
+
+    public ActionBase withStreamExecutionEnvironment(StreamExecutionEnvironment env) {
+        initFlinkEnv(env);
+        return this;
+    }
+
+    protected Catalog initPaimonCatalog() {
+        return FlinkCatalogFactory.createPaimonCatalog(catalogOptions);
+    }
+
+    protected FlinkCatalog initFlinkCatalog() {
+        return FlinkCatalogFactory.createCatalog(catalogName, catalog, catalogOptions);
+    }
+
+    protected void initFlinkEnv(StreamExecutionEnvironment env) {
+        this.env = env;
         // we enable object reuse, we copy the un-reusable object ourselves.
-        env.getConfig().enableObjectReuse();
-        batchTEnv = StreamTableEnvironment.create(env, EnvironmentSettings.inBatchMode());
+        this.env.getConfig().enableObjectReuse();
+        batchTEnv = StreamTableEnvironment.create(this.env, EnvironmentSettings.inBatchMode());
 
         // register flink catalog to table environment
         batchTEnv.registerCatalog(flinkCatalog.getName(), flinkCatalog);
         batchTEnv.useCatalog(flinkCatalog.getName());
     }
 
-    protected void execute(StreamExecutionEnvironment env, String defaultName) throws Exception {
-        ReadableConfig conf = StreamExecutionEnvironmentUtils.getConfiguration(env);
+    protected void execute(String defaultName) throws Exception {
+        ReadableConfig conf = env.getConfiguration();
         String name = conf.getOptional(PipelineOptions.NAME).orElse(defaultName);
         env.execute(name);
     }
 
-    protected Catalog.Loader catalogLoader() {
+    protected CatalogLoader catalogLoader() {
         // to make the action workflow serializable
         Options catalogOptions = this.catalogOptions;
         return () -> FlinkCatalogFactory.createPaimonCatalog(catalogOptions);

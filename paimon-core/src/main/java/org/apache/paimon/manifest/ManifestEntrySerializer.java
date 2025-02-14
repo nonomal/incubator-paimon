@@ -21,6 +21,7 @@ package org.apache.paimon.manifest;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.DataFileMetaSerializer;
 import org.apache.paimon.utils.VersionedObjectSerializer;
 
@@ -37,7 +38,7 @@ public class ManifestEntrySerializer extends VersionedObjectSerializer<ManifestE
     private final DataFileMetaSerializer dataFileMetaSerializer;
 
     public ManifestEntrySerializer() {
-        super(ManifestEntry.schema());
+        super(ManifestEntry.SCHEMA);
         this.dataFileMetaSerializer = new DataFileMetaSerializer();
     }
 
@@ -76,6 +77,10 @@ public class ManifestEntrySerializer extends VersionedObjectSerializer<ManifestE
                 dataFileMetaSerializer.fromRow(row.getRow(4, dataFileMetaSerializer.numFields())));
     }
 
+    public static Function<InternalRow, FileKind> kindGetter() {
+        return row -> FileKind.fromByteValue(row.getByte(1));
+    }
+
     public static Function<InternalRow, BinaryRow> partitionGetter() {
         return row -> deserializeBinaryRow(row.getBinary(2));
     }
@@ -86,5 +91,13 @@ public class ManifestEntrySerializer extends VersionedObjectSerializer<ManifestE
 
     public static Function<InternalRow, Integer> totalBucketGetter() {
         return row -> row.getInt(4);
+    }
+
+    public static Function<InternalRow, String> fileNameGetter() {
+        return row -> row.getRow(5, DataFileMeta.SCHEMA.getFieldCount()).getString(0).toString();
+    }
+
+    public static Function<InternalRow, Integer> levelGetter() {
+        return row -> row.getRow(5, DataFileMeta.SCHEMA.getFieldCount()).getInt(10);
     }
 }

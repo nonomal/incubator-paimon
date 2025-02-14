@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,60 +18,26 @@
 
 package org.apache.paimon.spark.procedure;
 
-import org.apache.spark.sql.catalyst.InternalRow;
-import org.apache.spark.sql.connector.catalog.Identifier;
-import org.apache.spark.sql.connector.catalog.TableCatalog;
-import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.Metadata;
-import org.apache.spark.sql.types.StructField;
-import org.apache.spark.sql.types.StructType;
+import org.apache.paimon.table.Table;
 
-import static org.apache.spark.sql.types.DataTypes.LongType;
-import static org.apache.spark.sql.types.DataTypes.StringType;
+import org.apache.spark.sql.connector.catalog.TableCatalog;
+
+import java.time.Duration;
 
 /** A procedure to create a tag. */
-public class CreateTagProcedure extends BaseProcedure {
+public class CreateTagProcedure extends CreateOrReplaceTagBaseProcedure {
 
-    private static final ProcedureParameter[] PARAMETERS =
-            new ProcedureParameter[] {
-                ProcedureParameter.required("table", StringType),
-                ProcedureParameter.required("tag", StringType),
-                ProcedureParameter.required("snapshot", LongType)
-            };
-
-    private static final StructType OUTPUT_TYPE =
-            new StructType(
-                    new StructField[] {
-                        new StructField("result", DataTypes.BooleanType, true, Metadata.empty())
-                    });
-
-    protected CreateTagProcedure(TableCatalog tableCatalog) {
+    private CreateTagProcedure(TableCatalog tableCatalog) {
         super(tableCatalog);
     }
 
     @Override
-    public ProcedureParameter[] parameters() {
-        return PARAMETERS;
-    }
-
-    @Override
-    public StructType outputType() {
-        return OUTPUT_TYPE;
-    }
-
-    @Override
-    public InternalRow[] call(InternalRow args) {
-        Identifier tableIdent = toIdentifier(args.getString(0), PARAMETERS[0].name());
-        String tag = args.getString(1);
-        long snapshot = args.getLong(2);
-
-        return modifyPaimonTable(
-                tableIdent,
-                table -> {
-                    table.createTag(tag, snapshot);
-                    InternalRow outputRow = newInternalRow(true);
-                    return new InternalRow[] {outputRow};
-                });
+    void createOrReplaceTag(Table table, String tagName, Long snapshotId, Duration timeRetained) {
+        if (snapshotId == null) {
+            table.createTag(tagName, timeRetained);
+        } else {
+            table.createTag(tagName, snapshotId, timeRetained);
+        }
     }
 
     public static ProcedureBuilder builder() {

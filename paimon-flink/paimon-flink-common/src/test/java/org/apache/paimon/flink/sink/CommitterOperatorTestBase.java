@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -87,13 +88,25 @@ public abstract class CommitterOperatorTestBase {
     }
 
     protected FileStoreTable createFileStoreTable() throws Exception {
+        return createFileStoreTable(options -> {}, Collections.emptyList());
+    }
+
+    protected FileStoreTable createFileStoreTable(Consumer<Options> setOptions) throws Exception {
+        return createFileStoreTable(setOptions, Collections.emptyList());
+    }
+
+    protected FileStoreTable createFileStoreTable(
+            Consumer<Options> setOptions, List<String> partitionKeys) throws Exception {
         Options conf = new Options();
         conf.set(CoreOptions.PATH, tablePath.toString());
+        conf.setString("bucket", "1");
+        conf.setString("bucket-key", "a");
+        setOptions.accept(conf);
         SchemaManager schemaManager = new SchemaManager(LocalFileIO.create(), tablePath);
         schemaManager.createTable(
                 new Schema(
                         ROW_TYPE.getFields(),
-                        Collections.emptyList(),
+                        partitionKeys,
                         Collections.emptyList(),
                         conf.toMap(),
                         ""));

@@ -16,10 +16,6 @@
  * limitations under the License.
  */
 
-/* This file is based on source code from the Hadoop Project (http://hadoop.apache.org/), licensed by the Apache
- * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
- * additional information regarding copyright ownership. */
-
 package org.apache.paimon.fs;
 
 import org.apache.paimon.annotation.Public;
@@ -28,7 +24,12 @@ import org.apache.paimon.utils.StringUtils;
 import java.io.Serializable;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.UUID;
 import java.util.regex.Pattern;
+
+/* This file is based on source code from the Hadoop Project (http://hadoop.apache.org/), licensed by the Apache
+ * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
 
 /**
  * Names a file or directory in a {@link FileIO}. Path strings use slash as the directory separator.
@@ -299,15 +300,6 @@ public class Path implements Comparable<Path>, Serializable {
     }
 
     /**
-     * Return full path.
-     *
-     * @return full path
-     */
-    public String getPath() {
-        return uri.getPath();
-    }
-
-    /**
      * Returns the final component of this path, i.e., everything that follows the last separator.
      *
      * @return the final component of the path
@@ -316,6 +308,11 @@ public class Path implements Comparable<Path>, Serializable {
         String path = uri.getPath();
         int slash = path.lastIndexOf(SEPARATOR);
         return path.substring(slash + 1);
+    }
+
+    /** Create a temporary path (to be used as a copy) for this path. */
+    public Path createTempPath() {
+        return new Path(getParent(), String.format(".%s.%s.tmp", getName(), UUID.randomUUID()));
     }
 
     /**

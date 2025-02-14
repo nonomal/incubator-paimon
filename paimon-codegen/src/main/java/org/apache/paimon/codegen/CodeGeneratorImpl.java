@@ -28,43 +28,41 @@ import java.util.List;
 public class CodeGeneratorImpl implements CodeGenerator {
 
     @Override
-    public GeneratedClass<Projection> generateProjection(
-            String name, RowType inputType, int[] inputMapping) {
+    public GeneratedClass<Projection> generateProjection(RowType inputType, int[] inputMapping) {
         RowType outputType = TypeUtils.project(inputType, inputMapping);
         return ProjectionCodeGenerator.generateProjection(
-                new CodeGeneratorContext(), name, inputType, outputType, inputMapping);
+                new CodeGeneratorContext(), "Projection", inputType, outputType, inputMapping);
     }
 
     @Override
     public GeneratedClass<NormalizedKeyComputer> generateNormalizedKeyComputer(
-            List<DataType> fieldTypes, String name) {
+            List<DataType> inputTypes, int[] sortFields) {
         return new SortCodeGenerator(
-                        RowType.builder().fields(fieldTypes).build(),
-                        getAscendingSortSpec(fieldTypes.size()))
-                .generateNormalizedKeyComputer(name);
+                        RowType.builder().fields(inputTypes).build(),
+                        getAscendingSortSpec(sortFields, true))
+                .generateNormalizedKeyComputer("NormalizedKeyComputer");
     }
 
     @Override
     public GeneratedClass<RecordComparator> generateRecordComparator(
-            List<DataType> fieldTypes, String name) {
+            List<DataType> inputTypes, int[] sortFields, boolean isAscendingOrder) {
         return ComparatorCodeGenerator.gen(
-                name,
-                RowType.builder().fields(fieldTypes).build(),
-                getAscendingSortSpec(fieldTypes.size()));
+                "RecordComparator",
+                RowType.builder().fields(inputTypes).build(),
+                getAscendingSortSpec(sortFields, isAscendingOrder));
     }
 
-    /** Generate a {@link RecordEqualiser}. */
     @Override
     public GeneratedClass<RecordEqualiser> generateRecordEqualiser(
-            List<DataType> fieldTypes, String name) {
-        return new EqualiserCodeGenerator(RowType.builder().fields(fieldTypes).build())
-                .generateRecordEqualiser(name);
+            List<DataType> fieldTypes, int[] fields) {
+        return new EqualiserCodeGenerator(fieldTypes.toArray(new DataType[0]), fields)
+                .generateRecordEqualiser("RecordEqualiser");
     }
 
-    private SortSpec getAscendingSortSpec(int numFields) {
+    private SortSpec getAscendingSortSpec(int[] sortFields, boolean isAscendingOrder) {
         SortSpec.SortSpecBuilder builder = SortSpec.builder();
-        for (int i = 0; i < numFields; i++) {
-            builder.addField(i, true, false);
+        for (int sortField : sortFields) {
+            builder.addField(sortField, isAscendingOrder, false);
         }
         return builder.build();
     }

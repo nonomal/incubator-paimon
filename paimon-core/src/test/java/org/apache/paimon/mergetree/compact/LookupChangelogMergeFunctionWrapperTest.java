@@ -18,23 +18,32 @@
 
 package org.apache.paimon.mergetree.compact;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.KeyValue;
 import org.apache.paimon.codegen.RecordEqualiser;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.InternalRow.FieldGetter;
+import org.apache.paimon.lookup.LookupStrategy;
 import org.apache.paimon.mergetree.compact.aggregate.AggregateMergeFunction;
 import org.apache.paimon.mergetree.compact.aggregate.FieldAggregator;
-import org.apache.paimon.mergetree.compact.aggregate.FieldSumAgg;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldLastValueAggFactory;
+import org.apache.paimon.mergetree.compact.aggregate.factory.FieldSumAggFactory;
 import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypes;
 import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.UserDefinedSeqComparator;
+import org.apache.paimon.utils.ValueEqualiserSupplier;
+
+import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
 
 import org.assertj.core.util.Lists;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -65,8 +74,10 @@ public class LookupChangelogMergeFunctionWrapperTest {
                                 RowType.of(DataTypes.INT()),
                                 RowType.of(DataTypes.INT())),
                         highLevel::get,
-                        EQUALISER,
-                        changelogRowDeduplicate);
+                        changelogRowDeduplicate ? EQUALISER : null,
+                        LookupStrategy.from(false, true, false, false),
+                        null,
+                        null);
 
         // Without level-0
         function.reset();
@@ -140,6 +151,7 @@ public class LookupChangelogMergeFunctionWrapperTest {
 
         // With level-0 'delete' record, without level-x record, query fail
         function.reset();
+        highLevel.clear();
         function.add(new KeyValue().replace(row(1), 1, UPDATE_BEFORE, row(2)).setLevel(0));
         result = function.getResult();
         assertThat(result).isNotNull();
@@ -204,6 +216,71 @@ public class LookupChangelogMergeFunctionWrapperTest {
         assertThat(kv.value().getInt(0)).isEqualTo(2);
     }
 
+    @Test
+    public void testDeduplicateWithIgnoreFields() {
+        Map<InternalRow, KeyValue> highLevel = new HashMap<>();
+        RowType valueType =
+                RowType.builder()
+                        .fields(
+                                new DataType[] {DataTypes.INT(), DataTypes.INT()},
+                                new String[] {"f0", "f1"})
+                        .build();
+        UserDefinedSeqComparator userDefinedSeqComparator =
+                UserDefinedSeqComparator.create(
+                        valueType, CoreOptions.fromMap(ImmutableMap.of("sequence.field", "f1")));
+        assert userDefinedSeqComparator != null;
+        List<String> ignoreFields = Collections.singletonList("f1");
+        ValueEqualiserSupplier logDedupEqualSupplier =
+                ValueEqualiserSupplier.fromIgnoreFields(valueType, ignoreFields);
+        LookupChangelogMergeFunctionWrapper function =
+                new LookupChangelogMergeFunctionWrapper(
+                        LookupMergeFunction.wrap(
+                                DeduplicateMergeFunction.factory(),
+                                RowType.of(DataTypes.INT()),
+                                valueType),
+                        highLevel::get,
+                        logDedupEqualSupplier.get(),
+                        LookupStrategy.from(false, true, false, false),
+                        null,
+                        userDefinedSeqComparator);
+
+        // With level-0 'insert' record, with level-x (x > 0) same record. Notice that the specified
+        // ignored
+        // fields in records are different.
+        function.reset();
+        function.add(new KeyValue().replace(row(1), 1, INSERT, row(1, 1)).setLevel(2));
+        function.add(new KeyValue().replace(row(1), 2, INSERT, row(1, 2)).setLevel(0));
+        ChangelogResult result = function.getResult();
+        assertThat(result).isNotNull();
+        List<KeyValue> changelogs = result.changelogs();
+        assertThat(changelogs).isEmpty();
+        KeyValue kv = result.result();
+        assertThat(kv).isNotNull();
+        assertThat(kv.valueKind()).isEqualTo(INSERT);
+        assertThat(kv.value().getInt(0)).isEqualTo(1);
+        assertThat(kv.value().getInt(1)).isEqualTo(2);
+
+        // With level-0 'insert' record, with level-x (x > 0) different record.
+        function.reset();
+        function.add(new KeyValue().replace(row(1), 1, INSERT, row(1, 1)).setLevel(1));
+        function.add(new KeyValue().replace(row(1), 2, INSERT, row(2, 2)).setLevel(0));
+        result = function.getResult();
+        assertThat(result).isNotNull();
+        changelogs = result.changelogs();
+        assertThat(changelogs).hasSize(2);
+        assertThat(changelogs.get(0).valueKind()).isEqualTo(UPDATE_BEFORE);
+        assertThat(changelogs.get(0).value().getInt(0)).isEqualTo(1);
+        assertThat(changelogs.get(0).value().getInt(1)).isEqualTo(1);
+        assertThat(changelogs.get(1).valueKind()).isEqualTo(UPDATE_AFTER);
+        assertThat(changelogs.get(1).value().getInt(0)).isEqualTo(2);
+        assertThat(changelogs.get(1).value().getInt(1)).isEqualTo(2);
+        kv = result.result();
+        assertThat(kv).isNotNull();
+        assertThat(kv.valueKind()).isEqualTo(INSERT);
+        assertThat(kv.value().getInt(0)).isEqualTo(2);
+        assertThat(kv.value().getInt(1)).isEqualTo(2);
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     public void testSum(boolean changelogRowDeduplicate) {
@@ -216,13 +293,16 @@ public class LookupChangelogMergeFunctionWrapperTest {
                                                     row -> row.isNullAt(0) ? null : row.getInt(0)
                                                 },
                                                 new FieldAggregator[] {
-                                                    new FieldSumAgg(DataTypes.INT())
+                                                    new FieldSumAggFactory()
+                                                            .create(DataTypes.INT(), null, null)
                                                 }),
                                 RowType.of(DataTypes.INT()),
                                 RowType.of(DataTypes.INT())),
                         key -> null,
-                        EQUALISER,
-                        changelogRowDeduplicate);
+                        changelogRowDeduplicate ? EQUALISER : null,
+                        LookupStrategy.from(false, true, false, false),
+                        null,
+                        null);
 
         // Without level-0
         function.reset();
@@ -291,16 +371,96 @@ public class LookupChangelogMergeFunctionWrapperTest {
     }
 
     @Test
+    public void testMergeHighLevelOrder() {
+        Map<InternalRow, KeyValue> highLevel = new HashMap<>();
+        LookupChangelogMergeFunctionWrapper function =
+                new LookupChangelogMergeFunctionWrapper(
+                        LookupMergeFunction.wrap(
+                                projection ->
+                                        new AggregateMergeFunction(
+                                                new FieldGetter[] {
+                                                    row -> row.isNullAt(0) ? null : row.getInt(0)
+                                                },
+                                                new FieldAggregator[] {
+                                                    new FieldLastValueAggFactory()
+                                                            .create(DataTypes.INT(), null, null)
+                                                }),
+                                RowType.of(DataTypes.INT()),
+                                RowType.of(DataTypes.INT())),
+                        highLevel::get,
+                        null,
+                        LookupStrategy.from(false, true, false, false),
+                        null,
+                        UserDefinedSeqComparator.create(
+                                RowType.builder().field("f0", DataTypes.INT()).build(),
+                                CoreOptions.fromMap(ImmutableMap.of("sequence.field", "f0"))));
+
+        // Only level-0 record and find record of higher sequence.field value in high level.
+        highLevel.put(row(1), new KeyValue().replace(row(1), 1, INSERT, row(3)).setLevel(3));
+        function.reset();
+        function.add(new KeyValue().replace(row(1), 2, INSERT, row(2)).setLevel(0));
+        ChangelogResult result = function.getResult();
+        assertThat(result).isNotNull();
+        List<KeyValue> changelogs = result.changelogs();
+        // 3 -> 3
+        assertThat(changelogs).hasSize(2);
+        assertThat(changelogs.get(0).valueKind()).isEqualTo(UPDATE_BEFORE);
+        assertThat(changelogs.get(0).value().getInt(0)).isEqualTo(3);
+        assertThat(changelogs.get(1).valueKind()).isEqualTo(UPDATE_AFTER);
+        assertThat(changelogs.get(1).value().getInt(0)).isEqualTo(3);
+        KeyValue kv = result.result();
+        assertThat(kv).isNotNull();
+        assertThat(kv.value().getInt(0)).isEqualTo(3);
+
+        // Only level-0 record and find record of lower sequence.field value in high level.
+        highLevel.put(row(1), new KeyValue().replace(row(1), 1, INSERT, row(1)).setLevel(3));
+        function.reset();
+        function.add(new KeyValue().replace(row(1), 2, INSERT, row(2)).setLevel(0));
+        result = function.getResult();
+        assertThat(result).isNotNull();
+        changelogs = result.changelogs();
+        // 1 -> 2
+        assertThat(changelogs).hasSize(2);
+        assertThat(changelogs.get(0).valueKind()).isEqualTo(UPDATE_BEFORE);
+        assertThat(changelogs.get(0).value().getInt(0)).isEqualTo(1);
+        assertThat(changelogs.get(1).valueKind()).isEqualTo(UPDATE_AFTER);
+        assertThat(changelogs.get(1).value().getInt(0)).isEqualTo(2);
+        kv = result.result();
+        assertThat(kv).isNotNull();
+        assertThat(kv.value().getInt(0)).isEqualTo(2);
+
+        // Only level-0 record and find record of middle sequence.field value in high level.
+        // 1 2 3
+        highLevel.put(row(1), new KeyValue().replace(row(1), 1, INSERT, row(2)).setLevel(3));
+        function.reset();
+        function.add(new KeyValue().replace(row(1), 2, INSERT, row(1)).setLevel(0));
+        function.add(new KeyValue().replace(row(1), 2, INSERT, row(3)).setLevel(0));
+        result = function.getResult();
+        assertThat(result).isNotNull();
+        changelogs = result.changelogs();
+        // 2 -> 3
+        assertThat(changelogs).hasSize(2);
+        assertThat(changelogs.get(0).valueKind()).isEqualTo(UPDATE_BEFORE);
+        assertThat(changelogs.get(0).value().getInt(0)).isEqualTo(2);
+        assertThat(changelogs.get(1).valueKind()).isEqualTo(UPDATE_AFTER);
+        assertThat(changelogs.get(1).value().getInt(0)).isEqualTo(3);
+        kv = result.result();
+        assertThat(kv).isNotNull();
+        assertThat(kv.value().getInt(0)).isEqualTo(3);
+    }
+
+    @Test
     public void testFirstRow() {
         Set<InternalRow> highLevel = new HashSet<>();
-        FirstRowMergeTreeCompactRewriter.FistRowMergeFunctionWrapper function =
-                new FirstRowMergeTreeCompactRewriter.FistRowMergeFunctionWrapper(
+        FirstRowMergeFunctionWrapper function =
+                new FirstRowMergeFunctionWrapper(
                         projection ->
                                 new FirstRowMergeFunction(
                                         new RowType(
                                                 Lists.list(new DataField(0, "f0", new IntType()))),
                                         new RowType(
-                                                Lists.list(new DataField(1, "f1", new IntType())))),
+                                                Lists.list(new DataField(1, "f1", new IntType()))),
+                                        false),
                         highLevel::contains);
 
         // Without level-0

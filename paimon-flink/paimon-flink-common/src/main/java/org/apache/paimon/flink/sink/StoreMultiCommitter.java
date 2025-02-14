@@ -18,8 +18,8 @@
 
 package org.apache.paimon.flink.sink;
 
-import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogLoader;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.manifest.WrappedManifestCommittable;
@@ -27,8 +27,6 @@ import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessage;
 
 import org.apache.flink.api.java.tuple.Tuple2;
-
-import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -48,45 +46,58 @@ public class StoreMultiCommitter
         implements Committer<MultiTableCommittable, WrappedManifestCommittable> {
 
     private final Catalog catalog;
-    private final String commitUser;
-    @Nullable private final CommitterMetrics metrics;
+    private final Context context;
 
     // To make the commit behavior consistent with that of Committer,
     //    StoreMultiCommitter manages multiple committers which are
     //    referenced by table id.
     private final Map<Identifier, StoreCommitter> tableCommitters;
 
-    // compact job needs set "write-only" of a table to false
-    private final boolean isCompactJob;
+    // Currently, only compact_database job needs to ignore empty commit and set dynamic options
+    private final boolean ignoreEmptyCommit;
+    private final Map<String, String> dynamicOptions;
 
-    public StoreMultiCommitter(
-            Catalog.Loader catalogLoader, String commitUser, @Nullable CommitterMetrics metrics) {
-        this(catalogLoader, commitUser, metrics, false);
+    public StoreMultiCommitter(CatalogLoader catalogLoader, Context context) {
+        this(catalogLoader, context, false, Collections.emptyMap());
     }
 
     public StoreMultiCommitter(
-            Catalog.Loader catalogLoader,
-            String commitUser,
-            @Nullable CommitterMetrics metrics,
-            boolean isCompactJob) {
+            CatalogLoader catalogLoader,
+            Context context,
+            boolean ignoreEmptyCommit,
+            Map<String, String> dynamicOptions) {
         this.catalog = catalogLoader.load();
-        this.commitUser = commitUser;
-        this.metrics = metrics;
+        this.context = context;
+        this.ignoreEmptyCommit = ignoreEmptyCommit;
+        this.dynamicOptions = dynamicOptions;
         this.tableCommitters = new HashMap<>();
-        this.isCompactJob = isCompactJob;
+    }
+
+    @Override
+    public boolean forceCreatingSnapshot() {
+        return true;
     }
 
     @Override
     public WrappedManifestCommittable combine(
             long checkpointId, long watermark, List<MultiTableCommittable> committables) {
-        WrappedManifestCommittable wrappedManifestCommittable = new WrappedManifestCommittable();
-        for (MultiTableCommittable committable : committables) {
+        WrappedManifestCommittable wrappedManifestCommittable =
+                new WrappedManifestCommittable(checkpointId, watermark);
+        return combine(checkpointId, watermark, wrappedManifestCommittable, committables);
+    }
 
+    @Override
+    public WrappedManifestCommittable combine(
+            long checkpointId,
+            long watermark,
+            WrappedManifestCommittable wrappedManifestCommittable,
+            List<MultiTableCommittable> committables) {
+        for (MultiTableCommittable committable : committables) {
+            Identifier identifier =
+                    Identifier.create(committable.getDatabase(), committable.getTable());
             ManifestCommittable manifestCommittable =
                     wrappedManifestCommittable.computeCommittableIfAbsent(
-                            Identifier.create(committable.getDatabase(), committable.getTable()),
-                            checkpointId,
-                            watermark);
+                            identifier, checkpointId, watermark);
 
             switch (committable.kind()) {
                 case FILE:
@@ -96,7 +107,9 @@ public class StoreMultiCommitter
                 case LOG_OFFSET:
                     LogOffsetCommittable offset =
                             (LogOffsetCommittable) committable.wrappedCommittable();
-                    manifestCommittable.addLogOffset(offset.bucket(), offset.offset());
+                    StoreCommitter committer = tableCommitters.get(identifier);
+                    manifestCommittable.addLogOffset(
+                            offset.bucket(), offset.offset(), committer.allowLogOffsetDuplicate());
                     break;
             }
         }
@@ -106,25 +119,42 @@ public class StoreMultiCommitter
     @Override
     public void commit(List<WrappedManifestCommittable> committables)
             throws IOException, InterruptedException {
+        if (committables.isEmpty()) {
+            return;
+        }
 
         // key by table id
         Map<Identifier, List<ManifestCommittable>> committableMap = groupByTable(committables);
+        committableMap.keySet().forEach(this::getStoreCommitter);
 
-        for (Map.Entry<Identifier, List<ManifestCommittable>> entry : committableMap.entrySet()) {
-            Identifier tableId = entry.getKey();
-            List<ManifestCommittable> committableList = entry.getValue();
-            StoreCommitter committer = getStoreCommitter(tableId);
-            committer.commit(committableList);
+        long checkpointId = committables.get(0).checkpointId();
+        long watermark = committables.get(0).watermark();
+        for (Map.Entry<Identifier, StoreCommitter> entry : tableCommitters.entrySet()) {
+            List<ManifestCommittable> committableList = committableMap.get(entry.getKey());
+            StoreCommitter committer = entry.getValue();
+            if (committableList != null) {
+                committer.commit(committableList);
+            } else {
+                // try best to commit empty snapshot, but tableCommitters may not contain all tables
+                if (committer.forceCreatingSnapshot()) {
+                    ManifestCommittable combine =
+                            committer.combine(checkpointId, watermark, Collections.emptyList());
+                    committer.commit(Collections.singletonList(combine));
+                }
+            }
         }
     }
 
     @Override
-    public int filterAndCommit(List<WrappedManifestCommittable> globalCommittables)
+    public int filterAndCommit(
+            List<WrappedManifestCommittable> globalCommittables, boolean checkAppendFiles)
             throws IOException {
         int result = 0;
         for (Map.Entry<Identifier, List<ManifestCommittable>> entry :
                 groupByTable(globalCommittables).entrySet()) {
-            result += getStoreCommitter(entry.getKey()).filterAndCommit(entry.getValue());
+            result +=
+                    getStoreCommitter(entry.getKey())
+                            .filterAndCommit(entry.getValue(), checkAppendFiles);
         }
         return result;
     }
@@ -135,7 +165,7 @@ public class StoreMultiCommitter
                 .flatMap(
                         wrapped -> {
                             Map<Identifier, ManifestCommittable> manifestCommittables =
-                                    wrapped.getManifestCommittables();
+                                    wrapped.manifestCommittables();
                             return manifestCommittables.entrySet().stream()
                                     .map(entry -> Tuple2.of(entry.getKey(), entry.getValue()));
                         })
@@ -160,13 +190,7 @@ public class StoreMultiCommitter
         if (committer == null) {
             FileStoreTable table;
             try {
-                table = (FileStoreTable) catalog.getTable(tableId);
-                if (isCompactJob) {
-                    table =
-                            table.copy(
-                                    Collections.singletonMap(
-                                            CoreOptions.WRITE_ONLY.key(), "false"));
-                }
+                table = (FileStoreTable) catalog.getTable(tableId).copy(dynamicOptions);
             } catch (Catalog.TableNotExistException e) {
                 throw new RuntimeException(
                         String.format(
@@ -175,7 +199,10 @@ public class StoreMultiCommitter
             }
             committer =
                     new StoreCommitter(
-                            table.newCommit(commitUser).ignoreEmptyCommit(isCompactJob), metrics);
+                            table,
+                            table.newCommit(context.commitUser())
+                                    .ignoreEmptyCommit(ignoreEmptyCommit),
+                            context);
             tableCommitters.put(tableId, committer);
         }
 
@@ -186,6 +213,9 @@ public class StoreMultiCommitter
     public void close() throws Exception {
         for (StoreCommitter committer : tableCommitters.values()) {
             committer.close();
+        }
+        if (catalog != null) {
+            catalog.close();
         }
     }
 }

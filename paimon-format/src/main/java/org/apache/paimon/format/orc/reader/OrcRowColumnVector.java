@@ -24,26 +24,34 @@ import org.apache.paimon.data.columnar.VectorizedColumnBatch;
 import org.apache.paimon.types.RowType;
 
 import org.apache.hadoop.hive.ql.exec.vector.StructColumnVector;
+import org.apache.hadoop.hive.ql.exec.vector.VectorizedRowBatch;
 
 /** This column vector is used to adapt hive's StructColumnVector to Flink's RowColumnVector. */
 public class OrcRowColumnVector extends AbstractOrcColumnVector
         implements org.apache.paimon.data.columnar.RowColumnVector {
 
-    private final ColumnarRow columnarRow;
+    private final VectorizedColumnBatch batch;
 
-    public OrcRowColumnVector(StructColumnVector hiveVector, RowType type) {
-        super(hiveVector);
+    public OrcRowColumnVector(
+            StructColumnVector hiveVector, VectorizedRowBatch orcBatch, RowType type) {
+        super(hiveVector, orcBatch);
         int len = hiveVector.fields.length;
         ColumnVector[] paimonVectors = new ColumnVector[len];
         for (int i = 0; i < len; i++) {
-            paimonVectors[i] = createPaimonVector(hiveVector.fields[i], type.getTypeAt(i));
+            paimonVectors[i] =
+                    createPaimonVector(hiveVector.fields[i], orcBatch, type.getTypeAt(i));
         }
-        this.columnarRow = new ColumnarRow(new VectorizedColumnBatch(paimonVectors));
+        this.batch = new VectorizedColumnBatch(paimonVectors);
     }
 
     @Override
     public ColumnarRow getRow(int i) {
-        this.columnarRow.setRowId(i);
-        return this.columnarRow;
+        i = rowMapper(i);
+        return new ColumnarRow(batch, i);
+    }
+
+    @Override
+    public VectorizedColumnBatch getBatch() {
+        return batch;
     }
 }

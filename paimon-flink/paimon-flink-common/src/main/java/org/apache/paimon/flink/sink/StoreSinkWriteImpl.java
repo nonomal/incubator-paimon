@@ -22,16 +22,18 @@ import org.apache.paimon.annotation.VisibleForTesting;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.disk.IOManagerImpl;
+import org.apache.paimon.flink.metrics.FlinkMetricRegistry;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
 import org.apache.paimon.memory.MemoryPoolFactory;
 import org.apache.paimon.memory.MemorySegmentPool;
-import org.apache.paimon.operation.AbstractFileStoreWrite;
+import org.apache.paimon.operation.FileStoreWrite;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.SinkRecord;
 import org.apache.paimon.table.sink.TableWriteImpl;
 
+import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,7 +54,7 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
 
     protected final String commitUser;
     protected final StoreSinkWriteState state;
-    private final IOManager ioManager;
+    private final IOManagerImpl paimonIOManager;
     private final boolean ignorePreviousFiles;
     private final boolean waitCompaction;
     private final boolean isStreamingMode;
@@ -60,6 +62,10 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
     @Nullable private final MemoryPoolFactory memoryPoolFactory;
 
     protected TableWriteImpl<?> write;
+
+    @Nullable private final MetricGroup metricGroup;
+
+    @Nullable private Boolean insertOnly;
 
     public StoreSinkWriteImpl(
             FileStoreTable table,
@@ -69,7 +75,8 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
             boolean ignorePreviousFiles,
             boolean waitCompaction,
             boolean isStreamingMode,
-            @Nullable MemorySegmentPool memoryPool) {
+            @Nullable MemorySegmentPool memoryPool,
+            @Nullable MetricGroup metricGroup) {
         this(
                 table,
                 commitUser,
@@ -79,7 +86,8 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
                 waitCompaction,
                 isStreamingMode,
                 memoryPool,
-                null);
+                null,
+                metricGroup);
     }
 
     public StoreSinkWriteImpl(
@@ -90,7 +98,8 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
             boolean ignorePreviousFiles,
             boolean waitCompaction,
             boolean isStreamingMode,
-            MemoryPoolFactory memoryPoolFactory) {
+            MemoryPoolFactory memoryPoolFactory,
+            @Nullable MetricGroup metricGroup) {
         this(
                 table,
                 commitUser,
@@ -100,7 +109,8 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
                 waitCompaction,
                 isStreamingMode,
                 null,
-                memoryPoolFactory);
+                memoryPoolFactory,
+                metricGroup);
     }
 
     private StoreSinkWriteImpl(
@@ -112,15 +122,17 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
             boolean waitCompaction,
             boolean isStreamingMode,
             @Nullable MemorySegmentPool memoryPool,
-            @Nullable MemoryPoolFactory memoryPoolFactory) {
+            @Nullable MemoryPoolFactory memoryPoolFactory,
+            @Nullable MetricGroup metricGroup) {
         this.commitUser = commitUser;
         this.state = state;
-        this.ioManager = ioManager;
+        this.paimonIOManager = new IOManagerImpl(ioManager.getSpillingDirectoriesPaths());
         this.ignorePreviousFiles = ignorePreviousFiles;
         this.waitCompaction = waitCompaction;
         this.isStreamingMode = isStreamingMode;
         this.memoryPool = memoryPool;
         this.memoryPoolFactory = memoryPoolFactory;
+        this.metricGroup = metricGroup;
         this.write = newTableWrite(table);
     }
 
@@ -134,20 +146,31 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
                                 commitUser,
                                 (part, bucket) ->
                                         state.stateValueFilter().filter(table.name(), part, bucket))
-                        .withIOManager(new IOManagerImpl(ioManager.getSpillingDirectoriesPaths()))
+                        .withIOManager(paimonIOManager)
                         .withIgnorePreviousFiles(ignorePreviousFiles)
-                        .isStreamingMode(isStreamingMode);
+                        .withExecutionMode(isStreamingMode)
+                        .withBucketMode(table.bucketMode());
+
+        if (metricGroup != null) {
+            tableWrite.withMetricRegistry(new FlinkMetricRegistry(metricGroup));
+        }
 
         if (memoryPoolFactory != null) {
-            return tableWrite.withMemoryPoolFactory(memoryPoolFactory);
+            tableWrite.withMemoryPoolFactory(memoryPoolFactory);
         } else {
-            return tableWrite.withMemoryPool(
+            tableWrite.withMemoryPool(
                     memoryPool != null
                             ? memoryPool
                             : new HeapMemorySegmentPool(
                                     table.coreOptions().writeBufferSize(),
                                     table.coreOptions().pageSize()));
         }
+
+        if (insertOnly != null) {
+            tableWrite.withInsertOnly(insertOnly);
+        }
+
+        return tableWrite;
     }
 
     public void withCompactExecutor(ExecutorService compactExecutor) {
@@ -155,8 +178,21 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
     }
 
     @Override
+    public void withInsertOnly(boolean insertOnly) {
+        this.insertOnly = insertOnly;
+        write.withInsertOnly(insertOnly);
+    }
+
+    @Override
+    @Nullable
     public SinkRecord write(InternalRow rowData) throws Exception {
         return write.writeAndReturn(rowData);
+    }
+
+    @Override
+    @Nullable
+    public SinkRecord write(InternalRow rowData, int bucket) throws Exception {
+        return write.writeAndReturn(rowData, bucket);
     }
 
     @Override
@@ -216,6 +252,8 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
         if (write != null) {
             write.close();
         }
+
+        paimonIOManager.close();
     }
 
     @Override
@@ -224,7 +262,7 @@ public class StoreSinkWriteImpl implements StoreSinkWrite {
             return;
         }
 
-        List<? extends AbstractFileStoreWrite.State<?>> states = write.checkpoint();
+        List<? extends FileStoreWrite.State<?>> states = write.checkpoint();
         write.close();
         write = newTableWrite(newTable);
         write.restore((List) states);

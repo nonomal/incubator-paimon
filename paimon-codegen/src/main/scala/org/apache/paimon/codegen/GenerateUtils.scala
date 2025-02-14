@@ -15,9 +15,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.paimon.codegen
 
 import org.apache.paimon.data._
+import org.apache.paimon.data.variant.Variant
 import org.apache.paimon.memory.MemorySegment
 import org.apache.paimon.types._
 import org.apache.paimon.types.DataTypeChecks.{getFieldCount, getFieldTypes, getPrecision, getScale}
@@ -379,6 +381,7 @@ object GenerateUtils {
     case ARRAY => className[InternalArray]
     case MULTISET | MAP => className[InternalMap]
     case ROW => className[InternalRow]
+    case VARIANT => className[Variant]
     case _ =>
       throw new IllegalArgumentException("Illegal type: " + t)
   }
@@ -417,6 +420,8 @@ object GenerateUtils {
         s"$rowTerm.getMap($indexTerm)"
       case ROW =>
         s"$rowTerm.getRow($indexTerm, ${getFieldCount(t)})"
+      case VARIANT =>
+        s"$rowTerm.getVariant($indexTerm)"
       case _ =>
         throw new IllegalArgumentException("Illegal type: " + t)
     }

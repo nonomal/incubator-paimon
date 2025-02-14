@@ -22,11 +22,19 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.table.source.ScanMode;
 import org.apache.paimon.utils.SnapshotManager;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+
 /**
  * {@link StartingScanner} for the {@link CoreOptions.StartupMode#FROM_SNAPSHOT} or {@link
  * CoreOptions.StartupMode#FROM_SNAPSHOT_FULL} startup mode of a batch read.
  */
-public class StaticFromSnapshotStartingScanner extends AbstractStartingScanner {
+public class StaticFromSnapshotStartingScanner extends ReadPlanStartingScanner {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(StaticFromSnapshotStartingScanner.class);
 
     public StaticFromSnapshotStartingScanner(SnapshotManager snapshotManager, long snapshotId) {
         super(snapshotManager);
@@ -39,12 +47,24 @@ public class StaticFromSnapshotStartingScanner extends AbstractStartingScanner {
     }
 
     @Override
-    public Result scan(SnapshotReader snapshotReader) {
-        if (snapshotManager.earliestSnapshotId() == null
-                || startingSnapshotId < snapshotManager.earliestSnapshotId()) {
-            return new NoSnapshot();
+    public SnapshotReader configure(SnapshotReader snapshotReader) {
+        Long earliestSnapshotId = snapshotManager.earliestSnapshotId();
+        Long latestSnapshotId = snapshotManager.latestSnapshotId();
+
+        if (earliestSnapshotId == null || latestSnapshotId == null) {
+            LOG.warn("There is currently no snapshot. Waiting for snapshot generation.");
+            return null;
         }
-        return StartingScanner.fromPlan(
-                snapshotReader.withMode(ScanMode.ALL).withSnapshot(startingSnapshotId).read());
+
+        // Checks earlier whether the specified scan snapshot id is valid and throws the correct
+        // exception.
+        checkArgument(
+                startingSnapshotId >= earliestSnapshotId && startingSnapshotId <= latestSnapshotId,
+                "The specified scan snapshotId %s is out of available snapshotId range [%s, %s].",
+                startingSnapshotId,
+                earliestSnapshotId,
+                latestSnapshotId);
+
+        return snapshotReader.withMode(ScanMode.ALL).withSnapshot(startingSnapshotId);
     }
 }

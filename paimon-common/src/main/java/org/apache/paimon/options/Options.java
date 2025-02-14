@@ -33,6 +33,7 @@ import java.util.function.BiFunction;
 
 import static org.apache.paimon.options.OptionsUtils.canBePrefixMap;
 import static org.apache.paimon.options.OptionsUtils.containsPrefixMap;
+import static org.apache.paimon.options.OptionsUtils.convertToPropertiesPrefixKey;
 import static org.apache.paimon.options.OptionsUtils.convertToPropertiesPrefixed;
 import static org.apache.paimon.options.OptionsUtils.removePrefixMap;
 
@@ -59,6 +60,13 @@ public class Options implements Serializable {
     public Options(Map<String, String> map) {
         this();
         map.forEach(this::setString);
+    }
+
+    /** Creates a new configuration that is initialized with the options of the given two maps. */
+    public Options(Map<String, String> map1, Map<String, String> map2) {
+        this();
+        map1.forEach(this::setString);
+        map2.forEach(this::setString);
     }
 
     public static Options fromMap(Map<String, String> map) {
@@ -98,11 +106,7 @@ public class Options implements Serializable {
         Class<?> clazz = option.getClazz();
 
         try {
-            if (option.isList()) {
-                return rawValue.map(v -> OptionsUtils.convertToList(v, clazz));
-            } else {
-                return rawValue.map(v -> OptionsUtils.convertValue(v, clazz));
-            }
+            return rawValue.map(v -> OptionsUtils.convertValue(v, clazz));
         } catch (Exception e) {
             throw new IllegalArgumentException(
                     String.format(
@@ -142,25 +146,22 @@ public class Options implements Serializable {
     }
 
     public synchronized Options removePrefix(String prefix) {
-        Map<String, String> newData = new HashMap<>();
-        data.forEach(
-                (k, v) -> {
-                    if (k.startsWith(prefix)) {
-                        newData.put(k.substring(prefix.length()), v);
-                    }
-                });
-        return new Options(newData);
+        return new Options(convertToPropertiesPrefixKey(data, prefix));
     }
 
-    public synchronized void remove(String key) {
-        data.remove(key);
+    public synchronized String remove(String key) {
+        return data.remove(key);
+    }
+
+    public synchronized void remove(ConfigOption<?> option) {
+        data.remove(option.key());
     }
 
     public synchronized boolean containsKey(String key) {
         return data.containsKey(key);
     }
 
-    /** Adds all entries in this options to the given {@link Properties}. */
+    /** Adds all entries in these options to the given {@link Properties}. */
     public synchronized void addAllToProperties(Properties props) {
         props.putAll(this.data);
     }
@@ -175,6 +176,10 @@ public class Options implements Serializable {
 
     public synchronized int getInteger(String key, int defaultValue) {
         return getRawValue(key).map(OptionsUtils::convertToInt).orElse(defaultValue);
+    }
+
+    public synchronized double getDouble(String key, double defaultValue) {
+        return getRawValue(key).map(OptionsUtils::convertToDouble).orElse(defaultValue);
     }
 
     public synchronized String getString(String key, String defaultValue) {

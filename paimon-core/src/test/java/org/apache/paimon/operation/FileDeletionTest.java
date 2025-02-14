@@ -34,8 +34,12 @@ import org.apache.paimon.manifest.ManifestFile;
 import org.apache.paimon.manifest.ManifestFileMeta;
 import org.apache.paimon.manifest.ManifestList;
 import org.apache.paimon.mergetree.compact.DeduplicateMergeFunction;
+import org.apache.paimon.options.ExpireConfig;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.ExpireSnapshots;
+import org.apache.paimon.table.ExpireSnapshotsImpl;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileStorePathFactory;
 import org.apache.paimon.utils.RecordWriter;
@@ -45,9 +49,12 @@ import org.apache.paimon.utils.TagManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -57,16 +64,19 @@ import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.CoreOptions.SNAPSHOT_CLEAN_EMPTY_DIRECTORIES;
+import static org.apache.paimon.operation.FileStoreCommitImpl.mustConflictCheck;
 import static org.apache.paimon.operation.FileStoreTestUtils.assertPathExists;
 import static org.apache.paimon.operation.FileStoreTestUtils.assertPathNotExists;
 import static org.apache.paimon.operation.FileStoreTestUtils.commitData;
 import static org.apache.paimon.operation.FileStoreTestUtils.partitionedData;
+import static org.apache.paimon.utils.BranchManager.DEFAULT_MAIN_BRANCH;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Tests for file deletion when expiring snapshot and deleting tag. It also tests that after
  * expiration, empty data file directories (buckets and partitions) are deleted. It didn't extend
- * {@link FileStoreExpireTestBase} because there are not too many codes can be reused.
+ * {@link ExpireSnapshotsTest} because there are not too many codes can be reused.
  */
 public class FileDeletionTest {
 
@@ -76,11 +86,13 @@ public class FileDeletionTest {
 
     private long commitIdentifier;
     private String root;
+    private TagManager tagManager;
 
     @BeforeEach
     public void setup() throws Exception {
         commitIdentifier = 0L;
         root = tempDir.toString();
+        tagManager = null;
     }
 
     /**
@@ -95,11 +107,12 @@ public class FileDeletionTest {
      *       dt=0402/hr=8 will be deleted after expiring).
      *   <li>4. Generate snapshot 4 by deleting all data of partition dt=0402/hr=12/bucket-0 (thus
      *       directory dt=0402/hr=12/bucket-0 will be deleted after expiring).
-     *   <li>5. Expire snapshot 1-3 (dt=0402/hr=20/bucket-1 survives) and check.
+     *   <li>5. Expire snapshot 1-3 (dt=0402/hr=12/bucket-1 survives) and check.
      * </ul>
      */
-    @Test
-    public void testMultiPartitions() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void testMultiPartitions(boolean cleanEmptyDirs) throws Exception {
         TestFileStore store = createStore(TestKeyValueGenerator.GeneratorMode.MULTI_PARTITIONED);
         TestKeyValueGenerator gen =
                 new TestKeyValueGenerator(TestKeyValueGenerator.GeneratorMode.MULTI_PARTITIONED);
@@ -142,20 +155,38 @@ public class FileDeletionTest {
         partitionSpec.put("hr", "8");
         commit.overwrite(
                 partitionSpec, new ManifestCommittable(commitIdentifier++), Collections.emptyMap());
+        commit.close();
 
         // step 4: generate snapshot 4 by cleaning dt=0402/hr=12/bucket-0
         BinaryRow partition = partitions.get(7);
         cleanBucket(store, partition, 0);
 
         // step 5: expire and check file paths
+        store.options().toConfiguration().set(SNAPSHOT_CLEAN_EMPTY_DIRECTORIES, true);
         store.newExpire(1, 1, Long.MAX_VALUE).expire();
-        // whole dt=0401 is deleted
-        assertPathNotExists(fileIO, new Path(root, "dt=0401"));
-        // whole dt=0402/hr=8 is deleted
-        assertPathNotExists(fileIO, new Path(root, "dt=0402/hr=8"));
-        // for dt=0402/hr=12, bucket-0 is delete but bucket-1 survives
-        assertPathNotExists(fileIO, pathFactory.bucketPath(partition, 0));
-        assertPathExists(fileIO, pathFactory.bucketPath(partition, 1));
+
+        // check dt=0401
+        if (cleanEmptyDirs) {
+            assertPathNotExists(fileIO, new Path(root, "dt=0401"));
+        } else {
+            for (String hr : new String[] {"hr=8", "hr=12"}) {
+                for (String bucket : new String[] {"bucket-0", "bucket-1"}) {
+                    Path path = new Path(root, String.format("dt=0401/%s/%s", hr, bucket));
+                    assertThat(fileIO.listStatus(path).length).isEqualTo(0);
+                }
+            }
+        }
+
+        // check dt=0402
+        assertPathExists(fileIO, new Path(root, "dt=0402/hr=12/bucket-1"));
+        if (cleanEmptyDirs) {
+            assertPathNotExists(fileIO, new Path(root, "dt=0402/hr=12/bucket-0"));
+            assertPathNotExists(fileIO, new Path(root, "dt=0402/hr-8"));
+        } else {
+            assertThat(fileIO.listStatus(new Path("dt=0402/hr=8/bucket-0")).length).isEqualTo(0);
+            assertThat(fileIO.listStatus(new Path("dt=0402/hr=8/bucket-1")).length).isEqualTo(0);
+            assertThat(fileIO.listStatus(new Path("dt=0402/hr=12/bucket-0")).length).isEqualTo(0);
+        }
     }
 
     // only exists bucket directories
@@ -184,6 +215,7 @@ public class FileDeletionTest {
 
         // check after expiring
         store.newExpire(1, 1, Long.MAX_VALUE).expire();
+
         assertPathNotExists(fileIO, pathFactory.bucketPath(partition, 0));
         assertPathExists(fileIO, pathFactory.bucketPath(partition, 1));
     }
@@ -221,7 +253,7 @@ public class FileDeletionTest {
     @Test
     public void testExpireWithExistingTags() throws Exception {
         TestFileStore store = createStore(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED, 4);
-        TagManager tagManager = new TagManager(fileIO, store.options().path());
+        tagManager = new TagManager(fileIO, store.options().path());
         SnapshotManager snapshotManager = store.snapshotManager();
         TestKeyValueGenerator gen =
                 new TestKeyValueGenerator(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED);
@@ -237,7 +269,7 @@ public class FileDeletionTest {
 
         // step 2: commit -A (by clean bucket 0) and create tag1
         cleanBucket(store, gen.getPartition(gen.next()), 0);
-        tagManager.createTag(snapshotManager.snapshot(2), "tag1");
+        createTag(snapshotManager.snapshot(2), "tag1", store.options().tagDefaultTimeRetained());
         assertThat(tagManager.tagExists("tag1")).isTrue();
 
         // step 3: commit C to bucket 2
@@ -248,7 +280,7 @@ public class FileDeletionTest {
 
         // step 4: commit -B (by clean bucket 1) and create tag2
         cleanBucket(store, partition, 1);
-        tagManager.createTag(snapshotManager.snapshot(4), "tag2");
+        createTag(snapshotManager.snapshot(4), "tag2", store.options().tagDefaultTimeRetained());
         assertThat(tagManager.tagExists("tag2")).isTrue();
 
         // step 5: commit D to bucket 3
@@ -281,9 +313,9 @@ public class FileDeletionTest {
         // check manifests
         ManifestList manifestList = store.manifestListFactory().create();
         for (String tagName : Arrays.asList("tag1", "tag2")) {
-            Snapshot snapshot = tagManager.taggedSnapshot(tagName);
+            Snapshot snapshot = tagManager.getOrThrow(tagName);
             List<Path> manifestFilePaths =
-                    snapshot.dataManifests(manifestList).stream()
+                    manifestList.readDataManifests(snapshot).stream()
                             .map(ManifestFileMeta::fileName)
                             .map(pathFactory::toManifestFilePath)
                             .collect(Collectors.toList());
@@ -299,7 +331,7 @@ public class FileDeletionTest {
     @Test
     public void testExpireWithUpgradeAndTags() throws Exception {
         TestFileStore store = createStore(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED);
-        TagManager tagManager = new TagManager(fileIO, store.options().path());
+        tagManager = new TagManager(fileIO, store.options().path());
         SnapshotManager snapshotManager = store.snapshotManager();
         TestKeyValueGenerator gen =
                 new TestKeyValueGenerator(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED);
@@ -328,17 +360,17 @@ public class FileDeletionTest {
         // snapshot 3: commit -A (by clean bucket 0)
         cleanBucket(store, gen.getPartition(gen.next()), 0);
 
-        tagManager.createTag(snapshotManager.snapshot(1), "tag1");
+        createTag(snapshotManager.snapshot(1), "tag1", store.options().tagDefaultTimeRetained());
         store.newExpire(1, 1, Long.MAX_VALUE).expire();
 
         // check data file and manifests
         FileStorePathFactory pathFactory = store.pathFactory();
         assertPathExists(fileIO, pathFactory.bucketPath(partition, 0));
 
-        Snapshot tag1 = tagManager.taggedSnapshot("tag1");
+        Snapshot tag1 = tagManager.getOrThrow("tag1");
         ManifestList manifestList = store.manifestListFactory().create();
         List<Path> manifestFilePaths =
-                tag1.dataManifests(manifestList).stream()
+                manifestList.readDataManifests(tag1).stream()
                         .map(ManifestFileMeta::fileName)
                         .map(pathFactory::toManifestFilePath)
                         .collect(Collectors.toList());
@@ -353,7 +385,7 @@ public class FileDeletionTest {
     @Test
     public void testDeleteTagWithSnapshot() throws Exception {
         TestFileStore store = createStore(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED, 3);
-        TagManager tagManager = new TagManager(fileIO, store.options().path());
+        tagManager = new TagManager(fileIO, store.options().path());
         SnapshotManager snapshotManager = store.snapshotManager();
         TestKeyValueGenerator gen =
                 new TestKeyValueGenerator(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED);
@@ -377,15 +409,15 @@ public class FileDeletionTest {
 
         ManifestList manifestList = store.manifestListFactory().create();
         Snapshot snapshot1 = snapshotManager.snapshot(1);
-        List<ManifestFileMeta> snapshot1Data = snapshot1.dataManifests(manifestList);
+        List<ManifestFileMeta> snapshot1Data = manifestList.readDataManifests(snapshot1);
         Snapshot snapshot3 = snapshotManager.snapshot(3);
-        List<ManifestFileMeta> snapshot3Data = snapshot3.dataManifests(manifestList);
+        List<ManifestFileMeta> snapshot3Data = manifestList.readDataManifests(snapshot3);
 
         List<String> manifestLists =
                 Arrays.asList(snapshot1.baseManifestList(), snapshot1.deltaManifestList());
 
         // create tag1
-        tagManager.createTag(snapshot1, "tag1");
+        createTag(snapshot1, "tag1", store.options().tagDefaultTimeRetained());
 
         // expire snapshot 1, 2
         store.newExpire(1, 1, Long.MAX_VALUE).expire();
@@ -402,7 +434,8 @@ public class FileDeletionTest {
             assertPathExists(fileIO, pathFactory.toManifestListPath(manifestListName));
         }
 
-        tagManager.deleteTag("tag1", store.newTagDeletion(), snapshotManager);
+        tagManager.deleteTag(
+                "tag1", store.newTagDeletion(), snapshotManager, Collections.emptyList());
 
         // check data files
         assertPathNotExists(fileIO, pathFactory.bucketPath(partition, 0));
@@ -426,7 +459,7 @@ public class FileDeletionTest {
     @Test
     public void testDeleteTagWithOtherTag() throws Exception {
         TestFileStore store = createStore(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED, 3);
-        TagManager tagManager = new TagManager(fileIO, store.options().path());
+        tagManager = new TagManager(fileIO, store.options().path());
         SnapshotManager snapshotManager = store.snapshotManager();
         TestKeyValueGenerator gen =
                 new TestKeyValueGenerator(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED);
@@ -453,15 +486,15 @@ public class FileDeletionTest {
 
         ManifestList manifestList = store.manifestListFactory().create();
         Snapshot snapshot2 = snapshotManager.snapshot(2);
-        List<ManifestFileMeta> snapshot2Data = snapshot2.dataManifests(manifestList);
+        List<ManifestFileMeta> snapshot2Data = manifestList.readDataManifests(snapshot2);
 
         List<String> manifestLists =
                 Arrays.asList(snapshot2.baseManifestList(), snapshot2.deltaManifestList());
 
         // create tags
-        tagManager.createTag(snapshotManager.snapshot(1), "tag1");
-        tagManager.createTag(snapshotManager.snapshot(2), "tag2");
-        tagManager.createTag(snapshotManager.snapshot(4), "tag3");
+        createTag(snapshotManager.snapshot(1), "tag1", store.options().tagDefaultTimeRetained());
+        createTag(snapshotManager.snapshot(2), "tag2", store.options().tagDefaultTimeRetained());
+        createTag(snapshotManager.snapshot(4), "tag3", store.options().tagDefaultTimeRetained());
 
         // expire snapshot 1, 2, 3, 4
         store.newExpire(1, 1, Long.MAX_VALUE).expire();
@@ -478,17 +511,18 @@ public class FileDeletionTest {
             assertPathExists(fileIO, pathFactory.toManifestListPath(manifestListName));
         }
 
-        tagManager.deleteTag("tag2", store.newTagDeletion(), snapshotManager);
+        tagManager.deleteTag(
+                "tag2", store.newTagDeletion(), snapshotManager, Collections.emptyList());
 
         // check data files
         assertPathExists(fileIO, pathFactory.bucketPath(partition, 0));
         assertPathNotExists(fileIO, pathFactory.bucketPath(partition, 1));
 
         // check manifests
-        Snapshot tag1 = tagManager.taggedSnapshot("tag1");
-        Snapshot tag3 = tagManager.taggedSnapshot("tag3");
-        List<ManifestFileMeta> existing = tag1.dataManifests(manifestList);
-        existing.addAll(tag3.dataManifests(manifestList));
+        Snapshot tag1 = tagManager.getOrThrow("tag1");
+        Snapshot tag3 = tagManager.getOrThrow("tag3");
+        List<ManifestFileMeta> existing = manifestList.readDataManifests(tag1);
+        existing.addAll(manifestList.readDataManifests(tag3));
         for (ManifestFileMeta manifestFileMeta : snapshot2Data) {
             Path path = pathFactory.toManifestFilePath(manifestFileMeta.fileName());
             if (existing.contains(manifestFileMeta)) {
@@ -608,6 +642,64 @@ public class FileDeletionTest {
         assertPathExists(fileIO, dataFileA);
     }
 
+    @Test
+    public void testExpireWithDeletingTags() throws Exception {
+        TestFileStore store = createStore(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED, 2);
+        tagManager = new TagManager(fileIO, store.options().path());
+        SnapshotManager snapshotManager = store.snapshotManager();
+        TestKeyValueGenerator gen =
+                new TestKeyValueGenerator(TestKeyValueGenerator.GeneratorMode.NON_PARTITIONED);
+        BinaryRow partition = gen.getPartition(gen.next());
+
+        // step 1: commit A to bucket 0 and create tag1
+        Map<BinaryRow, Map<Integer, RecordWriter<KeyValue>>> writers = new HashMap<>();
+        List<KeyValue> kvs = partitionedData(5, gen);
+        writeData(store, kvs, partition, 0, writers);
+        commitData(store, commitIdentifier++, writers);
+        createTag(snapshotManager.snapshot(1), "tag1", store.options().tagDefaultTimeRetained());
+
+        // step 2: commit B to bucket 1 and create tag2
+        writers.clear();
+        kvs = partitionedData(5, gen);
+        writeData(store, kvs, partition, 1, writers);
+        commitData(store, commitIdentifier++, writers);
+        createTag(snapshotManager.snapshot(2), "tag2", store.options().tagDefaultTimeRetained());
+
+        // step 3: commit -B
+        cleanBucket(store, partition, 1);
+
+        // step 4: commit -A
+        cleanBucket(store, partition, 0);
+
+        // action: expire snapshot 1 -> delete tag1 -> expire snapshot 2
+        // result: exist A & B (because of tag2)
+        ExpireSnapshots expireSnapshots =
+                new ExpireSnapshotsImpl(snapshotManager, store.newSnapshotDeletion(), tagManager);
+        expireSnapshots
+                .config(
+                        ExpireConfig.builder()
+                                .snapshotRetainMax(3)
+                                .snapshotRetainMin(3)
+                                .snapshotTimeRetain(Duration.ofMillis(Long.MAX_VALUE))
+                                .build())
+                .expire();
+        tagManager.deleteTag(
+                "tag1", store.newTagDeletion(), snapshotManager, Collections.emptyList());
+        expireSnapshots
+                .config(
+                        ExpireConfig.builder()
+                                .snapshotRetainMax(2)
+                                .snapshotRetainMin(2)
+                                .snapshotTimeRetain(Duration.ofMillis(Long.MAX_VALUE))
+                                .build())
+                .expire();
+
+        assertThat(snapshotManager.snapshotCount()).isEqualTo(2);
+        FileStorePathFactory pathFactory = store.pathFactory();
+        assertPathExists(fileIO, pathFactory.bucketPath(partition, 0));
+        assertPathExists(fileIO, pathFactory.bucketPath(partition, 1));
+    }
+
     private TestFileStore createStore(TestKeyValueGenerator.GeneratorMode mode) throws Exception {
         return createStore(mode, 2);
     }
@@ -642,13 +734,16 @@ public class FileDeletionTest {
         }
 
         SchemaManager schemaManager = new SchemaManager(fileIO, new Path(root));
-        schemaManager.createTable(
-                new Schema(
-                        rowType.getFields(),
-                        partitionType.getFieldNames(),
-                        TestKeyValueGenerator.getPrimaryKeys(mode),
-                        Collections.emptyMap(),
-                        null));
+
+        TableSchema tableSchema =
+                schemaManager.createTable(
+                        new Schema(
+                                rowType.getFields(),
+                                partitionType.getFieldNames(),
+                                TestKeyValueGenerator.getPrimaryKeys(mode),
+                                Collections.singletonMap(
+                                        SNAPSHOT_CLEAN_EMPTY_DIRECTORIES.key(), "true"),
+                                null));
 
         return new TestFileStore.Builder(
                         "avro",
@@ -658,7 +753,8 @@ public class FileDeletionTest {
                         TestKeyValueGenerator.KEY_TYPE,
                         rowType,
                         TestKeyValueGenerator.TestKeyValueFieldsExtractor.EXTRACTOR,
-                        DeduplicateMergeFunction.factory())
+                        DeduplicateMergeFunction.factory(),
+                        tableSchema)
                 .changelogProducer(changelogProducer)
                 .build();
     }
@@ -691,16 +787,24 @@ public class FileDeletionTest {
                                                 entry.file()))
                         .collect(Collectors.toList());
         // commit
-        store.newCommit()
-                .tryCommitOnce(
-                        delete,
-                        Collections.emptyList(),
-                        Collections.emptyList(),
-                        commitIdentifier++,
-                        null,
-                        Collections.emptyMap(),
-                        Snapshot.CommitKind.APPEND,
-                        store.snapshotManager().latestSnapshot(),
-                        null);
+        try (FileStoreCommitImpl commit = store.newCommit()) {
+            commit.tryCommitOnce(
+                    null,
+                    delete,
+                    Collections.emptyList(),
+                    Collections.emptyList(),
+                    commitIdentifier++,
+                    null,
+                    Collections.emptyMap(),
+                    Snapshot.CommitKind.APPEND,
+                    store.snapshotManager().latestSnapshot(),
+                    mustConflictCheck(),
+                    DEFAULT_MAIN_BRANCH,
+                    null);
+        }
+    }
+
+    private void createTag(Snapshot snapshot, String tagName, Duration timeRetained) {
+        tagManager.createTag(snapshot, tagName, timeRetained, Collections.emptyList(), false);
     }
 }

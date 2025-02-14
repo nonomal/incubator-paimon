@@ -19,19 +19,13 @@
 package org.apache.paimon.flink.sorter;
 
 import org.apache.paimon.annotation.VisibleForTesting;
-import org.apache.paimon.codegen.CodeGenUtils;
-import org.apache.paimon.codegen.NormalizedKeyComputer;
-import org.apache.paimon.codegen.RecordComparator;
+import org.apache.paimon.compression.CompressOptions;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
-import org.apache.paimon.data.serializer.BinaryRowSerializer;
-import org.apache.paimon.data.serializer.InternalRowSerializer;
-import org.apache.paimon.data.serializer.InternalSerializers;
-import org.apache.paimon.disk.IOManagerImpl;
-import org.apache.paimon.memory.HeapMemorySegmentPool;
-import org.apache.paimon.memory.MemorySegmentPool;
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.flink.utils.RuntimeContextUtils;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.sort.BinaryExternalSortBuffer;
-import org.apache.paimon.sort.BinaryInMemorySortBuffer;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.MutableObjectIterator;
 
@@ -39,6 +33,8 @@ import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.runtime.operators.TableStreamOperator;
+
+import java.util.stream.IntStream;
 
 /** SortOperator to sort the `InternalRow`s by the `KeyType`. */
 public class SortOperator extends TableStreamOperator<InternalRow>
@@ -50,55 +46,67 @@ public class SortOperator extends TableStreamOperator<InternalRow>
     private final int pageSize;
     private final int arity;
     private final int spillSortMaxNumFiles;
+    private final CompressOptions spillCompression;
+    private final int sinkParallelism;
+    private final MemorySize maxDiskSize;
+    private final boolean sequenceOrder;
+
     private transient BinaryExternalSortBuffer buffer;
+    private transient IOManager ioManager;
 
     public SortOperator(
             RowType keyType,
             RowType rowType,
             long maxMemory,
             int pageSize,
-            int spillSortMaxNumFiles) {
+            int spillSortMaxNumFiles,
+            CompressOptions spillCompression,
+            int sinkParallelism,
+            MemorySize maxDiskSize,
+            boolean sequenceOrder) {
         this.keyType = keyType;
         this.rowType = rowType;
         this.maxMemory = maxMemory;
         this.pageSize = pageSize;
         this.arity = rowType.getFieldCount();
         this.spillSortMaxNumFiles = spillSortMaxNumFiles;
+        this.spillCompression = spillCompression;
+        this.sinkParallelism = sinkParallelism;
+        this.maxDiskSize = maxDiskSize;
+        this.sequenceOrder = sequenceOrder;
     }
 
     @Override
     public void open() throws Exception {
         super.open();
         initBuffer();
+        if (sinkParallelism
+                != RuntimeContextUtils.getNumberOfParallelSubtasks(getRuntimeContext())) {
+            throw new IllegalArgumentException(
+                    "Please ensure that the runtime parallelism of the sink matches the initial configuration "
+                            + "to avoid potential issues with skewed range partitioning.");
+        }
     }
 
     @VisibleForTesting
     void initBuffer() {
-        InternalRowSerializer serializer = InternalSerializers.create(rowType);
-        NormalizedKeyComputer normalizedKeyComputer =
-                CodeGenUtils.newNormalizedKeyComputer(
-                        keyType.getFieldTypes(), "MemTableKeyComputer");
-        RecordComparator keyComparator =
-                CodeGenUtils.newRecordComparator(keyType.getFieldTypes(), "MemTableComparator");
-
-        MemorySegmentPool memoryPool = new HeapMemorySegmentPool(maxMemory, pageSize);
-
-        BinaryInMemorySortBuffer inMemorySortBuffer =
-                BinaryInMemorySortBuffer.createBuffer(
-                        normalizedKeyComputer, serializer, keyComparator, memoryPool);
-
+        this.ioManager =
+                IOManager.create(
+                        getContainingTask()
+                                .getEnvironment()
+                                .getIOManager()
+                                .getSpillingDirectoriesPaths());
         buffer =
-                new BinaryExternalSortBuffer(
-                        new BinaryRowSerializer(serializer.getArity()),
-                        keyComparator,
-                        memoryPool.pageSize(),
-                        inMemorySortBuffer,
-                        new IOManagerImpl(
-                                getContainingTask()
-                                        .getEnvironment()
-                                        .getIOManager()
-                                        .getSpillingDirectoriesPaths()),
-                        spillSortMaxNumFiles);
+                BinaryExternalSortBuffer.create(
+                        ioManager,
+                        rowType,
+                        IntStream.range(0, keyType.getFieldCount()).toArray(),
+                        maxMemory,
+                        pageSize,
+                        spillSortMaxNumFiles,
+                        spillCompression,
+                        maxDiskSize,
+                        sequenceOrder);
     }
 
     @Override
@@ -115,7 +123,12 @@ public class SortOperator extends TableStreamOperator<InternalRow>
     @Override
     public void close() throws Exception {
         super.close();
-        buffer.clear();
+        if (buffer != null) {
+            buffer.clear();
+        }
+        if (ioManager != null) {
+            ioManager.close();
+        }
     }
 
     @Override

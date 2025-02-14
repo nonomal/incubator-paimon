@@ -20,9 +20,11 @@ package org.apache.paimon.table.source;
 
 import org.apache.paimon.annotation.Public;
 import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.table.Table;
 
 import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * A scan of {@link Table} to generate {@link Split} splits.
@@ -35,8 +37,14 @@ public interface TableScan {
     /** Plan splits, throws {@link EndOfScanException} if the scan is ended. */
     Plan plan();
 
-    /** Get partitions from simple manifest entries. */
-    List<BinaryRow> listPartitions();
+    /** List partitions. */
+    default List<BinaryRow> listPartitions() {
+        return listPartitionEntries().stream()
+                .map(PartitionEntry::partition)
+                .collect(Collectors.toList());
+    }
+
+    List<PartitionEntry> listPartitionEntries();
 
     /**
      * Plan of scan.

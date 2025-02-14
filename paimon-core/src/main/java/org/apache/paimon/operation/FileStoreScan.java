@@ -21,21 +21,30 @@ package org.apache.paimon.operation;
 import org.apache.paimon.Snapshot;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.manifest.BucketEntry;
 import org.apache.paimon.manifest.FileKind;
 import org.apache.paimon.manifest.ManifestCacheFilter;
 import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.manifest.ManifestFileMeta;
+import org.apache.paimon.manifest.PartitionEntry;
+import org.apache.paimon.manifest.SimpleFileEntry;
+import org.apache.paimon.operation.metrics.ScanMetrics;
+import org.apache.paimon.partition.PartitionPredicate;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.table.source.ScanMode;
+import org.apache.paimon.utils.BiFilter;
 import org.apache.paimon.utils.Filter;
 
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+
+import static org.apache.paimon.manifest.ManifestEntry.recordCount;
 
 /** Scan operation which produces a plan. */
 public interface FileStoreScan {
@@ -44,9 +53,15 @@ public interface FileStoreScan {
 
     FileStoreScan withPartitionFilter(List<BinaryRow> partitions);
 
+    FileStoreScan withPartitionsFilter(List<Map<String, String>> partitions);
+
+    FileStoreScan withPartitionFilter(PartitionPredicate predicate);
+
     FileStoreScan withBucket(int bucket);
 
     FileStoreScan withBucketFilter(Filter<Integer> bucketFilter);
+
+    FileStoreScan withTotalAwareBucketFilter(BiFilter<Integer, Integer> bucketFilter);
 
     FileStoreScan withPartitionBucket(BinaryRow partition, int bucket);
 
@@ -54,16 +69,60 @@ public interface FileStoreScan {
 
     FileStoreScan withSnapshot(Snapshot snapshot);
 
-    FileStoreScan withManifestList(List<ManifestFileMeta> manifests);
-
     FileStoreScan withKind(ScanMode scanMode);
 
     FileStoreScan withLevelFilter(Filter<Integer> levelFilter);
 
+    FileStoreScan enableValueFilter();
+
+    FileStoreScan withManifestEntryFilter(Filter<ManifestEntry> filter);
+
     FileStoreScan withManifestCacheFilter(ManifestCacheFilter manifestFilter);
+
+    FileStoreScan withDataFileNameFilter(Filter<String> fileNameFilter);
+
+    FileStoreScan withMetrics(ScanMetrics metrics);
+
+    FileStoreScan dropStats();
+
+    @Nullable
+    Integer parallelism();
+
+    ManifestsReader manifestsReader();
+
+    List<ManifestEntry> readManifest(ManifestFileMeta manifest);
 
     /** Produce a {@link Plan}. */
     Plan plan();
+
+    /**
+     * Return record count of all changes occurred in this snapshot given the scan.
+     *
+     * @return total record count of Snapshot.
+     */
+    default Long totalRecordCount(Snapshot snapshot) {
+        return snapshot.totalRecordCount() == null
+                ? (Long) recordCount(withSnapshot(snapshot.id()).plan().files())
+                : snapshot.totalRecordCount();
+    }
+
+    /**
+     * Read {@link SimpleFileEntry}s, SimpleFileEntry only retains some critical information, so it
+     * cannot perform filtering based on statistical information.
+     */
+    List<SimpleFileEntry> readSimpleEntries();
+
+    List<PartitionEntry> readPartitionEntries();
+
+    List<BucketEntry> readBucketEntries();
+
+    Iterator<ManifestEntry> readFileIterator();
+
+    default List<BinaryRow> listPartitions() {
+        return readPartitionEntries().stream()
+                .map(PartitionEntry::partition)
+                .collect(Collectors.toList());
+    }
 
     /** Result plan of this scan. */
     interface Plan {
@@ -72,13 +131,11 @@ public interface FileStoreScan {
         Long watermark();
 
         /**
-         * Snapshot id of this plan, return null if the table is empty or the manifest list is
+         * Snapshot of this plan, return null if the table is empty or the manifest list is
          * specified.
          */
         @Nullable
-        Long snapshotId();
-
-        ScanMode scanMode();
+        Snapshot snapshot();
 
         /** Result {@link ManifestEntry} files. */
         List<ManifestEntry> files();

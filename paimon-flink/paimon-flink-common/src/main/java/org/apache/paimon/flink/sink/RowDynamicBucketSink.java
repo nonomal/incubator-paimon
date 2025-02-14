@@ -21,12 +21,13 @@ package org.apache.paimon.flink.sink;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.schema.TableSchema;
 import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.ChannelComputer;
 import org.apache.paimon.table.sink.PartitionKeyExtractor;
 import org.apache.paimon.table.sink.RowPartitionKeyExtractor;
 import org.apache.paimon.utils.SerializableFunction;
 
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 
 import javax.annotation.Nullable;
 
@@ -43,8 +44,8 @@ public class RowDynamicBucketSink extends DynamicBucketSink<InternalRow> {
     }
 
     @Override
-    protected ChannelComputer<InternalRow> channelComputer1() {
-        return new RowHashKeyChannelComputer(table.schema());
+    protected ChannelComputer<InternalRow> assignerChannelComputer(Integer numAssigners) {
+        return new RowAssignerChannelComputer(table.schema(), numAssigners);
     }
 
     @Override
@@ -59,8 +60,8 @@ public class RowDynamicBucketSink extends DynamicBucketSink<InternalRow> {
     }
 
     @Override
-    protected OneInputStreamOperator<Tuple2<InternalRow, Integer>, Committable> createWriteOperator(
-            StoreSinkWrite.Provider writeProvider, String commitUser) {
-        return new DynamicBucketRowWriteOperator(table, writeProvider, commitUser);
+    protected OneInputStreamOperatorFactory<Tuple2<InternalRow, Integer>, Committable>
+            createWriteOperatorFactory(StoreSinkWrite.Provider writeProvider, String commitUser) {
+        return new DynamicBucketRowWriteOperator.Factory(table, writeProvider, commitUser);
     }
 }

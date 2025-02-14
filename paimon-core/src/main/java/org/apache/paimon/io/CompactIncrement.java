@@ -18,6 +18,7 @@
 
 package org.apache.paimon.io;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -77,15 +78,14 @@ public class CompactIncrement {
     @Override
     public String toString() {
         return String.format(
-                "CompactIncrement {compactBefore = [\n%s\n], compactAfter = [\n%s\n], changelogFiles = [\n%s\n]}",
-                compactBefore.stream()
-                        .map(DataFileMeta::fileName)
-                        .collect(Collectors.joining(",\n")),
-                compactAfter.stream()
-                        .map(DataFileMeta::fileName)
-                        .collect(Collectors.joining(",\n")),
-                changelogFiles.stream()
-                        .map(DataFileMeta::fileName)
-                        .collect(Collectors.joining(",\n")));
+                "CompactIncrement {compactBefore = %s, compactAfter = %s, changelogFiles = %s}",
+                compactBefore.stream().map(DataFileMeta::fileName).collect(Collectors.toList()),
+                compactAfter.stream().map(DataFileMeta::fileName).collect(Collectors.toList()),
+                changelogFiles.stream().map(DataFileMeta::fileName).collect(Collectors.toList()));
+    }
+
+    public static CompactIncrement emptyIncrement() {
+        return new CompactIncrement(
+                Collections.emptyList(), Collections.emptyList(), Collections.emptyList());
     }
 }

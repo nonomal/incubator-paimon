@@ -18,8 +18,13 @@
 
 package org.apache.paimon.flink.sink;
 
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.flink.metrics.FlinkMetricRegistry;
+import org.apache.paimon.flink.sink.partition.PartitionListeners;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.manifest.ManifestCommittable;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.CommitMessage;
 import org.apache.paimon.table.sink.CommitMessageImpl;
 import org.apache.paimon.table.sink.TableCommit;
@@ -38,17 +43,51 @@ import java.util.Map;
 public class StoreCommitter implements Committer<Committable, ManifestCommittable> {
 
     private final TableCommitImpl commit;
-    @Nullable private final CommitterMetrics metrics;
+    @Nullable private final CommitterMetrics committerMetrics;
+    private final PartitionListeners partitionListeners;
+    private final boolean allowLogOffsetDuplicate;
 
-    public StoreCommitter(TableCommit commit, @Nullable CommitterMetrics metrics) {
+    public StoreCommitter(FileStoreTable table, TableCommit commit, Context context) {
         this.commit = (TableCommitImpl) commit;
-        this.metrics = metrics;
+
+        if (context.metricGroup() != null) {
+            this.commit.withMetricRegistry(new FlinkMetricRegistry(context.metricGroup()));
+            this.committerMetrics = new CommitterMetrics(context.metricGroup().getIOMetricGroup());
+        } else {
+            this.committerMetrics = null;
+        }
+
+        try {
+            this.partitionListeners = PartitionListeners.create(context, table);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        allowLogOffsetDuplicate = table.bucketMode() == BucketMode.BUCKET_UNAWARE;
+    }
+
+    @VisibleForTesting
+    public CommitterMetrics getCommitterMetrics() {
+        return committerMetrics;
+    }
+
+    @Override
+    public boolean forceCreatingSnapshot() {
+        return commit.forceCreatingSnapshot();
     }
 
     @Override
     public ManifestCommittable combine(
             long checkpointId, long watermark, List<Committable> committables) {
         ManifestCommittable manifestCommittable = new ManifestCommittable(checkpointId, watermark);
+        return combine(checkpointId, watermark, manifestCommittable, committables);
+    }
+
+    @Override
+    public ManifestCommittable combine(
+            long checkpointId,
+            long watermark,
+            ManifestCommittable manifestCommittable,
+            List<Committable> committables) {
         for (Committable committable : committables) {
             switch (committable.kind()) {
                 case FILE:
@@ -58,7 +97,8 @@ public class StoreCommitter implements Committer<Committable, ManifestCommittabl
                 case LOG_OFFSET:
                     LogOffsetCommittable offset =
                             (LogOffsetCommittable) committable.wrappedCommittable();
-                    manifestCommittable.addLogOffset(offset.bucket(), offset.offset());
+                    manifestCommittable.addLogOffset(
+                            offset.bucket(), offset.offset(), allowLogOffsetDuplicate);
                     break;
             }
         }
@@ -68,17 +108,27 @@ public class StoreCommitter implements Committer<Committable, ManifestCommittabl
     @Override
     public void commit(List<ManifestCommittable> committables)
             throws IOException, InterruptedException {
-        commit.commitMultiple(committables);
+        commit.commitMultiple(committables, false);
         calcNumBytesAndRecordsOut(committables);
+        partitionListeners.notifyCommittable(committables);
     }
 
     @Override
-    public int filterAndCommit(List<ManifestCommittable> globalCommittables) {
-        return commit.filterAndCommitMultiple(globalCommittables);
+    public int filterAndCommit(
+            List<ManifestCommittable> globalCommittables, boolean checkAppendFiles) {
+        int committed = commit.filterAndCommitMultiple(globalCommittables, checkAppendFiles);
+        partitionListeners.notifyCommittable(globalCommittables);
+        return committed;
     }
 
     @Override
     public Map<Long, List<Committable>> groupByCheckpoint(Collection<Committable> committables) {
+        try {
+            partitionListeners.snapshotState();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
         Map<Long, List<Committable>> grouped = new HashMap<>();
         for (Committable c : committables) {
             grouped.computeIfAbsent(c.checkpointId(), k -> new ArrayList<>()).add(c);
@@ -89,10 +139,15 @@ public class StoreCommitter implements Committer<Committable, ManifestCommittabl
     @Override
     public void close() throws Exception {
         commit.close();
+        partitionListeners.close();
+    }
+
+    public boolean allowLogOffsetDuplicate() {
+        return allowLogOffsetDuplicate;
     }
 
     private void calcNumBytesAndRecordsOut(List<ManifestCommittable> committables) {
-        if (metrics == null) {
+        if (committerMetrics == null) {
             return;
         }
 
@@ -111,8 +166,8 @@ public class StoreCommitter implements Committer<Committable, ManifestCommittabl
                 recordsOut += dataFileRowCountInc;
             }
         }
-        metrics.increaseNumBytesOut(bytesOut);
-        metrics.increaseNumRecordsOut(recordsOut);
+        committerMetrics.increaseNumBytesOut(bytesOut);
+        committerMetrics.increaseNumRecordsOut(recordsOut);
     }
 
     private static long calcTotalFileSize(List<DataFileMeta> files) {

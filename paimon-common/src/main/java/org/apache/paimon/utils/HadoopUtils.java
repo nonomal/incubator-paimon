@@ -18,6 +18,9 @@
 
 package org.apache.paimon.utils;
 
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.options.ConfigOption;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.options.description.DescribedEnum;
@@ -27,8 +30,16 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.InputSource;
 
-import java.io.File;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import java.io.IOException;
+import java.io.StringReader;
+import java.io.UncheckedIOException;
 
 import static org.apache.paimon.options.ConfigOptions.key;
 import static org.apache.paimon.options.description.TextElement.text;
@@ -47,6 +58,13 @@ public class HadoopUtils {
                     .defaultValue(HadoopConfigLoader.ALL)
                     .withDescription("Specifies the way of loading hadoop config.");
 
+    public static final ConfigOption<Boolean> HADOOP_LOAD_DEFAULT_CONFIG =
+            key("hadoop-load-default-config")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Specifies whether load the default configuration from core-default.xml、hdfs-default.xml, which may lead larger size for the serialization of table.");
+
     private static final String[] CONFIG_PREFIXES = {"hadoop."};
     public static final String HADOOP_HOME_ENV = "HADOOP_HOME";
     public static final String HADOOP_CONF_ENV = "HADOOP_CONF_DIR";
@@ -59,7 +77,11 @@ public class HadoopUtils {
         // Instantiate an HdfsConfiguration to load the hdfs-site.xml and hdfs-default.xml
         // from the classpath
 
-        Configuration result = new HdfsConfiguration();
+        Boolean loadDefaultConfig = options.get(HADOOP_LOAD_DEFAULT_CONFIG);
+        if (loadDefaultConfig) {
+            LOG.debug("Load the default value for configuration.");
+        }
+        Configuration result = new HdfsConfiguration(loadDefaultConfig);
         boolean foundHadoopConfiguration = false;
 
         // We need to load both core-site.xml and hdfs-site.xml to determine the default fs path and
@@ -68,11 +90,16 @@ public class HadoopUtils {
         // a configuration
         // file with higher priority should be added later.
 
-        // Approach 1: HADOOP_HOME environment variables
-        String[] possibleHadoopConfPaths = new String[2];
-
         HadoopConfigLoader loader = options.get(HADOOP_CONF_LOADER);
 
+        // The HDFS configuration priority from low to high is as follows:
+        // 1. HADOOP_HOME
+        // 2. HADOOP_CONF_DIR
+        // 3. Paimon catalog or paimon table configuration(hadoop-conf-dir)
+        // 4. paimon table advanced configurations
+
+        // Approach 1: HADOOP_HOME environment variables
+        String[] possibleHadoopConfPaths = new String[2];
         final String hadoopHomeDir = System.getenv(HADOOP_HOME_ENV);
         if (hadoopHomeDir != null && loader.loadEnv()) {
             LOG.debug("Searching Hadoop configuration files in HADOOP_HOME: {}", hadoopHomeDir);
@@ -81,29 +108,31 @@ public class HadoopUtils {
         }
 
         for (String possibleHadoopConfPath : possibleHadoopConfPaths) {
-            if (possibleHadoopConfPath != null) {
-                foundHadoopConfiguration = addHadoopConfIfFound(result, possibleHadoopConfPath);
+            if (!StringUtils.isNullOrWhitespaceOnly(possibleHadoopConfPath)) {
+                foundHadoopConfiguration =
+                        addHadoopConfIfFound(result, possibleHadoopConfPath, options);
             }
         }
 
-        // Approach 2: Paimon Catalog Option
-        final String hadoopConfigPath = options.getString(PATH_HADOOP_CONFIG, null);
-        if (hadoopConfigPath != null && loader.loadOption()) {
-            LOG.debug(
-                    "Searching Hadoop configuration files in Paimon config: {}", hadoopConfigPath);
-            foundHadoopConfiguration =
-                    addHadoopConfIfFound(result, hadoopConfigPath) || foundHadoopConfiguration;
-        }
-
-        // Approach 3: HADOOP_CONF_DIR environment variable
+        // Approach 2: HADOOP_CONF_DIR environment variable
         String hadoopConfDir = System.getenv(HADOOP_CONF_ENV);
-        if (hadoopConfDir != null && loader.loadEnv()) {
+        if (!StringUtils.isNullOrWhitespaceOnly(hadoopConfDir) && loader.loadEnv()) {
             LOG.debug("Searching Hadoop configuration files in HADOOP_CONF_DIR: {}", hadoopConfDir);
             foundHadoopConfiguration =
-                    addHadoopConfIfFound(result, hadoopConfDir) || foundHadoopConfiguration;
+                    addHadoopConfIfFound(result, hadoopConfDir, options)
+                            || foundHadoopConfiguration;
         }
 
-        // Approach 4: Paimon configuration
+        // Approach 3: Paimon table or paimon catalog hadoop conf
+        hadoopConfDir = options.getString(PATH_HADOOP_CONFIG, null);
+        if (!StringUtils.isNullOrWhitespaceOnly(hadoopConfDir) && loader.loadOption()) {
+            LOG.debug("Searching Hadoop configuration files in Paimon config: {}", hadoopConfDir);
+            foundHadoopConfiguration =
+                    addHadoopConfIfFound(result, hadoopConfDir, options)
+                            || foundHadoopConfiguration;
+        }
+
+        // Approach 4: Paimon advanced configuration
         // add all configuration key with prefix 'hadoop.' in Paimon conf to hadoop conf
         for (String key : options.keySet()) {
             for (String prefix : CONFIG_PREFIXES) {
@@ -132,37 +161,83 @@ public class HadoopUtils {
      * Search Hadoop configuration files in the given path, and add them to the configuration if
      * found.
      */
-    private static boolean addHadoopConfIfFound(
-            Configuration configuration, String possibleHadoopConfPath) {
-        boolean foundHadoopConfiguration = false;
-        if (new File(possibleHadoopConfPath).exists()) {
-            if (new File(possibleHadoopConfPath + "/core-site.xml").exists()) {
-                configuration.addResource(
-                        new org.apache.hadoop.fs.Path(possibleHadoopConfPath + "/core-site.xml"));
-                LOG.debug(
-                        "Adding "
-                                + possibleHadoopConfPath
-                                + "/core-site.xml to hadoop configuration");
-                foundHadoopConfiguration = true;
+    public static boolean addHadoopConfIfFound(
+            Configuration configuration, String possibleHadoopConfPath, Options options) {
+        Path root = new Path(possibleHadoopConfPath);
+
+        try {
+            FileIO fileIO = FileIO.get(root, CatalogContext.create(options, configuration));
+            boolean foundHadoopConfiguration = false;
+
+            if (fileIO.exists(root)) {
+                Path path = new Path(possibleHadoopConfPath, "core-site.xml");
+                if (fileIO.exists(path)) {
+                    readHadoopXml(fileIO.readFileUtf8(path), configuration);
+                    LOG.debug(
+                            "Adding "
+                                    + possibleHadoopConfPath
+                                    + "/core-site.xml to hadoop configuration");
+                    foundHadoopConfiguration = true;
+                }
+
+                path = new Path(possibleHadoopConfPath, "hdfs-site.xml");
+                if (fileIO.exists(path)) {
+                    readHadoopXml(fileIO.readFileUtf8(path), configuration);
+                    LOG.debug(
+                            "Adding "
+                                    + possibleHadoopConfPath
+                                    + "/hdfs-site.xml to hadoop configuration");
+                    foundHadoopConfiguration = true;
+                }
+
+                // Add mapred-site.xml. We need to read configurations like compression codec.
+                path = new Path(possibleHadoopConfPath, "mapred-site.xml");
+                if (fileIO.exists(path)) {
+                    readHadoopXml(fileIO.readFileUtf8(path), configuration);
+                    LOG.debug(
+                            "Adding "
+                                    + possibleHadoopConfPath
+                                    + "/mapred-site.xml to hadoop configuration");
+                    foundHadoopConfiguration = true;
+                }
             }
-            if (new File(possibleHadoopConfPath + "/hdfs-site.xml").exists()) {
-                configuration.addResource(
-                        new org.apache.hadoop.fs.Path(possibleHadoopConfPath + "/hdfs-site.xml"));
-                LOG.debug(
-                        "Adding "
-                                + possibleHadoopConfPath
-                                + "/hdfs-site.xml to hadoop configuration");
-                foundHadoopConfiguration = true;
+
+            return foundHadoopConfiguration;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    public static void readHadoopXml(String xml, Configuration conf) {
+        NodeList propertyNodes;
+        try {
+            propertyNodes =
+                    DocumentBuilderFactory.newInstance()
+                            .newDocumentBuilder()
+                            .parse(new InputSource(new StringReader(xml)))
+                            .getElementsByTagName("property");
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        for (int i = 0; i < propertyNodes.getLength(); i++) {
+            Node propertyNode = propertyNodes.item(i);
+            if (propertyNode.getNodeType() == 1) {
+                Element propertyElement = (Element) propertyNode;
+                String key = propertyElement.getElementsByTagName("name").item(0).getTextContent();
+                String value =
+                        propertyElement.getElementsByTagName("value").item(0).getTextContent();
+                if (!StringUtils.isNullOrWhitespaceOnly(value)) {
+                    conf.set(key, value);
+                }
             }
         }
-        return foundHadoopConfiguration;
     }
 
     /** Specifies the way of loading hadoop config. */
     public enum HadoopConfigLoader implements DescribedEnum {
         ALL("all", "Load Hadoop conf from environment variables and catalog option.", true, true),
         ENV("env", "Load Hadoop conf from environment variables only.", true, false),
-        OPTION("option", "Load Hadoop conf from catalog option only.", false, true);
+        OPTION("option", "Load Hadoop conf from catalog or table option only.", false, true);
 
         private final String value;
         private final String description;

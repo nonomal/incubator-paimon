@@ -23,24 +23,19 @@ import org.apache.paimon.types.DataType;
 /** primary key aggregate a field of a row. */
 public class FieldPrimaryKeyAgg extends FieldAggregator {
 
-    public static final String NAME = "primary-key";
+    private static final long serialVersionUID = 1L;
 
-    public FieldPrimaryKeyAgg(DataType dataType) {
-        super(dataType);
+    public FieldPrimaryKeyAgg(String name, DataType dataType) {
+        super(name, dataType);
     }
 
     @Override
-    String name() {
-        return NAME;
-    }
-
-    @Override
-    Object agg(Object accumulator, Object inputField) {
+    public Object agg(Object accumulator, Object inputField) {
         return inputField;
     }
 
     @Override
-    Object retract(Object accumulator, Object inputField) {
+    public Object retract(Object accumulator, Object inputField) {
         return inputField;
     }
 }

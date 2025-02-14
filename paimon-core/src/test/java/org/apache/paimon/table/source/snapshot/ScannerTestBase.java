@@ -18,6 +18,7 @@
 
 package org.apache.paimon.table.source.snapshot;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.BinaryRowWriter;
 import org.apache.paimon.data.GenericRow;
@@ -26,8 +27,8 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.FileIOFinder;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.mergetree.compact.ConcatRecordReader;
-import org.apache.paimon.operation.Lock;
 import org.apache.paimon.options.Options;
+import org.apache.paimon.reader.ReaderSupplier;
 import org.apache.paimon.reader.RecordReader;
 import org.apache.paimon.reader.RecordReaderIterator;
 import org.apache.paimon.schema.Schema;
@@ -48,6 +49,7 @@ import org.apache.paimon.utils.TraceableFileIO;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -83,6 +85,14 @@ public abstract class ScannerTestBase {
         snapshotReader = table.newSnapshotReader();
     }
 
+    protected void createAppendOnlyTable() throws Exception {
+        tempDir = Files.createTempDirectory("junit");
+        tablePath = new Path(TraceableFileIO.SCHEME + "://" + tempDir.toString());
+        fileIO = FileIOFinder.find(tablePath);
+        table = createFileStoreTable(false);
+        snapshotReader = table.newSnapshotReader();
+    }
+
     protected GenericRow rowData(Object... values) {
         return GenericRow.of(values);
     }
@@ -100,7 +110,7 @@ public abstract class ScannerTestBase {
     }
 
     protected List<String> getResult(TableRead read, List<Split> splits) throws Exception {
-        List<ConcatRecordReader.ReaderSupplier<InternalRow>> readers = new ArrayList<>();
+        List<ReaderSupplier<InternalRow>> readers = new ArrayList<>();
         for (Split split : splits) {
             readers.add(() -> read.createReader(split));
         }
@@ -125,25 +135,40 @@ public abstract class ScannerTestBase {
     }
 
     protected FileStoreTable createFileStoreTable() throws Exception {
-        return createFileStoreTable(new Options());
+        return createFileStoreTable(true, new Options(), tablePath);
     }
 
     protected FileStoreTable createFileStoreTable(Options conf) throws Exception {
+        return createFileStoreTable(true, conf, tablePath);
+    }
+
+    protected FileStoreTable createFileStoreTable(boolean withPrimaryKeys) throws Exception {
+        return createFileStoreTable(withPrimaryKeys, new Options(), tablePath);
+    }
+
+    protected FileStoreTable createFileStoreTable(
+            boolean withPrimaryKeys, Options conf, Path tablePath) throws Exception {
         SchemaManager schemaManager = new SchemaManager(fileIO, tablePath);
+        List<String> primaryKeys = new ArrayList<>();
+        if (withPrimaryKeys) {
+            primaryKeys = Arrays.asList("pt", "a");
+        }
+        if (!conf.contains(CoreOptions.BUCKET)) {
+            conf.set(CoreOptions.BUCKET, 1);
+            if (!withPrimaryKeys) {
+                conf.set(CoreOptions.BUCKET_KEY, "a");
+            }
+        }
         TableSchema tableSchema =
                 schemaManager.createTable(
                         new Schema(
                                 ROW_TYPE.getFields(),
                                 Collections.singletonList("pt"),
-                                Arrays.asList("pt", "a"),
+                                primaryKeys,
                                 conf.toMap(),
                                 ""));
         return FileStoreTableFactory.create(
-                fileIO,
-                tablePath,
-                tableSchema,
-                conf,
-                new CatalogEnvironment(Lock.emptyFactory(), null, null));
+                fileIO, tablePath, tableSchema, conf, CatalogEnvironment.empty());
     }
 
     protected List<Split> toSplits(List<DataSplit> dataSplits) {

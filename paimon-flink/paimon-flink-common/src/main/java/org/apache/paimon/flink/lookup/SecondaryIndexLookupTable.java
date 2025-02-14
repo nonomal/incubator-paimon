@@ -20,78 +20,95 @@ package org.apache.paimon.flink.lookup;
 
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.serializer.InternalSerializers;
+import org.apache.paimon.lookup.RocksDBSetState;
+import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.types.RowKind;
-import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.KeyProjectedRow;
 import org.apache.paimon.utils.TypeUtils;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
-import java.util.function.Predicate;
 
 /** A {@link LookupTable} for primary key table which provides lookup by secondary key. */
 public class SecondaryIndexLookupTable extends PrimaryKeyLookupTable {
 
-    private final RocksDBSetState<InternalRow, InternalRow> indexState;
-
     private final KeyProjectedRow secKeyRow;
 
-    public SecondaryIndexLookupTable(
-            RocksDBStateFactory stateFactory,
-            RowType rowType,
-            List<String> primaryKey,
-            List<String> secKey,
-            Predicate<InternalRow> recordFilter,
-            long lruCacheSize)
-            throws IOException {
-        super(stateFactory, rowType, primaryKey, recordFilter, lruCacheSize / 2);
-        List<String> fieldNames = rowType.getFieldNames();
-        int[] secKeyMapping = secKey.stream().mapToInt(fieldNames::indexOf).toArray();
+    private RocksDBSetState<InternalRow, InternalRow> indexState;
+
+    public SecondaryIndexLookupTable(Context context, long lruCacheSize) {
+        super(context, lruCacheSize / 2, context.table.primaryKeys());
+        List<String> fieldNames = projectedType.getFieldNames();
+        int[] secKeyMapping = context.joinKey.stream().mapToInt(fieldNames::indexOf).toArray();
         this.secKeyRow = new KeyProjectedRow(secKeyMapping);
-        this.indexState =
-                stateFactory.setState(
-                        "sec-index",
-                        InternalSerializers.create(TypeUtils.project(rowType, secKeyMapping)),
-                        InternalSerializers.create(TypeUtils.project(rowType, primaryKeyMapping)),
-                        lruCacheSize / 2);
     }
 
     @Override
-    public List<InternalRow> get(InternalRow key) throws IOException {
+    public void open() throws Exception {
+        init();
+        createTableState();
+        this.indexState =
+                stateFactory.setState(
+                        "sec-index",
+                        InternalSerializers.create(
+                                TypeUtils.project(projectedType, secKeyRow.indexMapping())),
+                        InternalSerializers.create(
+                                TypeUtils.project(projectedType, primaryKeyRow.indexMapping())),
+                        lruCacheSize);
+        bootstrap();
+    }
+
+    @Override
+    public List<InternalRow> innerGet(InternalRow key) throws IOException {
         List<InternalRow> pks = indexState.get(key);
         List<InternalRow> values = new ArrayList<>(pks.size());
         for (InternalRow pk : pks) {
-            InternalRow value = tableState.get(pk);
-            if (value != null) {
-                values.add(value);
+            InternalRow row = tableState.get(pk);
+            if (row != null) {
+                values.add(row);
             }
         }
         return values;
     }
 
     @Override
-    public void refresh(Iterator<InternalRow> incremental) throws IOException {
-        while (incremental.hasNext()) {
-            InternalRow row = incremental.next();
-            primaryKey.replaceRow(row);
-            if (row.getRowKind() == RowKind.INSERT || row.getRowKind() == RowKind.UPDATE_AFTER) {
-                InternalRow previous = tableState.get(primaryKey);
-                if (previous != null) {
-                    indexState.retract(secKeyRow.replaceRow(previous), primaryKey);
-                }
+    protected void refreshRow(InternalRow row, Predicate predicate) throws IOException {
+        primaryKeyRow.replaceRow(row);
 
-                if (recordFilter.test(row)) {
-                    tableState.put(primaryKey, row);
-                    indexState.add(secKeyRow.replaceRow(row), primaryKey);
-                } else {
-                    tableState.delete(primaryKey);
-                }
-            } else {
-                tableState.delete(primaryKey);
-                indexState.retract(secKeyRow.replaceRow(row), primaryKey);
+        boolean previousFetched = false;
+        InternalRow previous = null;
+        if (userDefinedSeqComparator != null) {
+            previous = tableState.get(primaryKeyRow);
+            previousFetched = true;
+            if (previous != null && userDefinedSeqComparator.compare(previous, row) > 0) {
+                return;
             }
         }
+
+        if (row.getRowKind() == RowKind.INSERT || row.getRowKind() == RowKind.UPDATE_AFTER) {
+            if (!previousFetched) {
+                previous = tableState.get(primaryKeyRow);
+            }
+            if (previous != null) {
+                indexState.retract(secKeyRow.replaceRow(previous), primaryKeyRow);
+            }
+
+            if (predicate == null || predicate.test(row)) {
+                tableState.put(primaryKeyRow, row);
+                indexState.add(secKeyRow.replaceRow(row), primaryKeyRow);
+            } else {
+                tableState.delete(primaryKeyRow);
+            }
+        } else {
+            tableState.delete(primaryKeyRow);
+            indexState.retract(secKeyRow.replaceRow(row), primaryKeyRow);
+        }
+    }
+
+    @Override
+    public void bulkLoadWritePlus(byte[] key, byte[] value) throws IOException {
+        InternalRow row = tableState.deserializeValue(value);
+        indexState.add(secKeyRow.replaceRow(row), primaryKeyRow.replaceRow(row));
     }
 }

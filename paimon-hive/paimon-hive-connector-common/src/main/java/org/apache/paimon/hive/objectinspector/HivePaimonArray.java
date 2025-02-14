@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,6 +24,7 @@ import org.apache.paimon.data.InternalArray;
 import org.apache.paimon.data.InternalMap;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.data.variant.Variant;
 import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataType;
 
@@ -112,6 +113,11 @@ public class HivePaimonArray implements InternalArray {
     @Override
     public byte[] getBinary(int i) {
         return getAs(i);
+    }
+
+    @Override
+    public Variant getVariant(int pos) {
+        return getAs(pos);
     }
 
     @Override

@@ -52,7 +52,12 @@ public class TestTable {
     private final Map<Integer, Map<String, String>> expected;
 
     public TestTable(
-            String tableName, int numEvents, int numSchemaChanges, int numPartitions, int numKeys) {
+            String tableName,
+            int numEvents,
+            int numSchemaChanges,
+            int numPartitions,
+            int numKeys,
+            boolean isAppendTable) {
         List<String> fieldNames = new ArrayList<>();
         List<Boolean> isBigInt = new ArrayList<>();
 
@@ -109,32 +114,44 @@ public class TestTable {
                 }
                 events.add(new TestCdcEvent(tableName, currentDataFieldList(fieldNames, isBigInt)));
             } else {
-                Map<String, String> fields = new HashMap<>();
+                Map<String, String> data = new HashMap<>();
                 int key = random.nextInt(numKeys);
-                fields.put("k", String.valueOf(key));
+                data.put("k", String.valueOf(key));
                 int pt = key % numPartitions;
-                fields.put("pt", String.valueOf(pt));
+                data.put("pt", String.valueOf(pt));
 
                 for (int j = 0; j < fieldNames.size(); j++) {
                     String fieldName = fieldNames.get(j);
                     if (isBigInt.get(j)) {
-                        fields.put(fieldName, String.valueOf(random.nextLong()));
+                        data.put(fieldName, String.valueOf(random.nextLong()));
                     } else {
-                        fields.put(fieldName, String.valueOf(random.nextInt()));
+                        data.put(fieldName, String.valueOf(random.nextInt()));
                     }
                 }
 
                 List<CdcRecord> records = new ArrayList<>();
-                boolean shouldInsert = true;
-                if (expected.containsKey(key)) {
-                    records.add(new CdcRecord(RowKind.DELETE, expected.get(key)));
-                    expected.remove(key);
-                    // 20% chance to only delete without insert
-                    shouldInsert = random.nextInt(5) > 0;
+                // Generate test data for pk table
+                if (!isAppendTable) {
+                    boolean shouldInsert = true;
+                    if (expected.containsKey(key)) {
+                        records.add(new CdcRecord(RowKind.DELETE, expected.get(key)));
+                        expected.remove(key);
+                        // 20% chance to only delete without insert
+                        shouldInsert = random.nextInt(5) > 0;
+                    }
+                    if (shouldInsert) {
+                        records.add(new CdcRecord(RowKind.INSERT, data));
+                        expected.put(key, data);
+                    }
                 }
-                if (shouldInsert) {
-                    records.add(new CdcRecord(RowKind.INSERT, fields));
-                    expected.put(key, fields);
+                // Generate test data for append table
+                else {
+                    if (expected.containsKey(key)) {
+                        records.add(new CdcRecord(RowKind.DELETE, expected.get(key)));
+                    } else {
+                        records.add(new CdcRecord(RowKind.INSERT, data));
+                        expected.put(key, data);
+                    }
                 }
                 events.add(new TestCdcEvent(tableName, records, Objects.hash(tableName, key)));
             }

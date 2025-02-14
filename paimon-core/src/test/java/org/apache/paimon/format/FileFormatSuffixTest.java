@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,11 +19,13 @@
 package org.apache.paimon.format;
 
 import org.apache.paimon.CoreOptions;
-import org.apache.paimon.append.AppendOnlyCompactManager;
 import org.apache.paimon.append.AppendOnlyWriter;
+import org.apache.paimon.append.BucketedAppendCompactManager;
+import org.apache.paimon.compression.CompressOptions;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.fileindex.FileIndexOptions;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.local.LocalFileIO;
 import org.apache.paimon.io.DataFileMeta;
@@ -31,6 +33,7 @@ import org.apache.paimon.io.DataFilePathFactory;
 import org.apache.paimon.io.KeyValueFileReadWriteTest;
 import org.apache.paimon.io.KeyValueFileWriterFactory;
 import org.apache.paimon.memory.HeapMemorySegmentPool;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.IntType;
@@ -60,10 +63,17 @@ public class FileFormatSuffixTest extends KeyValueFileReadWriteTest {
         String format = "avro";
         KeyValueFileWriterFactory writerFactory = createWriterFactory(tempDir.toString(), format);
         Path path = writerFactory.pathFactory(0).newPath();
-        assertThat(path.getPath().endsWith(format)).isTrue();
+        assertThat(path.toString().endsWith(format)).isTrue();
 
         DataFilePathFactory dataFilePathFactory =
-                new DataFilePathFactory(new Path(tempDir.toString()), "dt=1", 1, format);
+                new DataFilePathFactory(
+                        new Path(tempDir + "/dt=1/bucket-1"),
+                        format,
+                        CoreOptions.DATA_FILE_PREFIX.defaultValue(),
+                        CoreOptions.CHANGELOG_FILE_PREFIX.defaultValue(),
+                        CoreOptions.FILE_SUFFIX_INCLUDE_COMPRESSION.defaultValue(),
+                        CoreOptions.FILE_COMPRESSION.defaultValue(),
+                        null);
         FileFormat fileFormat = FileFormat.fromIdentifier(format, new Options());
         LinkedList<DataFileMeta> toCompact = new LinkedList<>();
         CoreOptions options = new CoreOptions(new HashMap<>());
@@ -76,15 +86,22 @@ public class FileFormatSuffixTest extends KeyValueFileReadWriteTest {
                         10,
                         SCHEMA,
                         0,
-                        new AppendOnlyCompactManager(null, toCompact, 4, 10, 10, null), // not used
+                        new BucketedAppendCompactManager(
+                                null, toCompact, null, 4, 10, 10, null, null), // not used
+                        null,
                         false,
                         dataFilePathFactory,
                         null,
                         false,
                         false,
                         CoreOptions.FILE_COMPRESSION.defaultValue(),
+                        CompressOptions.defaultOptions(),
                         StatsCollectorFactories.createStatsFactories(
-                                options, SCHEMA.getFieldNames()));
+                                options, SCHEMA.getFieldNames()),
+                        MemorySize.MAX_VALUE,
+                        new FileIndexOptions(),
+                        true,
+                        false);
         appendOnlyWriter.setMemoryPool(
                 new HeapMemorySegmentPool(options.writeBufferSize(), options.pageSize()));
         appendOnlyWriter.write(

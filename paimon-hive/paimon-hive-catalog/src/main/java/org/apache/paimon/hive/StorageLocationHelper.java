@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,9 +22,8 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 
 import org.apache.hadoop.hive.metastore.api.Database;
+import org.apache.hadoop.hive.metastore.api.Partition;
 import org.apache.hadoop.hive.metastore.api.Table;
-
-import java.io.IOException;
 
 /** Helper for Setting Location in Hive Table Storage. */
 public final class StorageLocationHelper implements LocationHelper {
@@ -32,12 +31,12 @@ public final class StorageLocationHelper implements LocationHelper {
     public StorageLocationHelper() {}
 
     @Override
-    public void createPathIfRequired(Path dbPath, FileIO fileIO) throws IOException {
+    public void createPathIfRequired(Path dbPath, FileIO fileIO) {
         // do nothing
     }
 
     @Override
-    public void dropPathIfRequired(Path path, FileIO fileIO) throws IOException {
+    public void dropPathIfRequired(Path path, FileIO fileIO) {
         // do nothing
     }
 
@@ -47,7 +46,27 @@ public final class StorageLocationHelper implements LocationHelper {
     }
 
     @Override
+    public String getTableLocation(Table table) {
+        return table.getSd().getLocation();
+    }
+
+    @Override
     public void specifyDatabaseLocation(Path path, Database database) {
         database.setLocationUri(path.toString());
+    }
+
+    @Override
+    public String getDatabaseLocation(Database database) {
+        return database.getLocationUri();
+    }
+
+    @Override
+    public void specifyPartitionLocation(Partition partition, String location) {
+        partition.getSd().setLocation(location);
+    }
+
+    @Override
+    public String getPartitionLocation(Partition partition) {
+        return partition.getSd().getLocation();
     }
 }

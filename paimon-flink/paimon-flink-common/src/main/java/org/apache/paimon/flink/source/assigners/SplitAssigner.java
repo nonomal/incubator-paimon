@@ -24,6 +24,7 @@ import javax.annotation.Nullable;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * The {@code SplitAssigner} is responsible for deciding what splits should be processed next by
@@ -50,4 +51,13 @@ public interface SplitAssigner {
 
     /** Gets the remaining splits that this assigner has pending. */
     Collection<FileStoreSourceSplit> remainingSplits();
+
+    /** Gets the snapshot id of the next split. */
+    Optional<Long> getNextSnapshotId(int subtask);
+
+    /**
+     * Gets the current number of remaining splits. This method should be guaranteed to be
+     * thread-safe.
+     */
+    int numberOfRemainingSplits();
 }

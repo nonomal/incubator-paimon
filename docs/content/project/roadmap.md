@@ -26,23 +26,32 @@ under the License.
 
 # Roadmap
 
-Paimon's long-term goal is to become the better data lake platform for building the Streaming Lakehouse. Paimon will
-invest in real-time, ecology, and data warehouse integrity for a long time.
+## Flink Lookup Join
 
-If you have other requirements, please contact us.
+Support Flink Custom Data Distribution Lookup Join to reach large-scale data lookup join.
 
-## What’s Next?
+## Produce Iceberg snapshots
 
-### Core
+Introduce a mode to produce Iceberg snapshots.
 
-- Foreign Key Join Partial-Update
-- Append-only table supports batch / streaming z-order sort
-- Supports cross partition update
+## Variant Type
 
-### Compute Engines
+Support Variant Type with Spark 4.0 and Flink 2.0. Unlocking support for semi-structured data.
 
-- More management via Flink/Spark `CALL` procedures
-- Flink Sink supports at-least-once / unaligned checkpoint
-- Flink Whole database compaction Job
-- Public Spark Schema Evolution Pipeline
-- Spark supports Dynamic Partition overwrite
+## File Index
+
+Add more index:
+
+1. Inverse
+
+## Vector Compaction
+
+Support Vector Compaction for super Wide Table.
+
+## Function support
+
+Paimon Catalog supports functions.
+
+## Files Schema Evolution Ingestion
+
+Introduce a files Ingestion with Schema Evolution.

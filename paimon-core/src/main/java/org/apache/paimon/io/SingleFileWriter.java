@@ -7,21 +7,22 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package org.apache.paimon.io;
 
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.format.BundleFormatWriter;
 import org.apache.paimon.format.FormatWriter;
 import org.apache.paimon.format.FormatWriterFactory;
+import org.apache.paimon.fs.AsyncPositionOutputStream;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
 import org.apache.paimon.fs.PositionOutputStream;
@@ -48,7 +49,7 @@ public abstract class SingleFileWriter<T, R> implements FileWriter<T, R> {
     protected final Path path;
     private final Function<T, InternalRow> converter;
 
-    private final FormatWriter writer;
+    private FormatWriter writer;
     private PositionOutputStream out;
 
     private long recordCount;
@@ -59,13 +60,17 @@ public abstract class SingleFileWriter<T, R> implements FileWriter<T, R> {
             FormatWriterFactory factory,
             Path path,
             Function<T, InternalRow> converter,
-            String compression) {
+            String compression,
+            boolean asyncWrite) {
         this.fileIO = fileIO;
         this.path = path;
         this.converter = converter;
 
         try {
             out = fileIO.newOutputStream(path, false);
+            if (asyncWrite) {
+                out = new AsyncPositionOutputStream(out);
+            }
             writer = factory.create(out, compression);
         } catch (IOException e) {
             LOG.warn(
@@ -88,6 +93,27 @@ public abstract class SingleFileWriter<T, R> implements FileWriter<T, R> {
     @Override
     public void write(T record) throws IOException {
         writeImpl(record);
+    }
+
+    public void writeBundle(BundleRecords bundle) throws IOException {
+        if (closed) {
+            throw new RuntimeException("Writer has already closed!");
+        }
+
+        try {
+            if (writer instanceof BundleFormatWriter) {
+                ((BundleFormatWriter) writer).writeBundle(bundle);
+            } else {
+                for (InternalRow row : bundle) {
+                    writer.addElement(row);
+                }
+            }
+            recordCount += bundle.rowCount();
+        } catch (Throwable e) {
+            LOG.warn("Exception occurs when writing file " + path + ". Cleaning up.", e);
+            abort();
+            throw e;
+        }
     }
 
     protected InternalRow writeImpl(T record) throws IOException {
@@ -118,7 +144,14 @@ public abstract class SingleFileWriter<T, R> implements FileWriter<T, R> {
 
     @Override
     public void abort() {
-        IOUtils.closeQuietly(out);
+        if (writer != null) {
+            IOUtils.closeQuietly(writer);
+            writer = null;
+        }
+        if (out != null) {
+            IOUtils.closeQuietly(out);
+            out = null;
+        }
         fileIO.deleteQuietly(path);
     }
 
@@ -141,13 +174,17 @@ public abstract class SingleFileWriter<T, R> implements FileWriter<T, R> {
         }
 
         try {
-            writer.flush();
-            writer.finish();
-
-            out.flush();
-            out.close();
+            if (writer != null) {
+                writer.close();
+                writer = null;
+            }
+            if (out != null) {
+                out.flush();
+                out.close();
+                out = null;
+            }
         } catch (IOException e) {
-            LOG.warn("Exception occurs when closing file " + path + ". Cleaning up.", e);
+            LOG.warn("Exception occurs when closing file {}. Cleaning up.", path, e);
             abort();
             throw e;
         } finally {

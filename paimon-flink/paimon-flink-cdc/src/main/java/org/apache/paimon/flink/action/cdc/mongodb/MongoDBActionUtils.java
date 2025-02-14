@@ -18,12 +18,15 @@
 
 package org.apache.paimon.flink.action.cdc.mongodb;
 
-import com.ververica.cdc.connectors.base.options.SourceOptions;
-import com.ververica.cdc.connectors.base.options.StartupOptions;
-import com.ververica.cdc.connectors.mongodb.source.MongoDBSource;
-import com.ververica.cdc.connectors.mongodb.source.MongoDBSourceBuilder;
-import com.ververica.cdc.connectors.mongodb.source.config.MongoDBSourceOptions;
-import com.ververica.cdc.debezium.JsonDebeziumDeserializationSchema;
+import org.apache.paimon.flink.action.cdc.CdcSourceRecord;
+import org.apache.paimon.flink.action.cdc.serialization.CdcDebeziumDeserializationSchema;
+import org.apache.paimon.flink.action.cdc.watermark.CdcTimestampExtractor;
+
+import org.apache.flink.cdc.connectors.base.options.SourceOptions;
+import org.apache.flink.cdc.connectors.base.options.StartupOptions;
+import org.apache.flink.cdc.connectors.mongodb.source.MongoDBSource;
+import org.apache.flink.cdc.connectors.mongodb.source.MongoDBSourceBuilder;
+import org.apache.flink.cdc.connectors.mongodb.source.config.MongoDBSourceOptions;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.Configuration;
@@ -32,8 +35,6 @@ import org.apache.kafka.connect.json.JsonConverterConfig;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
-
-import static org.apache.paimon.utils.Preconditions.checkArgument;
 
 /**
  * Utility class for MongoDB-related actions.
@@ -58,6 +59,7 @@ public class MongoDBActionUtils {
     private static final String INITIAL_MODE = "initial";
     private static final String LATEST_OFFSET_MODE = "latest-offset";
     private static final String TIMESTAMP_MODE = "timestamp";
+    private static final String SNAPSHOT_MODE = "snapshot";
 
     public static final ConfigOption<String> FIELD_NAME =
             ConfigOptions.key("field.name")
@@ -85,10 +87,9 @@ public class MongoDBActionUtils {
                     .withDescription(
                             "Determines whether to use the default MongoDB _id generation strategy. If set to true, the default _id generation will remove the outer $oid nesting. If set to false, no additional processing will be done on the _id field.");
 
-    public static MongoDBSource<String> buildMongodbSource(
+    public static MongoDBSource<CdcSourceRecord> buildMongodbSource(
             Configuration mongodbConfig, String tableList) {
-        validateMongodbConfig(mongodbConfig);
-        MongoDBSourceBuilder<String> sourceBuilder = MongoDBSource.builder();
+        MongoDBSourceBuilder<CdcSourceRecord> sourceBuilder = MongoDBSource.builder();
 
         if (mongodbConfig.contains(MongoDBSourceOptions.USERNAME)
                 && mongodbConfig.contains(MongoDBSourceOptions.PASSWORD)) {
@@ -129,28 +130,25 @@ public class MongoDBActionUtils {
                         StartupOptions.timestamp(
                                 mongodbConfig.get(SourceOptions.SCAN_STARTUP_TIMESTAMP_MILLIS)));
                 break;
+            case SNAPSHOT_MODE:
+                sourceBuilder.startupOptions(StartupOptions.snapshot());
+                break;
             default:
-                throw new IllegalArgumentException("Unsupported startup mode: " + startupMode);
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Unknown scan.startup.mode='%s'. Valid scan.startup.mode for MongoDB CDC are [initial, latest-offset, timestamp, snapshot]",
+                                startupMode));
         }
 
         Map<String, Object> customConverterConfigs = new HashMap<>();
         customConverterConfigs.put(JsonConverterConfig.DECIMAL_FORMAT_CONFIG, "numeric");
-        JsonDebeziumDeserializationSchema schema =
-                new JsonDebeziumDeserializationSchema(false, customConverterConfigs);
+        CdcDebeziumDeserializationSchema schema =
+                new CdcDebeziumDeserializationSchema(false, customConverterConfigs);
 
         return sourceBuilder.deserializer(schema).build();
     }
 
-    private static void validateMongodbConfig(Configuration mongodbConfig) {
-        checkArgument(
-                mongodbConfig.get(MongoDBSourceOptions.HOSTS) != null,
-                String.format(
-                        "mongodb-conf [%s] must be specified.", MongoDBSourceOptions.HOSTS.key()));
-
-        checkArgument(
-                mongodbConfig.get(MongoDBSourceOptions.DATABASE) != null,
-                String.format(
-                        "mongodb-conf [%s] must be specified.",
-                        MongoDBSourceOptions.DATABASE.key()));
+    public static CdcTimestampExtractor createCdcTimestampExtractor() {
+        return new MongoDBCdcTimestampExtractor();
     }
 }

@@ -21,7 +21,7 @@ package org.apache.paimon.flink.sink;
 import org.apache.paimon.catalog.Identifier;
 import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.io.CompactIncrement;
-import org.apache.paimon.io.NewFilesIncrement;
+import org.apache.paimon.io.DataIncrement;
 import org.apache.paimon.manifest.ManifestCommittable;
 import org.apache.paimon.manifest.WrappedManifestCommittable;
 import org.apache.paimon.table.sink.CommitMessage;
@@ -51,7 +51,8 @@ class WrappedManifestCommittableSerializerTest {
         WrappedManifestCommittableSerializer serializer = serializer();
         ManifestCommittable committable1 = createManifestCommittable();
         ManifestCommittable committable2 = createManifestCommittable();
-        WrappedManifestCommittable wrappedManifestCommittable = new WrappedManifestCommittable();
+        WrappedManifestCommittable wrappedManifestCommittable =
+                new WrappedManifestCommittable(-1, -1);
         wrappedManifestCommittable.putManifestCommittable(
                 Identifier.create("db", "table1"), committable1);
         wrappedManifestCommittable.putManifestCommittable(
@@ -59,7 +60,7 @@ class WrappedManifestCommittableSerializerTest {
         byte[] serialized = serializer.serialize(wrappedManifestCommittable);
         WrappedManifestCommittable deserialize = serializer.deserialize(VERSION, serialized);
         Map<Identifier, ManifestCommittable> manifestCommittables =
-                deserialize.getManifestCommittables();
+                deserialize.manifestCommittables();
 
         assertThat(manifestCommittables.size()).isEqualTo(2);
         assertThat(deserialize).isEqualTo(wrappedManifestCommittable);
@@ -87,17 +88,17 @@ class WrappedManifestCommittableSerializerTest {
         List<CommitMessage> commitMessages = new ArrayList<>();
         int length = ThreadLocalRandom.current().nextInt(10) + 1;
         for (int i = 0; i < length; i++) {
-            NewFilesIncrement newFilesIncrement = randomNewFilesIncrement();
+            DataIncrement dataIncrement = randomNewFilesIncrement();
             CompactIncrement compactIncrement = randomCompactIncrement();
             CommitMessage commitMessage =
-                    new CommitMessageImpl(partition, bucket, newFilesIncrement, compactIncrement);
+                    new CommitMessageImpl(partition, bucket, dataIncrement, compactIncrement);
             commitMessages.add(commitMessage);
             committable.addFileCommittable(commitMessage);
         }
 
         if (!committable.logOffsets().containsKey(bucket)) {
             int offset = ID.incrementAndGet();
-            committable.addLogOffset(bucket, offset);
+            committable.addLogOffset(bucket, offset, false);
             assertThat(committable.logOffsets().get(bucket)).isEqualTo(offset);
         }
     }

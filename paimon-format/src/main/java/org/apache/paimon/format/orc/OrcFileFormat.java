@@ -7,7 +7,7 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -24,16 +24,16 @@ import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.format.FileFormatFactory.FormatContext;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.format.FormatWriterFactory;
-import org.apache.paimon.format.TableStatsExtractor;
+import org.apache.paimon.format.SimpleStatsExtractor;
 import org.apache.paimon.format.orc.filter.OrcFilters;
 import org.apache.paimon.format.orc.filter.OrcPredicateFunctionVisitor;
-import org.apache.paimon.format.orc.filter.OrcTableStatsExtractor;
-import org.apache.paimon.format.orc.reader.OrcSplitReaderUtil;
+import org.apache.paimon.format.orc.filter.OrcSimpleStatsExtractor;
 import org.apache.paimon.format.orc.writer.RowDataVectorizer;
 import org.apache.paimon.format.orc.writer.Vectorizer;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
-import org.apache.paimon.statistics.FieldStatsCollector;
+import org.apache.paimon.statistics.SimpleColStatsCollector;
 import org.apache.paimon.types.ArrayType;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
@@ -42,8 +42,8 @@ import org.apache.paimon.types.IntType;
 import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
-import org.apache.paimon.utils.Projection;
 
+import org.apache.orc.OrcConf;
 import org.apache.orc.TypeDescription;
 
 import javax.annotation.Nullable;
@@ -55,6 +55,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.stream.Collectors;
 
+import static org.apache.paimon.CoreOptions.DELETION_VECTORS_ENABLED;
 import static org.apache.paimon.types.DataTypeChecks.getFieldTypes;
 
 /** Orc {@link FileFormat}. */
@@ -66,40 +67,42 @@ public class OrcFileFormat extends FileFormat {
     private final Properties orcProperties;
     private final org.apache.hadoop.conf.Configuration readerConf;
     private final org.apache.hadoop.conf.Configuration writerConf;
-
-    private final FormatContext formatContext;
+    private final int readBatchSize;
+    private final int writeBatchSize;
+    private final boolean deletionVectorsEnabled;
 
     public OrcFileFormat(FormatContext formatContext) {
         super(IDENTIFIER);
-        this.orcProperties = getOrcProperties(formatContext.formatOptions());
-        this.readerConf = new org.apache.hadoop.conf.Configuration();
+        this.orcProperties = getOrcProperties(formatContext.options(), formatContext);
+        this.readerConf = new org.apache.hadoop.conf.Configuration(false);
         this.orcProperties.forEach((k, v) -> readerConf.set(k.toString(), v.toString()));
-        this.writerConf = new org.apache.hadoop.conf.Configuration();
+        this.writerConf = new org.apache.hadoop.conf.Configuration(false);
         this.orcProperties.forEach((k, v) -> writerConf.set(k.toString(), v.toString()));
-        this.formatContext = formatContext;
+        this.readBatchSize = formatContext.readBatchSize();
+        this.writeBatchSize = formatContext.writeBatchSize();
+        this.deletionVectorsEnabled = formatContext.options().get(DELETION_VECTORS_ENABLED);
     }
 
     @VisibleForTesting
-    Properties orcProperties() {
+    public Properties orcProperties() {
         return orcProperties;
     }
 
     @VisibleForTesting
-    public FormatContext formatContext() {
-        return formatContext;
+    public int readBatchSize() {
+        return readBatchSize;
     }
 
     @Override
-    public Optional<TableStatsExtractor> createStatsExtractor(
-            RowType type, FieldStatsCollector.Factory[] statsCollectors) {
-        return Optional.of(new OrcTableStatsExtractor(type, statsCollectors));
+    public Optional<SimpleStatsExtractor> createStatsExtractor(
+            RowType type, SimpleColStatsCollector.Factory[] statsCollectors) {
+        return Optional.of(new OrcSimpleStatsExtractor(type, statsCollectors));
     }
 
     @Override
     public FormatReaderFactory createReaderFactory(
-            RowType type, int[][] projection, @Nullable List<Predicate> filters) {
+            RowType projectedRowType, @Nullable List<Predicate> filters) {
         List<OrcFilters.Predicate> orcPredicates = new ArrayList<>();
-
         if (filters != null) {
             for (Predicate pred : filters) {
                 Optional<OrcFilters.Predicate> orcPred =
@@ -110,16 +113,16 @@ public class OrcFileFormat extends FileFormat {
 
         return new OrcReaderFactory(
                 readerConf,
-                (RowType) refineDataType(type),
-                Projection.of(projection).toTopLevelIndexes(),
+                (RowType) refineDataType(projectedRowType),
                 orcPredicates,
-                formatContext.readBatchSize());
+                readBatchSize,
+                deletionVectorsEnabled);
     }
 
     @Override
     public void validateDataFields(RowType rowType) {
         DataType refinedType = refineDataType(rowType);
-        OrcSplitReaderUtil.toOrcType(refinedType);
+        OrcTypeUtil.convertToOrcSchema((RowType) refinedType);
     }
 
     /**
@@ -137,22 +140,32 @@ public class OrcFileFormat extends FileFormat {
         DataType refinedType = refineDataType(type);
         DataType[] orcTypes = getFieldTypes(refinedType).toArray(new DataType[0]);
 
-        TypeDescription typeDescription = OrcSplitReaderUtil.toOrcType(refinedType);
-        Vectorizer<InternalRow> vectorizer =
-                new RowDataVectorizer(typeDescription.toString(), orcTypes);
+        TypeDescription typeDescription = OrcTypeUtil.convertToOrcSchema((RowType) refinedType);
+        Vectorizer<InternalRow> vectorizer = new RowDataVectorizer(typeDescription, orcTypes);
 
-        return new OrcWriterFactory(vectorizer, orcProperties, writerConf);
+        return new OrcWriterFactory(vectorizer, orcProperties, writerConf, writeBatchSize);
     }
 
-    private static Properties getOrcProperties(Options options) {
+    private Properties getOrcProperties(Options options, FormatContext formatContext) {
         Properties orcProperties = new Properties();
-        Properties properties = new Properties();
-        options.addAllToProperties(properties);
-        properties.forEach((k, v) -> orcProperties.put(IDENTIFIER + "." + k, v));
+        orcProperties.putAll(getIdentifierPrefixOptions(options).toMap());
+
+        if (!orcProperties.containsKey(OrcConf.COMPRESSION_ZSTD_LEVEL.getAttribute())) {
+            orcProperties.setProperty(
+                    OrcConf.COMPRESSION_ZSTD_LEVEL.getAttribute(),
+                    String.valueOf(formatContext.zstdLevel()));
+        }
+
+        MemorySize blockSize = formatContext.blockSize();
+        if (blockSize != null) {
+            orcProperties.setProperty(
+                    OrcConf.STRIPE_SIZE.getAttribute(), String.valueOf(blockSize.getBytes()));
+        }
+
         return orcProperties;
     }
 
-    private static DataType refineDataType(DataType type) {
+    public static DataType refineDataType(DataType type) {
         switch (type.getTypeRoot()) {
             case BINARY:
             case VARBINARY:

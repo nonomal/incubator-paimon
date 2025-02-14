@@ -19,71 +19,105 @@
 package org.apache.paimon.operation;
 
 import org.apache.paimon.AppendOnlyFileStore;
+import org.apache.paimon.fileindex.FileIndexPredicate;
 import org.apache.paimon.manifest.ManifestEntry;
 import org.apache.paimon.manifest.ManifestFile;
-import org.apache.paimon.manifest.ManifestList;
 import org.apache.paimon.predicate.Predicate;
 import org.apache.paimon.schema.SchemaManager;
-import org.apache.paimon.stats.FieldStatsConverters;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.stats.SimpleStatsEvolution;
+import org.apache.paimon.stats.SimpleStatsEvolutions;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.SnapshotManager;
 
-import java.util.List;
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 /** {@link FileStoreScan} for {@link AppendOnlyFileStore}. */
 public class AppendOnlyFileStoreScan extends AbstractFileStoreScan {
 
-    private final FieldStatsConverters fieldStatsConverters;
+    private final BucketSelectConverter bucketSelectConverter;
+    private final SimpleStatsEvolutions simpleStatsEvolutions;
+
+    private final boolean fileIndexReadEnabled;
 
     private Predicate filter;
 
+    // just cache.
+    private final Map<Long, Predicate> dataFilterMapping = new HashMap<>();
+
     public AppendOnlyFileStoreScan(
-            RowType partitionType,
-            ScanBucketFilter bucketFilter,
+            ManifestsReader manifestsReader,
+            BucketSelectConverter bucketSelectConverter,
             SnapshotManager snapshotManager,
             SchemaManager schemaManager,
-            long schemaId,
+            TableSchema schema,
             ManifestFile.Factory manifestFileFactory,
-            ManifestList.Factory manifestListFactory,
-            int numOfBuckets,
-            boolean checkNumOfBuckets,
-            Integer scanManifestParallelism) {
+            Integer scanManifestParallelism,
+            boolean fileIndexReadEnabled) {
         super(
-                partitionType,
-                bucketFilter,
+                manifestsReader,
                 snapshotManager,
                 schemaManager,
+                schema,
                 manifestFileFactory,
-                manifestListFactory,
-                numOfBuckets,
-                checkNumOfBuckets,
                 scanManifestParallelism);
-        this.fieldStatsConverters =
-                new FieldStatsConverters(sid -> scanTableSchema(sid).fields(), schemaId);
+        this.bucketSelectConverter = bucketSelectConverter;
+        this.simpleStatsEvolutions =
+                new SimpleStatsEvolutions(sid -> scanTableSchema(sid).fields(), schema.id());
+        this.fileIndexReadEnabled = fileIndexReadEnabled;
     }
 
     public AppendOnlyFileStoreScan withFilter(Predicate predicate) {
         this.filter = predicate;
-        this.bucketKeyFilter.pushdown(predicate);
+        this.bucketSelectConverter.convert(predicate).ifPresent(this::withTotalAwareBucketFilter);
         return this;
     }
 
     /** Note: Keep this thread-safe. */
     @Override
     protected boolean filterByStats(ManifestEntry entry) {
-        return filter == null
-                || filter.test(
+        if (filter == null) {
+            return true;
+        }
+
+        SimpleStatsEvolution evolution = simpleStatsEvolutions.getOrCreate(entry.file().schemaId());
+        SimpleStatsEvolution.Result stats =
+                evolution.evolution(
+                        entry.file().valueStats(),
                         entry.file().rowCount(),
-                        entry.file()
-                                .valueStats()
-                                .fields(
-                                        fieldStatsConverters.getOrCreate(entry.file().schemaId()),
-                                        entry.file().rowCount()));
+                        entry.file().valueStatsCols());
+
+        return filter.test(
+                        entry.file().rowCount(),
+                        stats.minValues(),
+                        stats.maxValues(),
+                        stats.nullCounts())
+                && (!fileIndexReadEnabled || testFileIndex(entry.file().embeddedIndex(), entry));
     }
 
-    @Override
-    protected boolean filterWholeBucketByStats(List<ManifestEntry> entries) {
-        // We don't need to filter per-bucket entries here
-        return true;
+    private boolean testFileIndex(@Nullable byte[] embeddedIndexBytes, ManifestEntry entry) {
+        if (embeddedIndexBytes == null) {
+            return true;
+        }
+
+        RowType dataRowType = scanTableSchema(entry.file().schemaId()).logicalRowType();
+
+        Predicate dataPredicate =
+                dataFilterMapping.computeIfAbsent(
+                        entry.file().schemaId(),
+                        id ->
+                                simpleStatsEvolutions.tryDevolveFilter(
+                                        entry.file().schemaId(), filter));
+
+        try (FileIndexPredicate predicate =
+                new FileIndexPredicate(embeddedIndexBytes, dataRowType)) {
+            return predicate.evaluate(dataPredicate).remain();
+        } catch (IOException e) {
+            throw new RuntimeException("Exception happens while checking predicate.", e);
+        }
     }
 }

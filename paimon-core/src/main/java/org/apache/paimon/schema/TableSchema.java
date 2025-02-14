@@ -18,13 +18,21 @@
 
 package org.apache.paimon.schema;
 
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.JsonSerdeUtil;
 import org.apache.paimon.utils.Preconditions;
 import org.apache.paimon.utils.StringUtils;
 
+import javax.annotation.Nullable;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.io.Serializable;
+import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -43,6 +51,13 @@ public class TableSchema implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
+    public static final int PAIMON_07_VERSION = 1;
+    public static final int PAIMON_08_VERSION = 2;
+    public static final int CURRENT_VERSION = 3;
+
+    // version of schema for paimon
+    private final int version;
+
     private final long id;
 
     private final List<DataField> fields;
@@ -54,9 +69,13 @@ public class TableSchema implements Serializable {
 
     private final List<String> primaryKeys;
 
+    private final List<String> bucketKeys;
+
+    private final int numBucket;
+
     private final Map<String, String> options;
 
-    private final String comment;
+    private final @Nullable String comment;
 
     private final long timeMillis;
 
@@ -67,8 +86,9 @@ public class TableSchema implements Serializable {
             List<String> partitionKeys,
             List<String> primaryKeys,
             Map<String, String> options,
-            String comment) {
+            @Nullable String comment) {
         this(
+                CURRENT_VERSION,
                 id,
                 fields,
                 highestFieldId,
@@ -80,28 +100,39 @@ public class TableSchema implements Serializable {
     }
 
     public TableSchema(
+            int version,
             long id,
             List<DataField> fields,
             int highestFieldId,
             List<String> partitionKeys,
             List<String> primaryKeys,
             Map<String, String> options,
-            String comment,
+            @Nullable String comment,
             long timeMillis) {
+        this.version = version;
         this.id = id;
         this.fields = fields;
         this.highestFieldId = highestFieldId;
         this.partitionKeys = partitionKeys;
         this.primaryKeys = primaryKeys;
-        this.options = Collections.unmodifiableMap(options);
+        this.options = options;
         this.comment = comment;
         this.timeMillis = timeMillis;
 
         // try to trim to validate primary keys
         trimmedPrimaryKeys();
 
-        // try to validate bucket keys
-        originalBucketKeys();
+        // try to validate and initialize the bucket keys
+        List<String> tmpBucketKeys = originalBucketKeys();
+        if (tmpBucketKeys.isEmpty()) {
+            tmpBucketKeys = trimmedPrimaryKeys();
+        }
+        bucketKeys = tmpBucketKeys;
+        numBucket = CoreOptions.fromMap(options).bucket();
+    }
+
+    public int version() {
+        return version;
     }
 
     public long id() {
@@ -152,14 +183,11 @@ public class TableSchema implements Serializable {
         return options;
     }
 
+    public int numBuckets() {
+        return numBucket;
+    }
+
     public List<String> bucketKeys() {
-        List<String> bucketKeys = originalBucketKeys();
-        if (bucketKeys.isEmpty()) {
-            bucketKeys = trimmedPrimaryKeys();
-        }
-        if (bucketKeys.isEmpty()) {
-            bucketKeys = fieldNames();
-        }
         return bucketKeys;
     }
 
@@ -205,7 +233,7 @@ public class TableSchema implements Serializable {
         return new HashSet<>(all).containsAll(new HashSet<>(contains));
     }
 
-    public String comment() {
+    public @Nullable String comment() {
         return comment;
     }
 
@@ -233,6 +261,10 @@ public class TableSchema implements Serializable {
         return projectedLogicalRowType(primaryKeys());
     }
 
+    public List<DataField> primaryKeysFields() {
+        return projectedDataFields(primaryKeys());
+    }
+
     public List<DataField> trimmedPrimaryKeysFields() {
         return projectedDataFields(trimmedPrimaryKeys());
     }
@@ -255,6 +287,7 @@ public class TableSchema implements Serializable {
 
     public TableSchema copy(Map<String, String> newOptions) {
         return new TableSchema(
+                version,
                 id,
                 fields,
                 highestFieldId,
@@ -279,19 +312,67 @@ public class TableSchema implements Serializable {
             return false;
         }
         TableSchema tableSchema = (TableSchema) o;
-        return Objects.equals(fields, tableSchema.fields)
+        return version == tableSchema.version
+                && Objects.equals(fields, tableSchema.fields)
                 && Objects.equals(partitionKeys, tableSchema.partitionKeys)
                 && Objects.equals(primaryKeys, tableSchema.primaryKeys)
                 && Objects.equals(options, tableSchema.options)
-                && Objects.equals(comment, tableSchema.comment);
+                && Objects.equals(comment, tableSchema.comment)
+                && timeMillis == tableSchema.timeMillis;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(fields, partitionKeys, primaryKeys, options, comment);
+        return Objects.hash(
+                version, fields, partitionKeys, primaryKeys, options, comment, timeMillis);
     }
 
     public static List<DataField> newFields(RowType rowType) {
         return rowType.getFields();
+    }
+
+    public Schema toSchema() {
+        return new Schema(fields, partitionKeys, primaryKeys, options, comment);
+    }
+
+    // =================== Utils for reading =========================
+
+    public static TableSchema fromJson(String json) {
+        return JsonSerdeUtil.fromJson(json, TableSchema.class);
+    }
+
+    public static TableSchema fromPath(FileIO fileIO, Path path) {
+        try {
+            return tryFromPath(fileIO, path);
+        } catch (FileNotFoundException e) {
+            throw new RuntimeException(e.getMessage(), e);
+        }
+    }
+
+    public static TableSchema tryFromPath(FileIO fileIO, Path path) throws FileNotFoundException {
+        try {
+            return fromJson(fileIO.readFileUtf8(path));
+        } catch (FileNotFoundException e) {
+            throw e;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    public static TableSchema create(long schemaId, Schema schema) {
+        List<DataField> fields = schema.fields();
+        List<String> partitionKeys = schema.partitionKeys();
+        List<String> primaryKeys = schema.primaryKeys();
+        Map<String, String> options = schema.options();
+        int highestFieldId = RowType.currentHighestFieldId(fields);
+
+        return new TableSchema(
+                schemaId,
+                fields,
+                highestFieldId,
+                partitionKeys,
+                primaryKeys,
+                options,
+                schema.comment());
     }
 }

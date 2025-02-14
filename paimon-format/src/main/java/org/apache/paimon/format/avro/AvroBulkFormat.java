@@ -22,12 +22,14 @@ import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.format.FormatReaderFactory;
 import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.fs.Path;
-import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.reader.FileRecordReader;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.IOUtils;
 import org.apache.paimon.utils.IteratorResultIterator;
+import org.apache.paimon.utils.IteratorWithException;
 import org.apache.paimon.utils.Pool;
 
+import org.apache.avro.AvroRuntimeException;
 import org.apache.avro.file.DataFileReader;
 import org.apache.avro.file.SeekableInput;
 import org.apache.avro.io.DatumReader;
@@ -35,54 +37,49 @@ import org.apache.avro.io.DatumReader;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
-import java.util.Iterator;
+import java.util.function.Supplier;
 
 /** Provides a {@link FormatReaderFactory} for Avro records. */
 public class AvroBulkFormat implements FormatReaderFactory {
 
-    private static final long serialVersionUID = 1L;
+    protected final RowType projectedRowType;
 
-    protected final RowType rowType;
-    private final int[] projection;
-
-    public AvroBulkFormat(RowType rowType, int[] projection) {
-        this.rowType = rowType;
-        this.projection = projection;
+    public AvroBulkFormat(RowType projectedRowType) {
+        this.projectedRowType = projectedRowType;
     }
 
     @Override
-    public AvroReader createReader(FileIO fileIO, Path file) throws IOException {
-        return new AvroReader(fileIO, file);
-    }
-
-    @Override
-    public RecordReader<InternalRow> createReader(FileIO fileIO, Path file, int poolSize)
+    public FileRecordReader<InternalRow> createReader(FormatReaderFactory.Context context)
             throws IOException {
-        throw new UnsupportedOperationException();
+        return new AvroReader(context.fileIO(), context.filePath(), context.fileSize());
     }
 
-    private class AvroReader implements RecordReader<InternalRow> {
+    private class AvroReader implements FileRecordReader<InternalRow> {
 
         private final FileIO fileIO;
         private final DataFileReader<InternalRow> reader;
 
         private final long end;
         private final Pool<Object> pool;
+        private final Path filePath;
+        private long currentRowPosition;
 
-        private AvroReader(FileIO fileIO, Path path) throws IOException {
+        private AvroReader(FileIO fileIO, Path path, long fileSize) throws IOException {
             this.fileIO = fileIO;
-            this.reader = createReaderFromPath(path);
+            this.end = fileSize;
+            this.reader = createReaderFromPath(path, end);
             this.reader.sync(0);
-            this.end = fileIO.getFileSize(path);
             this.pool = new Pool<>(1);
             this.pool.add(new Object());
+            this.filePath = path;
+            this.currentRowPosition = 0;
         }
 
-        private DataFileReader<InternalRow> createReaderFromPath(Path path) throws IOException {
-            DatumReader<InternalRow> datumReader = new AvroRowDatumReader(rowType, projection);
+        private DataFileReader<InternalRow> createReaderFromPath(Path path, long fileSize)
+                throws IOException {
+            DatumReader<InternalRow> datumReader = new AvroRowDatumReader(projectedRowType);
             SeekableInput in =
-                    new SeekableInputStreamWrapper(
-                            fileIO.newInputStream(path), fileIO.getFileSize(path));
+                    new SeekableInputStreamWrapper(fileIO.newInputStream(path), fileSize);
             try {
                 return (DataFileReader<InternalRow>) DataFileReader.openReader(in, datumReader);
             } catch (Throwable e) {
@@ -93,7 +90,7 @@ public class AvroBulkFormat implements FormatReaderFactory {
 
         @Nullable
         @Override
-        public RecordIterator<InternalRow> readBatch() throws IOException {
+        public IteratorResultIterator readBatch() throws IOException {
             Object ticket;
             try {
                 ticket = pool.pollEntry();
@@ -108,14 +105,18 @@ public class AvroBulkFormat implements FormatReaderFactory {
                 return null;
             }
 
-            Iterator<InternalRow> iterator = new AvroBlockIterator(reader.getBlockCount(), reader);
-            return new IteratorResultIterator<>(iterator, () -> pool.recycler().recycle(ticket));
+            long rowPosition = currentRowPosition;
+            currentRowPosition += reader.getBlockCount();
+            IteratorWithException<InternalRow, IOException> iterator =
+                    new AvroBlockIterator(reader.getBlockCount(), reader);
+            return new IteratorResultIterator(
+                    iterator, () -> pool.recycler().recycle(ticket), filePath, rowPosition);
         }
 
         private boolean readNextBlock() throws IOException {
             // read the next block with reader,
             // returns true if a block is read and false if we reach the end of this split
-            return reader.hasNext() && !reader.pastSync(end);
+            return replaceAvroRuntimeException(reader::hasNext) && !reader.pastSync(end);
         }
 
         @Override
@@ -124,7 +125,8 @@ public class AvroBulkFormat implements FormatReaderFactory {
         }
     }
 
-    private static class AvroBlockIterator implements Iterator<InternalRow> {
+    private static class AvroBlockIterator
+            implements IteratorWithException<InternalRow, IOException> {
 
         private long numRecordsRemaining;
         private final DataFileReader<InternalRow> reader;
@@ -140,17 +142,23 @@ public class AvroBulkFormat implements FormatReaderFactory {
         }
 
         @Override
-        public InternalRow next() {
-            try {
-                numRecordsRemaining--;
-                // reader.next merely deserialize bytes in memory to java objects
-                // and will not read from file
-                // Do not reuse object, manifest file assumes no object reuse
-                return reader.next(null);
-            } catch (IOException e) {
-                throw new RuntimeException(
-                        "Encountered exception when reading from avro format file", e);
+        public InternalRow next() throws IOException {
+            numRecordsRemaining--;
+            // reader.next merely deserialize bytes in memory to java objects
+            // and will not read from file
+            // Do not reuse object, manifest file assumes no object reuse
+            return replaceAvroRuntimeException(reader::next);
+        }
+    }
+
+    private static <T> T replaceAvroRuntimeException(Supplier<T> supplier) throws IOException {
+        try {
+            return supplier.get();
+        } catch (AvroRuntimeException e) {
+            if (e.getCause() != null && e.getCause() instanceof IOException) {
+                throw (IOException) e.getCause();
             }
+            throw e;
         }
     }
 }

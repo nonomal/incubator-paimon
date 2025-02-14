@@ -27,6 +27,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Comparator;
 import java.util.List;
+import java.util.TreeSet;
 
 /** Utils for lookup. */
 public class LookupUtils {
@@ -35,18 +36,40 @@ public class LookupUtils {
             Levels levels,
             InternalRow key,
             int startLevel,
-            BiFunctionWithIOE<InternalRow, SortedRun, T> lookup)
+            BiFunctionWithIOE<InternalRow, SortedRun, T> lookup,
+            BiFunctionWithIOE<InternalRow, TreeSet<DataFileMeta>, T> level0Lookup)
             throws IOException {
-        if (startLevel == 0) {
-            throw new IllegalArgumentException("Start level can not be zero.");
-        }
 
         T result = null;
         for (int i = startLevel; i < levels.numberOfLevels(); i++) {
-            SortedRun level = levels.runOfLevel(i);
-            result = lookup.apply(key, level);
+            if (i == 0) {
+                result = level0Lookup.apply(key, levels.level0());
+            } else {
+                SortedRun level = levels.runOfLevel(i);
+                result = lookup.apply(key, level);
+            }
             if (result != null) {
                 break;
+            }
+        }
+
+        return result;
+    }
+
+    public static <T> T lookupLevel0(
+            Comparator<InternalRow> keyComparator,
+            InternalRow target,
+            TreeSet<DataFileMeta> level0,
+            BiFunctionWithIOE<InternalRow, DataFileMeta, T> lookup)
+            throws IOException {
+        T result = null;
+        for (DataFileMeta file : level0) {
+            if (keyComparator.compare(file.maxKey(), target) >= 0
+                    && keyComparator.compare(file.minKey(), target) <= 0) {
+                result = lookup.apply(target, file);
+                if (result != null) {
+                    break;
+                }
             }
         }
 
@@ -59,6 +82,9 @@ public class LookupUtils {
             SortedRun level,
             BiFunctionWithIOE<InternalRow, DataFileMeta, T> lookup)
             throws IOException {
+        if (level.isEmpty()) {
+            return null;
+        }
         List<DataFileMeta> files = level.files();
         int left = 0;
         int right = files.size() - 1;
